@@ -44,8 +44,9 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
     prompt.push_str(
         "\nUse the tools available to you (forge CLI/API, git, shell, filesystem) to \
          gather context, make changes, run tests, and commit/push when appropriate. \
-         Reply on the forge when you are done. Forge credentials are available in \
-         the environment.\n",
+         Reply on the forge when you are done. Do not start that reply with \
+         `forge-bot:` — that prefix marks the gateway's own status comments, not \
+         your answer. Forge credentials are available in the environment.\n",
     );
 
     prompt
@@ -97,8 +98,18 @@ mod tests {
                 "Your working directory: /tmp/ws\n\n",
                 "Requested work:\nfix this\n",
                 "\nThis mention is an inline pull-request review comment. Post any reply in the same review thread (review id 7, file `src/lib.rs`, line 42) instead of opening a new top-level comment.\n",
-                "\nUse the tools available to you (forge CLI/API, git, shell, filesystem) to gather context, make changes, run tests, and commit/push when appropriate. Reply on the forge when you are done. Forge credentials are available in the environment.\n",
+                "\nUse the tools available to you (forge CLI/API, git, shell, filesystem) to gather context, make changes, run tests, and commit/push when appropriate. Reply on the forge when you are done. Do not start that reply with `forge-bot:` — that prefix marks the gateway's own status comments, not your answer. Forge credentials are available in the environment.\n",
             )
+        );
+    }
+
+    #[test]
+    fn prompt_forbids_the_gateway_prefix() {
+        let (request, context) = sample();
+        let prompt = build_prompt(&request, &context);
+        assert!(
+            prompt.contains("Do not start that reply with `forge-bot:`"),
+            "agents must not prefix their own reply with the gateway marker: {prompt}"
         );
     }
 
