@@ -19,18 +19,59 @@ use crate::error::{BotError, Result};
 /// Names of the adapters that are always registered.
 pub const BUILTIN_AGENTS: &[&str] = &["codex", "agy", "pi-rpc", "pi", "claude", "kimi"];
 
+/// Why an agent was temporarily marked unavailable.
+///
+/// Recorded alongside the cooldown so fallback notices can explain *why* an
+/// agent was skipped instead of only naming it (issue #94).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnavailableReason {
+    /// The agent reported a quota, rate or provider-capacity error.
+    CapacityLimit,
+    /// The agent process could not be started (missing binary, bad command).
+    StartFailed,
+    /// Any other failure that put the agent on cooldown.
+    Failed,
+}
+
+impl UnavailableReason {
+    /// Short, user-facing label used in fallback notices.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CapacityLimit => "capacity limit",
+            Self::StartFailed => "start failed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for UnavailableReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// A cooldown window together with the reason it was recorded.
+#[derive(Debug, Clone)]
+struct Unavailable {
+    /// Instant at which the agent may be tried again.
+    until: Instant,
+    /// Why the agent is out of rotation.
+    reason: UnavailableReason,
+}
+
 /// Resolves agent names to adapters.
 ///
 /// The registry also remembers which agents are temporarily unavailable
-/// because they reported a quota, rate or capacity error. That state is shared
-/// by every clone of the [`Arc`] the dispatcher and the HTTP layer hold, so a
-/// capacity hit on one job makes later jobs skip the agent too.
+/// because they reported a quota, rate or capacity error, or because their
+/// adapter could not be started. That state is shared by every clone of the
+/// [`Arc`] the dispatcher and the HTTP layer hold, so a hit on one job makes
+/// later jobs skip the agent too.
 pub struct AgentRegistry {
     agents: BTreeMap<String, Arc<dyn Agent>>,
     default: String,
     sequence: Vec<String>,
-    /// Agent name -> instant at which it may be tried again.
-    unavailable: Mutex<HashMap<String, Instant>>,
+    /// Agent name -> cooldown window and the reason for it.
+    unavailable: Mutex<HashMap<String, Unavailable>>,
 }
 
 impl AgentRegistry {
@@ -214,14 +255,37 @@ impl AgentRegistry {
     }
 
     /// Mark an agent unavailable until `cooldown` has elapsed.
+    ///
+    /// Kept for callers that only know an agent is out; it records
+    /// [`UnavailableReason::CapacityLimit`], matching the registry's original
+    /// capacity-only behaviour. Use [`Self::mark_unavailable_with_reason`] to
+    /// record a more specific cause.
     pub fn mark_unavailable(&self, name: &str, cooldown: Duration) {
+        self.mark_unavailable_with_reason(name, cooldown, UnavailableReason::CapacityLimit);
+    }
+
+    /// Mark an agent unavailable for `cooldown`, recording why so fallback
+    /// notices can explain the skip.
+    pub fn mark_unavailable_with_reason(
+        &self,
+        name: &str,
+        cooldown: Duration,
+        reason: UnavailableReason,
+    ) {
         let until = Instant::now() + cooldown;
         self.unavailable
             .lock()
             .expect("agent availability mutex poisoned")
-            .insert(name.to_owned(), until);
+            .insert(
+                name.to_owned(),
+                Unavailable {
+                    until,
+                    reason: reason.clone(),
+                },
+            );
         tracing::warn!(
             agent = %name,
+            reason = %reason,
             retry_after_secs = cooldown.as_secs(),
             "agent marked unavailable"
         );
@@ -242,14 +306,46 @@ impl AgentRegistry {
             .unavailable
             .lock()
             .expect("agent availability mutex poisoned");
-        match unavailable.get(name).copied() {
-            Some(until) if until > now => false,
+        match unavailable.get(name) {
+            Some(entry) if entry.until > now => false,
             Some(_) => {
                 unavailable.remove(name);
                 true
             }
             None => true,
         }
+    }
+
+    /// The reason `name` is currently unavailable, if it is. Expired entries
+    /// are forgotten, matching [`Self::is_available`].
+    pub fn unavailable_reason(&self, name: &str) -> Option<UnavailableReason> {
+        let now = Instant::now();
+        let mut unavailable = self
+            .unavailable
+            .lock()
+            .expect("agent availability mutex poisoned");
+        match unavailable.get(name) {
+            Some(entry) if entry.until > now => Some(entry.reason.clone()),
+            Some(_) => {
+                unavailable.remove(name);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Every currently unavailable agent in preference order, with its reason.
+    ///
+    /// Used by the terminal "no available agent" reply to explain why nothing
+    /// could run.
+    pub fn unavailable_agents(&self) -> Vec<(String, UnavailableReason)> {
+        self.sequence
+            .iter()
+            .filter_map(|name| {
+                self.unavailable_reason(name)
+                    .map(|reason| (name.clone(), reason))
+            })
+            .collect()
     }
 
     /// Names of the agents that are registered and not capacity-limited, in
@@ -407,5 +503,46 @@ mod tests {
         registry.mark_unavailable("codex", Duration::from_secs(60));
         registry.mark_available("codex");
         assert!(registry.is_available("codex"));
+    }
+
+    #[test]
+    fn records_and_expires_the_unavailable_reason() {
+        let registry = AgentRegistry::from_config(&Config::default());
+        registry.mark_unavailable_with_reason(
+            "codex",
+            Duration::from_secs(60),
+            UnavailableReason::StartFailed,
+        );
+        assert_eq!(
+            registry.unavailable_reason("codex"),
+            Some(UnavailableReason::StartFailed)
+        );
+        assert_eq!(
+            registry.unavailable_agents(),
+            vec![("codex".to_owned(), UnavailableReason::StartFailed)]
+        );
+
+        // The plain helper still records the original capacity reason.
+        registry.mark_unavailable("codex", Duration::from_secs(60));
+        assert_eq!(
+            registry.unavailable_reason("codex"),
+            Some(UnavailableReason::CapacityLimit)
+        );
+
+        // An expired entry is forgotten, reason included.
+        registry.mark_unavailable_with_reason("codex", Duration::ZERO, UnavailableReason::Failed);
+        assert_eq!(registry.unavailable_reason("codex"), None);
+        assert!(registry.unavailable_agents().is_empty());
+    }
+
+    #[test]
+    fn unavailable_reason_labels_are_user_facing() {
+        assert_eq!(UnavailableReason::CapacityLimit.label(), "capacity limit");
+        assert_eq!(UnavailableReason::StartFailed.label(), "start failed");
+        assert_eq!(UnavailableReason::Failed.label(), "failed");
+        assert_eq!(
+            UnavailableReason::CapacityLimit.to_string(),
+            "capacity limit"
+        );
     }
 }

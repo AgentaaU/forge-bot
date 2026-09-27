@@ -114,7 +114,7 @@ Implemented:
 - [x] GitHub and GitLab adapters
 - [x] Per-user systemd service (no root)
 - [x] Polling ingester for deployments where the bot cannot create a webhook: discovers every repository visible to the token and refreshes the list, so new repositories are picked up automatically
-- [x] Agent capacity / quota handling: a failed run that looks like a usage limit, rate limit or provider overload marks the agent unavailable for a cooldown and the job is retried on another available agent (adapters that cannot even start are skipped too); when none is left the bot replies `No available agent`
+- [x] Agent capacity / quota handling: a failed run that looks like a usage limit, rate limit or provider overload marks the agent unavailable for a cooldown and the job is retried on another available agent (adapters that cannot even start are skipped too); the fallback notice names each skipped agent with the reason it was taken out of rotation (for example `capacity limit` or `start failed`), and when none is left the bot replies `No available agent` listing those reasons
 
 Still open (see the issue's roadmap):
 

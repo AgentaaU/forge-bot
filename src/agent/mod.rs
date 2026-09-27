@@ -26,7 +26,7 @@ use crate::error::Result;
 use crate::forge::{IssueRef, ReplyTarget};
 use crate::location::ForgeKind;
 
-pub use registry::AgentRegistry;
+pub use registry::{AgentRegistry, UnavailableReason};
 
 /// The only thing the gateway sends to an agent, exactly as in the design:
 /// where the request came from and what was asked.

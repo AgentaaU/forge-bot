@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent::capacity::is_capacity_limited;
-use crate::agent::{AgentContext, AgentOutcome, AgentRegistry, AgentRequest};
+use crate::agent::{AgentContext, AgentOutcome, AgentRegistry, AgentRequest, UnavailableReason};
 use crate::config::Config;
 use crate::error::{BotError, Result};
 use crate::forge::ForgeMessage;
@@ -326,9 +326,9 @@ impl Inner {
         let mut used_agent = candidates[0].clone();
         let mut unavailable_hits = 0usize;
         // Why the previous candidate stopped, so the "switching" notice can
-        // name the right reason. Capacity hits are called out as such; every
-        // other failure reads as a plain failure.
-        let mut previous_was_capacity = false;
+        // name the right reason. `None` means it failed for an ordinary,
+        // unclassified reason.
+        let mut previous_reason: Option<UnavailableReason> = None;
 
         for (index, name) in candidates.iter().enumerate() {
             used_agent = name.clone();
@@ -336,52 +336,41 @@ impl Inner {
 
             // Buffer the notice for this step so the whole calling sequence
             // shares one comment. Every agent skipped because it is unavailable
-            // is named, so an intermediate fallback (for example `agy`) is
-            // never silently passed over.
+            // is named together with the reason it was taken out of rotation,
+            // so an intermediate fallback (for example `agy`) is never silently
+            // passed over and the operator can see *why*.
             if self.config.reply.ack {
                 let notice = if index == 0 {
                     if name == &job.agent {
                         None
                     } else {
                         let skipped = self.skipped_agents(&job.agent, name);
-                        Some(match skipped.as_slice() {
-                            [] => format!("⚠️ Running agent **{name}** instead."),
-                            [only] => format!(
-                                "⚠️ Agent **{only}** is unavailable; running agent **{name}** instead."
-                            ),
-                            many => format!(
-                                "⚠️ Agents {} are unavailable; running agent **{name}** instead.",
-                                agent_list(many)
-                            ),
+                        Some(if skipped.is_empty() {
+                            format!("⚠️ Running agent **{name}** instead.")
+                        } else {
+                            format!(
+                                "⚠️ {}; running agent **{name}** instead.",
+                                describe_unavailable(&skipped)
+                            )
                         })
                     }
                 } else {
                     let previous = &candidates[index - 1];
                     let skipped = self.skipped_agents(previous, name);
-                    Some(if previous_was_capacity {
-                        // `skipped` starts with `previous`, because a capacity
-                        // hit marks it unavailable before the next candidate is
-                        // chosen.
-                        match skipped.as_slice() {
-                            [] | [_] => format!(
-                                "⚠️ Agent **{previous}** hit a capacity limit; switching to **{name}**."
-                            ),
-                            many => format!(
-                                "⚠️ Agents {} hit a capacity limit; switching to **{name}**.",
-                                agent_list(many)
-                            ),
-                        }
-                    } else if skipped.is_empty() {
-                        format!("⚠️ Agent **{previous}** failed; switching to **{name}**.")
-                    } else {
-                        format!(
-                            "⚠️ Agent **{previous}** failed; {} unavailable; switching to **{name}**.",
-                            match skipped.as_slice() {
-                                [only] => format!("agent **{only}** is"),
-                                many => format!("agents {} are", agent_list(many)),
-                            }
-                        )
-                    })
+                    // `skipped` starts with `previous` when it was marked
+                    // unavailable. Combine it with the just-observed reason so
+                    // the notice names the agent that stopped and every other
+                    // agent passed over on the way to `name`, each with its
+                    // own reason.
+                    let mut stopped = vec![(
+                        previous.clone(),
+                        previous_reason.clone().unwrap_or(UnavailableReason::Failed),
+                    )];
+                    stopped.extend(skipped.into_iter().filter(|(agent, _)| agent != previous));
+                    Some(format!(
+                        "⚠️ {}; switching to **{name}**.",
+                        describe_unavailable(&stopped)
+                    ))
                 };
                 if let Some(notice) = notice {
                     notices.push(notice);
@@ -412,11 +401,15 @@ impl Inner {
                     // The adapter cannot start at all (missing binary, wrong
                     // command, ...). Skip it like a capacity hit so the next
                     // configured agent gets a chance.
-                    self.agents.mark_unavailable(name, cooldown);
+                    self.agents.mark_unavailable_with_reason(
+                        name,
+                        cooldown,
+                        UnavailableReason::StartFailed,
+                    );
                     unavailable_hits += 1;
                     tracing::warn!(job = %job.id, agent = %name, %error, "agent cannot be started");
                     last_outcome = Some(permission_aware_failure(&job, &error));
-                    previous_was_capacity = false;
+                    previous_reason = Some(UnavailableReason::StartFailed);
                     continue;
                 }
                 Err(error) => permission_aware_failure(&job, &error),
@@ -426,11 +419,15 @@ impl Inner {
                 && is_capacity_limited(&outcome.summary, &self.config.capacity.markers);
 
             if capacity_limited {
-                self.agents.mark_unavailable(name, cooldown);
+                self.agents.mark_unavailable_with_reason(
+                    name,
+                    cooldown,
+                    UnavailableReason::CapacityLimit,
+                );
                 unavailable_hits += 1;
                 tracing::warn!(job = %job.id, agent = %name, "agent hit a capacity limit");
                 last_outcome = Some(outcome);
-                previous_was_capacity = true;
+                previous_reason = Some(UnavailableReason::CapacityLimit);
                 continue;
             }
 
@@ -441,7 +438,7 @@ impl Inner {
                 // unanswered while a working agent is available.
                 tracing::warn!(job = %job.id, agent = %name, "agent failed; trying the next candidate");
                 last_outcome = Some(outcome);
-                previous_was_capacity = false;
+                previous_reason = None;
                 continue;
             }
 
@@ -490,8 +487,8 @@ impl Inner {
         candidates
     }
 
-    /// Agents passed over between two fallback steps because they are at
-    /// capacity.
+    /// Agents passed over between two fallback steps, with the reason each
+    /// one is unavailable.
     ///
     /// `from` is the agent being left (the requested agent before the first
     /// candidate, otherwise the previously tried one) and `to` is the next
@@ -500,13 +497,14 @@ impl Inner {
     /// name every agent the fallback skipped instead of omitting one (for
     /// example `agy`) and leaving the operator to guess why.
     ///
-    /// Naming every skipped agent keeps each notice accurate; the notices are
-    /// collected and posted as a single status comment (issue #77).
-    fn skipped_agents(&self, from: &str, to: &str) -> Vec<String> {
+    /// Naming every skipped agent with its reason keeps each notice accurate;
+    /// the notices are collected and posted as a single status comment
+    /// (issues #77, #94).
+    fn skipped_agents(&self, from: &str, to: &str) -> Vec<(String, UnavailableReason)> {
         let order = self.agents.ordered_names();
         let mut skipped = Vec::new();
-        if !self.agents.is_available(from) {
-            skipped.push(from.to_owned());
+        if let Some(reason) = self.agents.unavailable_reason(from) {
+            skipped.push((from.to_owned(), reason));
         }
         if let (Some(start), Some(end)) = (
             order.iter().position(|name| name == from),
@@ -514,8 +512,8 @@ impl Inner {
         ) && end > start
         {
             for name in &order[start + 1..end] {
-                if !self.agents.is_available(name) {
-                    skipped.push(name.clone());
+                if let Some(reason) = self.agents.unavailable_reason(name) {
+                    skipped.push((name.clone(), reason));
                 }
             }
         }
@@ -588,10 +586,13 @@ impl Inner {
 
     /// Report that no agent can take the job. This is a terminal, actionable
     /// error, so it is always posted even when result replies are disabled.
+    /// The reply names the reason each configured agent is out of rotation
+    /// when the registry knows it (issue #94).
     async fn finish_no_agent(&self, key: &str, job: &Job) {
-        let outcome = AgentOutcome::failure(NO_AVAILABLE_AGENT, Default::default());
+        let message = no_available_agent_message(&self.agents.unavailable_agents());
+        let outcome = AgentOutcome::failure(&message, Default::default());
         self.persist_outcome(key, job, &job.agent, &outcome);
-        self.reply(&job.message, NO_AVAILABLE_AGENT).await;
+        self.reply(&job.message, &message).await;
     }
 
     fn persist_outcome(&self, key: &str, job: &Job, agent: &str, outcome: &AgentOutcome) {
@@ -641,9 +642,27 @@ impl Inner {
     }
 }
 
-/// Reply posted when every configured agent is currently unavailable.
+/// Reply posted when every configured agent is currently unavailable and the
+/// registry has no reasons recorded for them.
 pub const NO_AVAILABLE_AGENT: &str = "No available agent. Every configured agent is currently unavailable; \
      please try again later.";
+
+/// Build the terminal "no available agent" reply, naming the reason each
+/// configured agent is out of rotation when it is known.
+fn no_available_agent_message(unavailable: &[(String, UnavailableReason)]) -> String {
+    if unavailable.is_empty() {
+        return NO_AVAILABLE_AGENT.to_owned();
+    }
+    let rendered = unavailable
+        .iter()
+        .map(|(name, reason)| unavailable_agent(name, reason))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "No available agent. Every configured agent is currently unavailable: {rendered}. \
+         Please try again later."
+    )
+}
 
 /// Build a failure outcome, replacing forge permission errors with a clear
 /// user-facing message.
@@ -677,13 +696,25 @@ fn status_body(agent: &str, notices: &[String]) -> String {
     parts.join(" ")
 }
 
-/// Render agent names for a fallback notice, e.g. `**codex**, **agy**`.
-fn agent_list(names: &[String]) -> String {
-    names
+/// Render one unavailable agent with its reason, e.g.
+/// `**codex** (capacity limit)`.
+fn unavailable_agent(name: &str, reason: &UnavailableReason) -> String {
+    format!("**{name}** ({reason})")
+}
+
+/// Render a set of skipped agents and their reasons as a sentence fragment,
+/// e.g. `Agents **codex** (capacity limit), **agy** (start failed) are
+/// unavailable`.
+fn describe_unavailable(agents: &[(String, UnavailableReason)]) -> String {
+    let rendered = agents
         .iter()
-        .map(|name| format!("**{name}**"))
+        .map(|(name, reason)| unavailable_agent(name, reason))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    match agents {
+        [_] => format!("Agent {rendered} is unavailable"),
+        _ => format!("Agents {rendered} are unavailable"),
+    }
 }
 
 fn truncate(input: &str, max: usize) -> String {
@@ -1437,6 +1468,26 @@ mod tests {
                 .any(|body| body.starts_with("forge-bot: No available agent")),
             "the bot must reply that no agent is available"
         );
+        // Issue #94: the terminal reply must also explain why nothing ran.
+        assert!(
+            api.comments()
+                .iter()
+                .any(|body| body.contains("(capacity limit)")),
+            "the no-agent reply must name the reason: {:?}",
+            api.comments()
+        );
+    }
+
+    #[test]
+    fn no_available_agent_message_names_reasons_and_falls_back() {
+        assert_eq!(no_available_agent_message(&[]), NO_AVAILABLE_AGENT);
+        let message = no_available_agent_message(&[
+            ("codex".into(), UnavailableReason::CapacityLimit),
+            ("agy".into(), UnavailableReason::StartFailed),
+        ]);
+        assert!(message.starts_with("No available agent"), "{message}");
+        assert!(message.contains("**codex** (capacity limit)"), "{message}");
+        assert!(message.contains("**agy** (start failed)"), "{message}");
     }
 
     #[tokio::test]
@@ -1683,6 +1734,116 @@ mod tests {
             }),
             "the switch notice must name the skipped agent: {comments:?}"
         );
+    }
+
+    /// Issue #94: the first fallback notice must state *why* each requested
+    /// agent is unavailable, not only that it is.
+    #[tokio::test]
+    async fn notice_reports_the_reason_agents_are_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = capacity_config(dir.path());
+        config.reply.ack = true;
+        let config = Arc::new(config);
+        let registry = isolated_registry(&config, &["capacity-agent", "flag-agent", "good-agent"]);
+        // A previous job exhausted `capacity-agent` and could not start
+        // `flag-agent`; this mirrors the real `codex` + `agy` fallback that
+        // prompted issue #94.
+        registry.mark_unavailable_with_reason(
+            "capacity-agent",
+            Duration::from_secs(3600),
+            UnavailableReason::CapacityLimit,
+        );
+        registry.mark_unavailable_with_reason(
+            "flag-agent",
+            Duration::from_secs(3600),
+            UnavailableReason::StartFailed,
+        );
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(RecordingApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry.clone(),
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    agent: Some("capacity-agent".into()),
+                    message: "go".into(),
+                },
+                "capacity-agent",
+            )
+            .await
+            .unwrap();
+
+        wait_for_drain(&sessions).await;
+
+        let comments = api.comments();
+        assert!(
+            comments.iter().any(|c| {
+                c.contains("capacity-agent")
+                    && c.contains("(capacity limit)")
+                    && c.contains("flag-agent")
+                    && c.contains("(start failed)")
+                    && c.contains("instead")
+            }),
+            "the notice must explain why each agent is unavailable: {comments:?}"
+        );
+    }
+
+    /// Issue #94: a run that cannot start is reported as "start failed", and a
+    /// capacity-marked agent passed over on the way keeps its own reason.
+    #[tokio::test]
+    async fn switch_notice_reports_each_agents_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = capacity_config(dir.path());
+        config.reply.ack = true;
+        config.agents.overrides.insert(
+            "missing-agent".into(),
+            crate::config::AgentConfig {
+                command: Some("definitely-not-a-real-binary-xyz".into()),
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(config);
+        let registry =
+            isolated_registry(&config, &["missing-agent", "capacity-agent", "good-agent"]);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(RecordingApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry.clone(),
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    agent: Some("missing-agent".into()),
+                    message: "go".into(),
+                },
+                "missing-agent",
+            )
+            .await
+            .unwrap();
+
+        wait_for_drain(&sessions).await;
+
+        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        assert_eq!(session.runs[0].agent, "good-agent");
+
+        let status = api.comments().join("\n");
+        assert!(status.contains("(start failed)"), "{status}");
+        assert!(status.contains("(capacity limit)"), "{status}");
     }
 
     /// Regression test for issue #77: the acknowledgement and every fallback
