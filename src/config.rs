@@ -542,10 +542,6 @@ pub struct PiRpcConfig {
     /// `false` to let an idle process be reused for any conversation in the
     /// workspace, carrying its earlier session.
     pub session_per_conversation: bool,
-    /// Optional model override, e.g. `deepseek-flash`.
-    pub model: Option<String>,
-    /// Optional provider override, e.g. `deepseek`.
-    pub provider: Option<String>,
     /// Extra environment variables for the spawned agents.
     pub env: BTreeMap<String, String>,
 }
@@ -564,8 +560,6 @@ impl Default for PiRpcConfig {
             // Start a new session for a new conversation by default instead of
             // handing it a process that already carries another conversation.
             session_per_conversation: true,
-            model: None,
-            provider: None,
             env: BTreeMap::new(),
         }
     }

@@ -207,10 +207,9 @@ its only real regression (losing the conversation on eviction).
 1. **Keep per-thread session reuse.** It is the mechanism that produces the
    96 %/94 % figures; nothing else in the gateway affects caching.
 2. **Stop treating `pi-rpc` as a capacity fallback for `pi`.** Both adapters
-   drive the same `pi` CLI, and here both resolve to `deepseek/deepseek-flash`
-   (the standalone adapter uses Pi's default; `[pi_rpc]` passes `--model
-   deepseek-flash --provider deepseek`). A quota or rate limit that stops `pi`
-   therefore stops `pi-rpc` too. `AgentRegistry::names()` currently returns
+   drive the same `pi` CLI and both use Pi's own configured default, so here
+   both resolve to `deepseek/deepseek-flash`. A quota or rate limit that stops
+   `pi` therefore stops `pi-rpc` too. `AgentRegistry::names()` currently returns
    `codex, pi, pi-rpc, claude, kimi`, so a Codex capacity hit tries `pi` and
    then `pi-rpc` — two attempts for one provider, doubling the failure latency.
    The longer-term consolidation is to keep only one Pi adapter at all (see

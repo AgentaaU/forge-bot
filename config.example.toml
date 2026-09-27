@@ -164,8 +164,6 @@ no_session = false
 # session. Set to false to let an idle process serve any conversation in the
 # workspace and carry its earlier session.
 session_per_conversation = true
-# model = "deepseek-flash"
-# provider = "deepseek"
 # args = []
 
 # --- polling ingester -------------------------------------------------------

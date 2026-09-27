@@ -194,13 +194,7 @@ impl Dispatcher {
     pub fn threads(&self) -> Result<Vec<ThreadStatus>> {
         let sessions = self.inner.sessions.list();
         let pending = self.inner.sessions.pending_jobs()?;
-        let mut threads = status::snapshot(sessions, pending);
-        // The snapshot only knows agent names; resolve their current model
-        // from the registry so the page can show it next to the agent.
-        for thread in &mut threads {
-            thread.model = self.inner.agents.model(&thread.agent);
-        }
-        Ok(threads)
+        Ok(status::snapshot(sessions, pending))
     }
 }
 

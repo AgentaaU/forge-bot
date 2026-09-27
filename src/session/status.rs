@@ -63,8 +63,6 @@ pub struct ThreadStatus {
     pub state: ThreadState,
     /// Agent currently running, next to run, or the one that ran last.
     pub agent: String,
-    /// Model the agent is launched with, when known. Reported, never set.
-    pub model: Option<String>,
     /// Follow-up mentions waiting behind the current run.
     pub queued: usize,
     /// Total number of runs recorded for the conversation.
@@ -118,7 +116,6 @@ pub fn snapshot(sessions: Vec<Session>, pending: Vec<Job>) -> Vec<ThreadStatus> 
             thread_type: thread_type(first.message.is_pull_request).to_owned(),
             state: ThreadState::Queued,
             agent: first.agent.clone(),
-            model: None,
             queued: waiting.len() + 1,
             runs: 0,
             created_at: first.created_at,
@@ -179,7 +176,6 @@ fn from_session(session: Session, waiting: Vec<Job>) -> ThreadStatus {
         thread_type,
         state,
         agent,
-        model: None,
         queued,
         runs: session.runs.len(),
         created_at: session.created_at,
@@ -387,7 +383,7 @@ a {{ color: inherit; }}
 </form>
 <p class="sub">{summary} Refreshes every 15s.</p>
 <table>
-<thead><tr><th>State</th><th>Thread</th><th>Agent</th><th>Model</th><th>Queued</th><th>Runs</th><th>Updated</th><th>Last result</th></tr></thead>
+<thead><tr><th>State</th><th>Thread</th><th>Agent</th><th>Queued</th><th>Runs</th><th>Updated</th><th>Last result</th></tr></thead>
 <tbody>
 {rows}
 </tbody>
@@ -425,12 +421,6 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
         escape_html(&thread.agent)
     };
 
-    let model = thread
-        .model
-        .as_deref()
-        .map(escape_html)
-        .unwrap_or_else(|| "—".to_owned());
-
     let last = match thread.last_success {
         Some(true) => format!(
             "✅ {}",
@@ -453,7 +443,6 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
         "<tr><td><span class=\"state {state}\">{label}</span></td>\
 <td>{thread_cell}</td>\
 <td>{agent}</td>\
-<td>{model}</td>\
 <td>{queued}</td>\
 <td>{runs}</td>\
 <td>{updated}</td>\
@@ -687,15 +676,12 @@ mod tests {
     #[test]
     fn html_page_lists_threads_and_states() {
         let key = "forgejo:owner/repo:issue:1";
-        let mut threads = snapshot(vec![session(key, vec![running()])], vec![]);
-        threads[0].model = Some("gpt-5-codex".into());
+        let threads = snapshot(vec![session(key, vec![running()])], vec![]);
         let html = render_html(&threads, None);
         assert!(html.contains("forge-bot — thread status"));
         assert!(html.contains("state running"));
         assert!(html.contains("owner/repo"));
         assert!(html.contains("pi-rpc"));
-        assert!(html.contains("<th>Model</th>"));
-        assert!(html.contains("gpt-5-codex"));
         assert!(html.contains("http://forge.local/owner/repo/issues/1"));
     }
 
@@ -717,7 +703,6 @@ mod tests {
             thread_type: "issue".into(),
             state: ThreadState::Idle,
             agent: "<img src=x>".into(),
-            model: Some("<model>\"&".into()),
             queued: 0,
             runs: 0,
             created_at: now,
@@ -730,20 +715,9 @@ mod tests {
         let html = render_row(&thread, now);
         assert!(!html.contains("<script>"));
         assert!(!html.contains("<img"));
-        assert!(!html.contains("<model>"));
         assert!(html.contains("&lt;script&gt;"));
-        assert!(html.contains("&lt;model&gt;&quot;&amp;"));
         assert!(html.contains("&quot; onmouseover=&quot;"));
         assert!(html.contains("❌"));
-    }
-
-    #[test]
-    fn missing_model_renders_a_dash() {
-        let now = Utc::now();
-        let key = "forgejo:owner/repo:issue:1";
-        let threads = snapshot(vec![session(key, vec![finished(true)])], vec![]);
-        let html = render_row(&threads[0], now);
-        assert!(html.contains("<td>—</td>"));
     }
 
     #[test]

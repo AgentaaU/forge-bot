@@ -59,14 +59,6 @@ fn rpc_arguments(config: &PiRpcConfig, session_id: Option<&str>) -> Vec<String> 
         args.push("--session-id".to_owned());
         args.push(session_id.to_owned());
     }
-    if let Some(model) = &config.model {
-        args.push("--model".to_owned());
-        args.push(model.clone());
-    }
-    if let Some(provider) = &config.provider {
-        args.push("--provider".to_owned());
-        args.push(provider.clone());
-    }
     args.extend(config.args.iter().cloned());
     args
 }
@@ -634,10 +626,6 @@ impl Agent for PiPoolAgent {
         "pi-rpc"
     }
 
-    fn model(&self) -> Option<&str> {
-        self.inner.config.model.as_deref()
-    }
-
     async fn run(&self, request: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
         let started = Instant::now();
         let key = conversation_key(context);
@@ -705,25 +693,10 @@ mod tests {
     }
 
     #[test]
-    fn reports_the_configured_model() {
-        let config = PiRpcConfig {
-            model: Some("deepseek-flash".into()),
-            ..Default::default()
-        };
-        let agent = PiPoolAgent::new(&config, store(), 1);
-        assert_eq!(agent.model(), Some("deepseek-flash"));
-
-        let agent = PiPoolAgent::new(&PiRpcConfig::default(), store(), 1);
-        assert_eq!(agent.model(), None);
-    }
-
-    #[test]
     fn rpc_arguments_persist_a_session_id_by_default() {
         let config = PiRpcConfig {
             approve: true,
             no_session: false,
-            model: Some("deepseek-flash".into()),
-            provider: Some("deepseek".into()),
             ..Default::default()
         };
         let args = rpc_arguments(&config, Some("session-123"));

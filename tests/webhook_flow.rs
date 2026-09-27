@@ -473,66 +473,6 @@ async fn status_json_lists_a_finished_thread() {
     assert_eq!(threads[0]["repository"], "shylock/forge-bot");
     assert_eq!(threads[0]["thread_type"], "issue");
     assert_eq!(threads[0]["number"], 1);
-    assert!(threads[0].get("model").is_some(), "{text}");
-}
-
-#[tokio::test]
-async fn status_json_reports_the_agent_model() {
-    let dir = tempfile::tempdir().unwrap();
-    // `true` ignores the configured `--model` flag, so the run still succeeds.
-    let harness = harness_with(dir.path(), |config| {
-        let agent = config.agents.overrides.get_mut("custom").unwrap();
-        agent.command = Some("true".into());
-        agent.args = Some(vec!["--model".into(), "deepseek-flash".into()]);
-    });
-
-    let response = harness
-        .app
-        .clone()
-        .oneshot(signed_request("issue_comment", PAYLOAD))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-    for _ in 0..200 {
-        if harness.sessions.pending_jobs().unwrap().is_empty() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    let response = harness
-        .app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/status.json")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let text = body_text(response).await;
-    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(value["threads"][0]["model"], "deepseek-flash", "{text}");
-
-    let response = harness
-        .app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/status")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let html = body_text(response).await;
-    assert!(html.contains("<th>Model</th>"), "{html}");
-    assert!(html.contains("deepseek-flash"), "{html}");
 }
 
 #[tokio::test]

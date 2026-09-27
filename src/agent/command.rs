@@ -107,28 +107,6 @@ fn parse_thread_id(stdout: &str) -> Option<String> {
     None
 }
 
-/// Find the value of a `--model` / `-m` flag in an argument list.
-///
-/// Handles the `--model value`, `--model=value`, `-m value` and `-m=value`
-/// forms used by the CLI agents.
-fn extract_model(args: &[String]) -> Option<&str> {
-    for (index, arg) in args.iter().enumerate() {
-        if let Some(value) = arg
-            .strip_prefix("--model=")
-            .or_else(|| arg.strip_prefix("-m="))
-            && !value.is_empty()
-        {
-            return Some(value);
-        }
-        if (arg == "--model" || arg == "-m")
-            && let Some(value) = args.get(index + 1)
-        {
-            return Some(value);
-        }
-    }
-    None
-}
-
 impl CommandAgent {
     pub fn new(name: impl Into<String>, program: impl Into<String>) -> Self {
         Self {
@@ -302,10 +280,6 @@ impl CommandAgent {
 impl Agent for CommandAgent {
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn model(&self) -> Option<&str> {
-        extract_model(&self.args)
     }
 
     async fn run(&self, request: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
@@ -495,47 +469,21 @@ mod tests {
     }
 
     #[test]
-    fn extracts_model_from_arguments() {
-        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            extract_model(&args(&["exec", "--model", "gpt-5"])),
-            Some("gpt-5")
-        );
-        assert_eq!(
-            extract_model(&args(&["exec", "--model=gpt-5"])),
-            Some("gpt-5")
-        );
-        assert_eq!(extract_model(&args(&["-m", "gpt-5"])), Some("gpt-5"));
-        assert_eq!(extract_model(&args(&["-m=gpt-5"])), Some("gpt-5"));
-        assert_eq!(extract_model(&args(&["--model"])), None);
-        assert_eq!(extract_model(&args(&["--model="])), None);
-        assert_eq!(extract_model(&args(&["exec"])), None);
-    }
-
-    #[test]
-    fn apply_config_reports_the_model_without_changing_the_arguments() {
+    fn apply_config_keeps_the_configured_arguments() {
         let config = crate::config::AgentConfig {
-            args: Some(vec!["exec".into(), "--model".into(), "gpt-5-codex".into()]),
+            args: Some(vec!["exec".into(), "--flag".into(), "value".into()]),
             ..Default::default()
         };
         let agent = CommandAgent::new("codex", "codex").apply_config(&config);
-        // The model is only reported, never injected: the arguments are exactly
-        // what the configuration asked for.
-        assert_eq!(agent.model(), Some("gpt-5-codex"));
+        // The arguments are exactly what the configuration asked for.
         assert_eq!(
             agent.arguments().to_vec(),
             vec![
                 "exec".to_string(),
-                "--model".to_string(),
-                "gpt-5-codex".to_string()
+                "--flag".to_string(),
+                "value".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn model_in_arguments_is_reported_without_config() {
-        let agent = CommandAgent::new("codex", "codex").args(["--model", "o3"]);
-        assert_eq!(agent.model(), Some("o3"));
     }
 
     #[test]
