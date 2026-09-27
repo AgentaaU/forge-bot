@@ -14,8 +14,8 @@
 #
 # Environment:
 #   BIN_SRC       Binary to install    (default ../target/release/forge-bot)
-#   CONFIG_SRC    Config to install    (default ../forge-bot.toml, else the
-#                                      per-user example)
+#   CONFIG_SRC    Config to install    (default ../forge-bot.toml, else
+#                                      ../config.example.toml)
 #   PREFIX        Install prefix       (default $HOME/.local)
 #   ENABLE_LINGER Set to 1 to run the service even while logged out
 #                 (`loginctl enable-linger "$USER"`).
@@ -43,13 +43,13 @@ if (( EUID == 0 )); then
     exit 1
 fi
 
-# Prefer an existing project config; otherwise fall back to the user example.
+# Prefer an existing project config; otherwise use the shared example.
 if [[ -n "${CONFIG_SRC:-}" ]]; then
     config_src="$CONFIG_SRC"
 elif [[ -f "$PROJECT_DIR/forge-bot.toml" ]]; then
     config_src="$PROJECT_DIR/forge-bot.toml"
 else
-    config_src="$SCRIPT_DIR/forge-bot.user.toml.example"
+    config_src="$PROJECT_DIR/config.example.toml"
 fi
 
 for file in "$BIN_SRC" "$config_src" "$SCRIPT_DIR/forge-bot.user.service"; do

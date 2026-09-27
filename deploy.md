@@ -13,10 +13,9 @@ supporting files live in [`contrib/`](contrib/):
 
 | File | Purpose |
 | --- | --- |
-| `config.example.toml` (repo root) | Annotated configuration reference |
+| `config.example.toml` (repo root) | Annotated config, per-user by default |
 | [`doc/forgejo-webhook.md`](doc/forgejo-webhook.md) | Hook scopes, events and API examples |
 | `contrib/forge-bot.user.service` | systemd **user** unit (recommended) |
-| `contrib/forge-bot.user.toml.example` | Per-user config with `~` state paths |
 | `contrib/install-user.sh` | Install binary + config + user unit, no root needed |
 | `contrib/forge-bot.env.example` | Environment/secret template |
 | `contrib/run.sh` | Rootless launcher (`setsid` + `nohup`) |
@@ -118,7 +117,7 @@ systemctl --user status forge-bot
 journalctl --user -u forge-bot -f        # or: tail -f ~/.local/state/forge-bot/forge-bot.log
 ```
 
-The installer copies `contrib/forge-bot.user.toml.example` when you have no
+The installer copies `config.example.toml` when you have no
 `forge-bot.toml` yet; state and workspaces then live under
 `~/.local/state/forge-bot/`. To keep the service running while logged out, run
 the installer with `ENABLE_LINGER=1` (it calls

@@ -1,5 +1,12 @@
 # Example configuration for forge-bot.
 #
+# This single example covers both install styles:
+#
+#   * per-user install (`contrib/install-user.sh`), where `~` expands to the
+#     service account's home and state stays inside it; and
+#   * a system-wide install, which uses absolute paths such as
+#     `/var/lib/forge-bot` and may bind to a routable address.
+#
 # Copy to `forge-bot.toml` and adjust. Secrets can be supplied through the
 # environment instead of this file:
 #
@@ -8,7 +15,9 @@
 #   FORGE_BOT_MAX_CONCURRENCY,
 #   FORGE_BOT_WORKSPACE_ROOT, FORGE_BOT_SESSION_DIR
 
-bind = "0.0.0.0:8080"
+# Bind locally by default; use `0.0.0.0:8080` (or a specific address) if
+# Forgejo must deliver webhooks from another host.
+bind = "127.0.0.1:8080"
 mention = "@agent"
 # Ordered agents for unqualified mentions and capacity fallback. When omitted,
 # the built-in order starts with codex. Use adapter names (`agy` for
@@ -35,7 +44,9 @@ allowed_repos = ["org/repo"]
 [workspace]
 # Clone the repository before invoking an agent.
 enabled = true
-root = "/var/lib/forge-bot/workspaces"
+# `~` expands to the service account's home. Use an absolute path such as
+# `/var/lib/forge-bot/workspaces` for a system-wide install.
+root = "~/.local/state/forge-bot/workspaces"
 reuse = true
 git_author_name = "forge-bot"
 git_author_email = "forge-bot@localhost"
@@ -64,7 +75,9 @@ cooldown_secs = 18000
 markers = []
 
 [session]
-dir = "/var/lib/forge-bot/state"
+# `~` expands to the service account's home. Use an absolute path such as
+# `/var/lib/forge-bot/state` for a system-wide install.
+dir = "~/.local/state/forge-bot/state"
 # How many agent runs may be in flight at once, shared by every adapter:
 # one-shot (codex/pi/claude/...) and pooled (pi-rpc) alike. This is the single
 # total count of agents; there is no separate per-adapter or pool limit. A
