@@ -36,6 +36,11 @@ pub struct Job {
     /// new one per step (issue #77).
     #[serde(default)]
     pub status_comment: Option<String>,
+    /// An acknowledgement was posted but cannot be edited, as with an inline
+    /// Forgejo review comment. Avoid posting the same acknowledgement again
+    /// when the worker finishes.
+    #[serde(default)]
+    pub ack_sent: bool,
 }
 
 impl Job {

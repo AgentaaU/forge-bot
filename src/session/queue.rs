@@ -19,7 +19,7 @@ use crate::agent::capacity::is_capacity_limited;
 use crate::agent::{AgentContext, AgentOutcome, AgentRegistry, AgentRequest};
 use crate::config::Config;
 use crate::error::{BotError, Result};
-use crate::forge::ForgeMessage;
+use crate::forge::{ForgeMessage, ReplyTarget};
 use crate::forge_api::ForgeApi;
 use crate::mention::Mention;
 use crate::policy::Policy;
@@ -103,15 +103,20 @@ impl Dispatcher {
             agent: agent_name.to_owned(),
             created_at: Utc::now(),
             status_comment: None,
+            ack_sent: false,
         };
 
-        // Acknowledge as soon as the job is accepted. When the forge can edit
-        // the comment, remember its id so each fallback notice can be appended
-        // to the same comment (issue #77). Otherwise the worker buffers the
-        // notices and posts them together.
+        // Acknowledge as soon as the job is accepted. Inline review comments
+        // cannot be edited through Forgejo's API, but still need an immediate
+        // reply in their thread. Other forges can return an editable comment
+        // id, allowing fallback notices to update the acknowledgement.
         if self.inner.config.reply.ack {
             let ack = format!("🤖 On it — running agent **{}**.", job.agent);
-            job.status_comment = self.inner.reply_tracked(&job.message, &ack).await;
+            if matches!(job.message.reply_target, ReplyTarget::ReviewComment(_)) {
+                job.ack_sent = self.inner.reply(&job.message, &ack).await;
+            } else {
+                job.status_comment = self.inner.reply_tracked(&job.message, &ack).await;
+            }
         }
 
         self.inner.sessions.save_job(&job)?;
@@ -263,7 +268,7 @@ impl Inner {
             Ok(workspace) => workspace,
             Err(error) => {
                 if job.status_comment.is_none() {
-                    self.flush_status(&job.message, &running_agent, &mut notices)
+                    self.flush_status(&job.message, &running_agent, &mut notices, job.ack_sent)
                         .await;
                 }
                 self.finish(
@@ -280,7 +285,7 @@ impl Inner {
         // Resolve eagerly so an unknown agent fails before we run anything.
         if let Err(error) = self.agents.get(&job.agent) {
             if job.status_comment.is_none() {
-                self.flush_status(&job.message, &running_agent, &mut notices)
+                self.flush_status(&job.message, &running_agent, &mut notices, job.ack_sent)
                     .await;
             }
             self.finish(
@@ -315,7 +320,7 @@ impl Inner {
         let candidates = self.candidate_agents(&job.agent);
         if candidates.is_empty() {
             if job.status_comment.is_none() {
-                self.flush_status(&job.message, &running_agent, &mut notices)
+                self.flush_status(&job.message, &running_agent, &mut notices, job.ack_sent)
                     .await;
             }
             self.finish_no_agent(&key, &job).await;
@@ -449,10 +454,9 @@ impl Inner {
             break;
         }
 
-        // Post the buffered acknowledgement and fallback notices together when
-        // the forge could not track the comment for in-place edits.
+        // Post buffered notices when the forge could not edit the acknowledgement.
         if job.status_comment.is_none() {
-            self.flush_status(&job.message, &running_agent, &mut notices)
+            self.flush_status(&job.message, &running_agent, &mut notices, job.ack_sent)
                 .await;
         }
 
@@ -543,16 +547,24 @@ impl Inner {
 
     /// Post the buffered status of a calling sequence as a single comment.
     ///
-    /// Used when the forge cannot track the acknowledgement for in-place
-    /// edits: the acknowledgement and the per-step fallback notices collected
-    /// in `notices` are joined so a fallback is one comment instead of one per
-    /// step (issue #77). The buffer is cleared so later callers (for example
-    /// the result reply) do not repeat it.
-    async fn flush_status(&self, message: &ForgeMessage, agent: &str, notices: &mut Vec<String>) {
-        if !self.config.reply.ack && notices.is_empty() {
+    /// When an inline acknowledgement was already posted, only fallback
+    /// notices are sent here. Otherwise the acknowledgement and notices share
+    /// one comment. The buffer is cleared so later callers do not repeat it.
+    async fn flush_status(
+        &self,
+        message: &ForgeMessage,
+        agent: &str,
+        notices: &mut Vec<String>,
+        ack_sent: bool,
+    ) {
+        if (ack_sent || !self.config.reply.ack) && notices.is_empty() {
             return;
         }
-        let body = status_body(agent, notices);
+        let body = if ack_sent {
+            notices.join("\n")
+        } else {
+            status_body(agent, notices)
+        };
         notices.clear();
         self.reply(message, &body).await;
     }
@@ -603,10 +615,10 @@ impl Inner {
         }
     }
 
-    async fn reply(&self, message: &ForgeMessage, body: &str) {
+    async fn reply(&self, message: &ForgeMessage, body: &str) -> bool {
         let reply = format!("forge-bot: {body}");
         match self.api.reply(message, &reply).await {
-            Ok(()) => {}
+            Ok(()) => return true,
             Err(error) if error.is_permission_denied() => {
                 tracing::warn!(
                     location = %message.location,
@@ -618,6 +630,7 @@ impl Inner {
                 tracing::warn!(%error, location = %message.location, "failed to post comment")
             }
         }
+        false
     }
 
     /// Post `body` and return the new comment id when the forge can edit it.
@@ -864,7 +877,8 @@ mod tests {
         config.agents.overrides.insert(
             "custom".into(),
             crate::config::AgentConfig {
-                command: Some("cat".into()),
+                command: Some("sh".into()),
+                args: Some(vec!["-c".into(), "sleep 0.2".into()]),
                 ..Default::default()
             },
         );
@@ -903,6 +917,12 @@ mod tests {
             )
             .await
             .unwrap();
+
+        assert_eq!(
+            api.replies.lock().unwrap().len(),
+            1,
+            "the inline acknowledgement must be posted before the agent finishes"
+        );
 
         wait_for_drain(&sessions).await;
 
@@ -976,6 +996,7 @@ mod tests {
             agent: "pi-rpc".into(),
             created_at: Utc::now(),
             status_comment: None,
+            ack_sent: false,
         };
         let outcome = permission_aware_failure(
             &job,
@@ -1581,6 +1602,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn inline_ack_is_immediate_and_fallback_only_posts_the_notice() {
+        use crate::forge::{ReplyTarget, ReviewCommentTarget};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = capacity_config(dir.path());
+        config.reply.ack = true;
+        let config = Arc::new(config);
+        let registry = isolated_registry(&config, &["capacity-agent", "good-agent"]);
+        registry.mark_unavailable("capacity-agent", Duration::from_secs(3600));
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(RecordingApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry,
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+        let mut review = message("o/r");
+        review.is_pull_request = true;
+        review.location = Url::parse("http://forge.local/o/r/pulls/1#issuecomment-1").unwrap();
+        review.reply_target = ReplyTarget::ReviewComment(ReviewCommentTarget {
+            review_id: 9,
+            path: "src/lib.rs".into(),
+            line: 4,
+            extra_lines_count: 0,
+        });
+
+        dispatcher
+            .submit(
+                review,
+                Mention {
+                    agent: Some("capacity-agent".into()),
+                    message: "go".into(),
+                },
+                "capacity-agent",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            api.comments().len(),
+            1,
+            "acknowledgement must precede the run"
+        );
+        wait_for_drain(&sessions).await;
+
+        let comments = api.comments();
+        assert_eq!(
+            comments.len(),
+            2,
+            "one acknowledgement and one fallback notice: {comments:?}"
+        );
+        assert!(comments[0].contains("On it"));
+        assert!(comments[1].contains("good-agent") && comments[1].contains("instead"));
+        assert!(!comments[1].contains("On it"));
+    }
+
     /// Regression test for issue #78: when several fallback agents are at
     /// capacity, the notice must name every one it skips. `flag-agent` sorts
     /// between `capacity-agent` and `good-agent`, mirroring `agy` sitting
@@ -2126,6 +2206,7 @@ echo "end:$token" >> "$AGENT_LOG"
                 agent: "gate".into(),
                 created_at: Utc::now() + chrono::Duration::seconds(index as i64),
                 status_comment: None,
+                ack_sent: false,
             };
             job.message.comment_id = Some(index as i64);
             sessions.save_job(&job).unwrap();

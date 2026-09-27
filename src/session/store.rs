@@ -255,7 +255,16 @@ mod tests {
             agent: "codex".into(),
             created_at: Utc::now(),
             status_comment: None,
+            ack_sent: false,
         }
+    }
+
+    #[test]
+    fn loads_jobs_saved_before_ack_sent_was_added() {
+        let mut value = serde_json::to_value(job()).unwrap();
+        value.as_object_mut().unwrap().remove("ack_sent");
+        let restored: Job = serde_json::from_value(value).unwrap();
+        assert!(!restored.ack_sent);
     }
 
     #[test]

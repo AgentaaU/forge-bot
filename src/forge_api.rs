@@ -291,8 +291,8 @@ impl ForgeApi for HttpForgeApi {
     }
 
     async fn reply_tracked(&self, message: &ForgeMessage, body: &str) -> Result<Option<String>> {
-        // Inline review comments use a different edit endpoint, so leave them
-        // to the buffered single-comment fallback.
+        // Inline review comments have no edit endpoint. The dispatcher posts
+        // their acknowledgement immediately through `reply` instead.
         if matches!(&message.reply_target, ReplyTarget::ReviewComment(_)) {
             return Ok(None);
         }
