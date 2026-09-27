@@ -194,10 +194,10 @@ so the token needs read access to the repository. `pull_request_review_comment`
 is kept for Forgejo versions that inline the comment.
 
 A mention in an inline review comment is answered **in the same thread**: the
-bot posts the acknowledgement and the agent's summary back as a review comment
-on the same review, file and line, instead of appending a top-level comment to
-the pull request. This needs write access to the repository, which is the same
-permission required to comment at all.
+bot posts an immediate acknowledgement and the agent's summary back as review
+comments on the same review, file and line, instead of appending a top-level
+comment to the pull request. This needs write access to the repository, which
+is the same permission required to comment at all.
 
 Description events are deduplicated by a hash of the body, so an edit that
 changes the text triggers once while re-deliveries of the same text are
