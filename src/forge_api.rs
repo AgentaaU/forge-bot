@@ -291,8 +291,8 @@ impl ForgeApi for HttpForgeApi {
     }
 
     async fn reply_tracked(&self, message: &ForgeMessage, body: &str) -> Result<Option<String>> {
-        // Inline review comments have no edit endpoint. The dispatcher posts
-        // their acknowledgement immediately through `reply` instead.
+        // Inline review comments have no edit endpoint. The worker posts their
+        // acknowledgement through `reply` once the agent is called instead.
         if matches!(&message.reply_target, ReplyTarget::ReviewComment(_)) {
             return Ok(None);
         }

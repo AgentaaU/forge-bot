@@ -106,17 +106,16 @@ impl Dispatcher {
             ack_sent: false,
         };
 
-        // Acknowledge as soon as the job is accepted. Inline review comments
-        // cannot be edited through Forgejo's API, but still need an immediate
-        // reply in their thread. Other forges can return an editable comment
-        // id, allowing fallback notices to update the acknowledgement.
-        if self.inner.config.reply.ack {
+        // Acknowledge as soon as the job is accepted when the forge can edit
+        // the comment, so fallback notices can update the acknowledgement in
+        // place. Inline review comments cannot be edited; their
+        // acknowledgement is posted by the worker when the agent is actually
+        // called (see `Inner::handle`).
+        if self.inner.config.reply.ack
+            && !matches!(job.message.reply_target, ReplyTarget::ReviewComment(_))
+        {
             let ack = format!("🤖 On it — running agent **{}**.", job.agent);
-            if matches!(job.message.reply_target, ReplyTarget::ReviewComment(_)) {
-                job.ack_sent = self.inner.reply(&job.message, &ack).await;
-            } else {
-                job.status_comment = self.inner.reply_tracked(&job.message, &ack).await;
-            }
+            job.status_comment = self.inner.reply_tracked(&job.message, &ack).await;
         }
 
         self.inner.sessions.save_job(&job)?;
@@ -247,7 +246,7 @@ impl Drop for DoneGuard {
 }
 
 impl Inner {
-    async fn handle(&self, job: Job) {
+    async fn handle(&self, mut job: Job) {
         let key = job.session_key();
 
         // The acknowledgement and every fallback notice share one status
@@ -334,6 +333,12 @@ impl Inner {
         // name the right reason. Capacity hits are called out as such; every
         // other failure reads as a plain failure.
         let mut previous_was_capacity = false;
+        // Inline review comments cannot be edited through the forge API, so
+        // their acknowledgement is posted here, once an agent is actually
+        // about to run, instead of when the webhook was accepted. Remember the
+        // persisted flag so a recovered job does not repeat it.
+        let inline_review = matches!(job.message.reply_target, ReplyTarget::ReviewComment(_));
+        let mut ack_posted = job.ack_sent || job.status_comment.is_some();
 
         for (index, name) in candidates.iter().enumerate() {
             used_agent = name.clone();
@@ -410,6 +415,20 @@ impl Inner {
             };
 
             let cooldown = Duration::from_secs(self.config.capacity.cooldown_secs.max(1));
+
+            // Tie the acknowledgement to the call rather than the webhook:
+            // post it once an agent is about to run, after naming any agents
+            // skipped on the way. Inline review comments cannot be edited, so
+            // this is their only status comment until a later fallback notice.
+            if inline_review && self.config.reply.ack && !ack_posted {
+                let body = status_body(name, &notices);
+                notices.clear();
+                job.ack_sent = self.reply(&job.message, &body).await;
+                ack_posted = true;
+                if let Err(error) = self.sessions.save_job(&job) {
+                    tracing::warn!(%error, "failed to persist deferred acknowledgement");
+                }
+            }
 
             let outcome = match agent.run(&request, &context).await {
                 Ok(outcome) => outcome,
@@ -548,8 +567,10 @@ impl Inner {
     /// Post the buffered status of a calling sequence as a single comment.
     ///
     /// When an inline acknowledgement was already posted, only fallback
-    /// notices are sent here. Otherwise the acknowledgement and notices share
-    /// one comment. The buffer is cleared so later callers do not repeat it.
+    /// notices are sent here. Inline review comments always flush notices
+    /// only, because their acknowledgement is posted by the worker when the
+    /// agent is called. Otherwise the acknowledgement and notices share one
+    /// comment. The buffer is cleared so later callers do not repeat it.
     async fn flush_status(
         &self,
         message: &ForgeMessage,
@@ -557,10 +578,11 @@ impl Inner {
         notices: &mut Vec<String>,
         ack_sent: bool,
     ) {
-        if (ack_sent || !self.config.reply.ack) && notices.is_empty() {
+        let inline_review = matches!(message.reply_target, ReplyTarget::ReviewComment(_));
+        if (ack_sent || inline_review || !self.config.reply.ack) && notices.is_empty() {
             return;
         }
-        let body = if ack_sent {
+        let body = if ack_sent || inline_review {
             notices.join("\n")
         } else {
             status_body(agent, notices)
@@ -918,10 +940,23 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(
+            api.replies.lock().unwrap().is_empty(),
+            "the webhook must not answer the inline mention"
+        );
+
+        // The agent sleeps, so the acknowledgement must appear while it is
+        // still running rather than only when the run settles.
+        for _ in 0..100 {
+            if !api.replies.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         assert_eq!(
             api.replies.lock().unwrap().len(),
             1,
-            "the inline acknowledgement must be posted before the agent finishes"
+            "the inline acknowledgement must be posted while the agent runs"
         );
 
         wait_for_drain(&sessions).await;
@@ -1603,7 +1638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inline_ack_is_immediate_and_fallback_only_posts_the_notice() {
+    async fn inline_ack_is_deferred_until_the_agent_is_called() {
         use crate::forge::{ReplyTarget, ReviewCommentTarget};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1643,22 +1678,80 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            api.comments().len(),
-            1,
-            "acknowledgement must precede the run"
+        assert!(
+            api.comments().is_empty(),
+            "the webhook must not post the inline acknowledgement: {:?}",
+            api.comments()
         );
         wait_for_drain(&sessions).await;
 
         let comments = api.comments();
         assert_eq!(
             comments.len(),
-            2,
-            "one acknowledgement and one fallback notice: {comments:?}"
+            1,
+            "the deferred acknowledgement and the pre-run fallback notice share one comment: {comments:?}"
         );
         assert!(comments[0].contains("On it"));
-        assert!(comments[1].contains("good-agent") && comments[1].contains("instead"));
-        assert!(!comments[1].contains("On it"));
+        assert!(comments[0].contains("good-agent") && comments[0].contains("instead"));
+    }
+
+    /// When no agent can take an inline mention, the thread gets the
+    /// actionable "no agent" reply without a misleading "On it".
+    #[tokio::test]
+    async fn inline_ack_is_not_posted_when_no_agent_runs() {
+        use crate::forge::{ReplyTarget, ReviewCommentTarget};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = capacity_config(dir.path());
+        config.reply.ack = true;
+        config.capacity.fallback = false;
+        let config = Arc::new(config);
+        let registry = isolated_registry(&config, &["capacity-agent"]);
+        registry.mark_unavailable("capacity-agent", Duration::from_secs(3600));
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(RecordingApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry,
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+        let mut review = message("o/r");
+        review.is_pull_request = true;
+        review.location = Url::parse("http://forge.local/o/r/pulls/1#issuecomment-1").unwrap();
+        review.reply_target = ReplyTarget::ReviewComment(ReviewCommentTarget {
+            review_id: 9,
+            path: "src/lib.rs".into(),
+            line: 4,
+            extra_lines_count: 0,
+        });
+
+        dispatcher
+            .submit(
+                review,
+                Mention {
+                    agent: Some("capacity-agent".into()),
+                    message: "go".into(),
+                },
+                "capacity-agent",
+            )
+            .await
+            .unwrap();
+        wait_for_drain(&sessions).await;
+
+        let comments = api.comments();
+        assert!(
+            comments.iter().all(|body| !body.contains("On it")),
+            "no acknowledgement may be posted when no agent runs: {comments:?}"
+        );
+        assert!(
+            comments
+                .iter()
+                .any(|body| body.contains("No available agent")),
+            "the thread must say no agent is available: {comments:?}"
+        );
     }
 
     /// Regression test for issue #78: when several fallback agents are at

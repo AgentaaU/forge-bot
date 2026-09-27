@@ -38,7 +38,7 @@ pub struct Job {
     pub status_comment: Option<String>,
     /// An acknowledgement was posted but cannot be edited, as with an inline
     /// Forgejo review comment. Avoid posting the same acknowledgement again
-    /// when the worker finishes.
+    /// when the worker finishes or when a pending job is recovered.
     #[serde(default)]
     pub ack_sent: bool,
 }
