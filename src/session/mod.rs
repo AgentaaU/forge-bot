@@ -38,6 +38,11 @@ pub struct Job {
     /// new one per step (issue #77).
     #[serde(default)]
     pub status_comment: Option<String>,
+    /// Whether `submit` acknowledged this job as waiting behind the run already
+    /// in flight for its conversation. The worker rewrites that acknowledgement
+    /// to name the running agent once the job actually starts.
+    #[serde(default)]
+    pub waiting: bool,
 }
 
 impl Job {

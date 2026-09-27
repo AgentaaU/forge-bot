@@ -544,6 +544,7 @@ mod tests {
             agent: agent.into(),
             created_at: Utc::now(),
             status_comment: None,
+            waiting: false,
         }
     }
 

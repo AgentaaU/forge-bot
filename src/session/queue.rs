@@ -140,6 +140,11 @@ impl Dispatcher {
         // Resolve eagerly so an unknown agent fails before we persist a job.
         let _ = self.inner.agents.get(agent_name)?;
 
+        // A mention that lands while its conversation is busy will wait for the
+        // run already in flight instead of starting, so say that rather than
+        // claiming the agent is running.
+        let key = SessionStore::key(&message);
+        let waiting = self.inner.thread_is_busy(&key);
         let mut job = Job {
             id: Uuid::new_v4(),
             message,
@@ -147,6 +152,7 @@ impl Dispatcher {
             agent: agent_name.to_owned(),
             created_at: Utc::now(),
             status_comment: None,
+            waiting,
         };
 
         // Acknowledge as soon as the job is accepted. When the forge can edit
@@ -154,7 +160,11 @@ impl Dispatcher {
         // to the same comment (issue #77). Otherwise the worker buffers the
         // notices and posts them together.
         if self.inner.config.reply.ack {
-            let ack = format!("🤖 On it — running agent **{}**.", job.agent);
+            let ack = if waiting {
+                WAITING_ACK.to_owned()
+            } else {
+                format!("🤖 On it — running agent **{}**.", job.agent)
+            };
             job.status_comment = self.inner.reply_tracked(&job.message, &ack).await;
         }
 
@@ -304,6 +314,35 @@ impl Drop for DoneGuard {
 }
 
 impl Inner {
+    /// Whether `key` already has a run in flight or a mention waiting in the
+    /// queue. `submit` uses this to acknowledge a queued mention honestly
+    /// instead of claiming the agent is already running.
+    fn thread_is_busy(&self, key: &str) -> bool {
+        // A run in flight for this conversation.
+        if let Some(session) = self.sessions.get(key)
+            && session.runs.iter().any(|run| run.finished_at.is_none())
+        {
+            return true;
+        }
+        // A mention already waiting behind that run.
+        if self
+            .sessions
+            .pending_jobs()
+            .map(|jobs| jobs.iter().any(|job| job.session_key() == key))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // Every worker is busy, so even an idle conversation must wait.
+        let workers = self.config.session.workers.max(1);
+        self.sessions
+            .list()
+            .iter()
+            .filter(|session| session.runs.iter().any(|run| run.finished_at.is_none()))
+            .count()
+            >= workers
+    }
+
     /// Try to deliver `job` into the run already in flight for its
     /// conversation.
     ///
@@ -379,6 +418,16 @@ impl Inner {
         // (issue #80).
         let mut notices: Vec<String> = Vec::new();
         let mut running_agent = job.agent.clone();
+
+        // A queued job acknowledged itself as waiting; now that it is starting,
+        // rewrite that same comment to name the agent that runs.
+        if job.waiting
+            && self.config.reply.ack
+            && let Some(id) = &job.status_comment
+        {
+            self.sync_status(&job.message, id, &running_agent, &notices)
+                .await;
+        }
 
         if let Err(error) = self.sessions.begin(&job) {
             tracing::warn!(%error, "failed to persist session start");
@@ -774,6 +823,11 @@ impl Inner {
     }
 }
 
+/// Acknowledgement posted when a mention must wait for the run already in
+/// flight for its conversation. The worker rewrites it to the running headline
+/// once the job actually starts.
+pub const WAITING_ACK: &str = "🤖 Waiting for the previous job to finish.";
+
 /// Reply posted when every configured agent is currently unavailable and the
 /// registry has no reasons recorded for them.
 pub const NO_AVAILABLE_AGENT: &str = "No available agent. Every configured agent is currently unavailable; \
@@ -1139,6 +1193,7 @@ mod tests {
             agent: "pi-rpc".into(),
             created_at: Utc::now(),
             status_comment: None,
+            waiting: false,
         };
         let outcome = permission_aware_failure(
             &job,
@@ -1407,6 +1462,7 @@ mod tests {
             agent: "plain".into(),
             created_at: Utc::now(),
             status_comment: None,
+            waiting: false,
         };
         let key = job.session_key();
         dispatcher.inner.running.lock().unwrap().insert(
@@ -2579,6 +2635,120 @@ echo "end:$token" >> "$AGENT_LOG"
         );
     }
 
+    /// A mention that arrives while its conversation is busy must not claim the
+    /// agent is already running: it is acknowledged as waiting, and the same
+    /// comment is rewritten once the job actually starts.
+    #[tokio::test]
+    async fn queued_follow_up_is_acknowledged_as_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, log, release) = gated_config(dir.path(), 2);
+        config.reply.ack = true;
+        let config = Arc::new(config);
+        let registry = isolated_registry(&config, &["gate"]);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(EditableApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry,
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        submit_token(&dispatcher, "o/r", 7, "TOKEN_A").await;
+        wait_for_log(&log, "start:TOKEN_A").await;
+        submit_token(&dispatcher, "o/r", 7, "TOKEN_B").await;
+
+        // The follow-up is queued, so it says so instead of "running agent".
+        let waiting = api
+            .comments()
+            .into_iter()
+            .find(|comment| comment.contains("Waiting"))
+            .expect("the queued mention must be acknowledged as waiting");
+        assert_eq!(
+            waiting,
+            "forge-bot: 🤖 Waiting for the previous job to finish."
+        );
+
+        release_token(&release, "TOKEN_A");
+        wait_for_log(&log, "start:TOKEN_B").await;
+
+        // Once it starts, the waiting acknowledgement becomes the running
+        // headline.
+        let comments = api.comments();
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.contains("running agent **gate**")),
+            "the waiting acknowledgement must be rewritten once it runs: {comments:?}"
+        );
+        assert!(
+            !comments.iter().any(|comment| comment.contains("Waiting")),
+            "no stale waiting acknowledgement may remain: {comments:?}"
+        );
+
+        release_token(&release, "TOKEN_B");
+        wait_for_drain(&sessions).await;
+    }
+
+    /// The same honesty when the conversation is idle but every worker is
+    /// busy: the mention waits for a free worker, not for a run on its own
+    /// thread.
+    #[tokio::test]
+    async fn queued_mention_waits_for_a_free_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, log, release) = gated_config(dir.path(), 1);
+        config.reply.ack = true;
+        let config = Arc::new(config);
+        let registry = isolated_registry(&config, &["gate"]);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(EditableApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry,
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        submit_token(&dispatcher, "o/r", 1, "TOKEN_A").await;
+        wait_for_log(&log, "start:TOKEN_A").await;
+        submit_token(&dispatcher, "o/r", 2, "TOKEN_B").await;
+
+        // The queued job for issue 2 keeps a third mention waiting even before
+        // any run exists for that conversation.
+        assert!(
+            dispatcher
+                .inner
+                .thread_is_busy(&SessionStore::key(&message_at("o/r", 2))),
+            "a pending job must mark its conversation busy"
+        );
+
+        let waiting = api
+            .comments()
+            .into_iter()
+            .find(|comment| comment.contains("Waiting"))
+            .expect("a mention with no free worker must be acknowledged as waiting");
+        assert_eq!(
+            waiting,
+            "forge-bot: 🤖 Waiting for the previous job to finish."
+        );
+
+        release_token(&release, "TOKEN_A");
+        wait_for_log(&log, "start:TOKEN_B").await;
+        assert!(
+            api.comments()
+                .iter()
+                .any(|comment| comment.contains("running agent **gate**")),
+            "the waiting acknowledgement must be rewritten once it runs"
+        );
+
+        release_token(&release, "TOKEN_B");
+        wait_for_drain(&sessions).await;
+    }
+
     /// Jobs recovered from disk after a restart must respect the same
     /// per-conversation serialization as live mentions: a crashed process that
     /// left two unfinished jobs for one thread must not run them at once
@@ -2604,6 +2774,7 @@ echo "end:$token" >> "$AGENT_LOG"
                 agent: "gate".into(),
                 created_at: Utc::now() + chrono::Duration::seconds(index as i64),
                 status_comment: None,
+                waiting: false,
             };
             job.message.comment_id = Some(index as i64);
             sessions.save_job(&job).unwrap();

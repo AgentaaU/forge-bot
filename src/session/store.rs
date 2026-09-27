@@ -265,6 +265,7 @@ mod tests {
             agent: "codex".into(),
             created_at: Utc::now(),
             status_comment: None,
+            waiting: false,
         }
     }
 
