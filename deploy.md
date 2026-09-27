@@ -115,7 +115,7 @@ users' processes or system state, and needs no root.
 cargo build --release
 ./contrib/install-user.sh
 systemctl --user status forge-bot
-journalctl --user -u forge-bot -f
+journalctl --user -u forge-bot -f        # or: tail -f ~/.local/state/forge-bot/forge-bot.log
 ```
 
 The installer copies `contrib/forge-bot.user.toml.example` when you have no
@@ -147,7 +147,8 @@ mentions reuse it while it is idle.
 
 ## 6. Operations
 
-* **Logs**: `journalctl -u forge-bot -f`, or `~/.local/state/forge-bot/forge-bot.log`.
+* **Logs**: `journalctl --user -u forge-bot -f`, or the mirrored file
+  `~/.local/state/forge-bot/forge-bot.log` written by the user service.
 * **State**: `state/jobs/`, `state/sessions/`, `state/poller.json`.
 * **Upgrade**: rebuild, reinstall the binary, restart the service.
 * **Uninstall**: stop and remove the unit/binary/config/state.
@@ -161,6 +162,7 @@ mentions reuse it while it is idle.
 | Forgejo cannot deliver to `127.0.0.1` | Allow loopback in `[webhook] ALLOWED_HOST_LIST`, or use the poller. |
 | Poller never triggers | `poller.enabled = false`, or the token cannot see the repository. Reset `state/poller.json` if a cursor ran ahead. |
 | `failed to spawn pi` | `pi` is not on the service account's `PATH`; set `[pi_rpc] command` to an absolute path. |
+| User service exits with `status=209/STDOUT` | The log directory is missing. `mkdir -p ~/.local/state/forge-bot` (`install-user.sh` does this) and restart. |
 | No reply comment | `[reply] result = false`, or the token lacks `write:issue`. |
 | Jobs pile up | Raise `[session] workers`, the single cap on concurrent agent runs (pooled `pi-rpc` and one-shot alike). |
 

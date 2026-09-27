@@ -77,6 +77,11 @@ fi
 echo "Installing systemd user unit to $UNIT_DST..."
 install -Dm644 "$SCRIPT_DIR/forge-bot.user.service" "$UNIT_DST"
 
+# The unit appends stdout/stderr here. systemd opens that file before it
+# creates any StateDirectory=, so the directory must exist before the first
+# start or the service fails with status=209/STDOUT.
+install -d -m700 "$HOME/.local/state/forge-bot"
+
 # `systemctl --user` needs a running user manager, which needs a runtime dir.
 if [[ -z "${XDG_RUNTIME_DIR:-}" && -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     cat >&2 <<EOF
@@ -105,6 +110,7 @@ Installed as a user service (running as $USER).
 Edit secrets:  $ENV_DST
 Edit config:   $CONFIG_DST
 Logs:          journalctl --user -u forge-bot -f
+               (also ~/.local/state/forge-bot/forge-bot.log)
 Status:        systemctl --user status forge-bot
 Stop:          systemctl --user stop forge-bot
 

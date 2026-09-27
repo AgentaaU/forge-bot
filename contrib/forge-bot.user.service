@@ -12,6 +12,14 @@ ExecStart=%h/.local/bin/forge-bot --config %h/.config/forge-bot/forge-bot.toml s
 Restart=on-failure
 RestartSec=5s
 
+# Mirror both streams into the state directory. The user journal may not be
+# readable by the service account (no adm/systemd-journal membership), and the
+# file survives journal rotation. systemd opens these files before it creates
+# any StateDirectory=, so the parent directory must already exist when the unit
+# starts; install-user.sh creates it.
+StandardOutput=append:%h/.local/state/forge-bot/forge-bot.log
+StandardError=append:%h/.local/state/forge-bot/forge-bot.log
+
 # Run as the invoking user only. A user unit has no system-wide reach and can
 # never start or signal processes owned by another account; the options below
 # are defense in depth on top of that boundary.
