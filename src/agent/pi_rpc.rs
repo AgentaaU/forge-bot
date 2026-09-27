@@ -21,13 +21,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Notify;
+use tokio::process::{Child, ChildStdout, Command};
+use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
-use crate::agent::prompt::build_prompt;
+use crate::agent::prompt::{build_follow_up_prompt, build_prompt};
 use crate::agent::session::SessionStore;
-use crate::agent::{Agent, AgentContext, AgentOutcome, AgentRequest, conversation_key};
+use crate::agent::{
+    Agent, AgentContext, AgentOutcome, AgentRequest, SteerReceipt, conversation_key,
+};
 use crate::config::PiRpcConfig;
 use crate::error::{BotError, Result};
 
@@ -72,10 +74,26 @@ fn rpc_arguments(config: &PiRpcConfig, session_id: Option<&str>) -> Vec<String> 
 /// A single `pi --mode rpc` subprocess.
 pub struct PiRpcClient {
     child: Child,
-    stdin: ChildStdin,
+    writer: mpsc::UnboundedSender<Value>,
     lines: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     workspace: PathBuf,
+}
+
+/// A cloneable handle for injecting commands into a live `pi --mode rpc`
+/// process without owning its reader.
+#[derive(Clone)]
+pub struct PiRpcWriter {
+    tx: mpsc::UnboundedSender<Value>,
+}
+
+impl PiRpcWriter {
+    fn send(&self, value: Value) -> Result<()> {
+        self.tx.send(value).map_err(|_| BotError::Agent {
+            name: "pi-rpc".into(),
+            reason: "pi process is no longer accepting input".into(),
+        })
+    }
 }
 
 impl PiRpcClient {
@@ -120,15 +138,39 @@ impl PiRpcClient {
             reason: "pi stdout was not captured".into(),
         })?;
 
+        // Own stdin from a small writer task so a follow-up can be injected
+        // while this client's reader is checked out by a run in flight.
+        let (writer, mut writer_rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(value) = writer_rx.recv().await {
+                let Ok(mut line) = serde_json::to_string(&value) else {
+                    continue;
+                };
+                line.push('\n');
+                if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+                    tracing::debug!("pi stdin closed; stopping writer task");
+                    break;
+                }
+            }
+        });
+
         tracing::debug!(workspace = %workspace.display(), "spawned pi rpc agent");
 
         Ok(Self {
             child,
-            stdin,
+            writer,
             lines: BufReader::new(stdout).lines(),
             next_id: 1,
             workspace: workspace.to_path_buf(),
         })
+    }
+
+    /// A cloneable handle that injects commands into this process.
+    pub fn writer(&self) -> PiRpcWriter {
+        PiRpcWriter {
+            tx: self.writer.clone(),
+        }
     }
 
     /// Process id of the child, while it is alive.
@@ -153,11 +195,12 @@ impl PiRpcClient {
     }
 
     async fn send(&mut self, value: &Value) -> Result<()> {
-        let mut line = serde_json::to_string(value)?;
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.flush().await?;
-        Ok(())
+        self.writer
+            .send(value.clone())
+            .map_err(|_| BotError::Agent {
+                name: "pi-rpc".into(),
+                reason: "pi process is no longer accepting input".into(),
+            })
     }
 
     /// Read the next JSONL record, skipping malformed lines.
@@ -291,6 +334,10 @@ struct PoolEntry {
     pid: Option<u32>,
     workspace: PathBuf,
     client: Option<PiRpcClient>,
+    /// Writer for the live process. Kept on the entry while `client` is
+    /// checked out by a run in flight, so a follow-up can be injected without
+    /// spawning another agent.
+    writer: Option<PiRpcWriter>,
     busy: bool,
     last_used: Instant,
 }
@@ -437,12 +484,14 @@ impl PoolInner {
                         session_id.as_deref(),
                     )?;
                     let pid = client.pid();
+                    let writer = Some(client.writer());
                     state.agents.push(PoolEntry {
                         id,
                         key: key.to_owned(),
                         pid,
                         workspace: workspace.to_path_buf(),
                         client: None,
+                        writer,
                         busy: true,
                         last_used: Instant::now(),
                     });
@@ -605,6 +654,32 @@ impl Agent for PiPoolAgent {
             }
         }
     }
+
+    async fn follow_up(
+        &self,
+        request: &AgentRequest,
+        context: &AgentContext,
+    ) -> Result<Option<SteerReceipt>> {
+        let key = conversation_key(context);
+        let writer = {
+            let state = self.inner.state.lock().expect("pi pool mutex poisoned");
+            state
+                .agents
+                .iter()
+                .find(|entry| entry.busy && entry.key == key)
+                .and_then(|entry| entry.writer.clone())
+        };
+        let Some(writer) = writer else {
+            return Ok(None);
+        };
+
+        writer.send(json!({
+            "type": "steer",
+            "message": build_follow_up_prompt(request),
+        }))?;
+        tracing::info!(key, "injected a steer into a live pi agent");
+        Ok(Some(SteerReceipt::merged()))
+    }
 }
 
 #[cfg(test)]
@@ -701,6 +776,7 @@ mod tests {
             pid: None,
             workspace: PathBuf::from("/tmp"),
             client: None,
+            writer: None,
             busy: false,
             last_used: Instant::now(),
         });
@@ -710,6 +786,7 @@ mod tests {
             pid: None,
             workspace: PathBuf::from("/tmp"),
             client: None,
+            writer: None,
             busy: true,
             last_used: Instant::now(),
         });
@@ -729,6 +806,7 @@ mod tests {
             pid: None,
             workspace: PathBuf::from("/tmp"),
             client: None,
+            writer: None,
             busy: true,
             last_used: Instant::now(),
         });
@@ -995,6 +1073,103 @@ mod tests {
         let outcome = agent.run(&request, &context).await.unwrap();
         assert!(outcome.success);
         assert_eq!(outcome.summary, "fake-result");
+    }
+
+    #[tokio::test]
+    async fn injects_a_follow_up_into_a_waiting_run_without_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let steer_log = dir.path().join("steer.log");
+        let result = dir.path().join("result.txt");
+
+        let mut config = PiRpcConfig {
+            command: fake_pi_command(),
+            timeout_secs: 10,
+            ..Default::default()
+        };
+        config
+            .env
+            .insert("FAKE_PI_WAIT_FOR_STEER".into(), "1".into());
+        config
+            .env
+            .insert("FAKE_PI_STEER_LOG".into(), steer_log.display().to_string());
+        config
+            .env
+            .insert("FAKE_PI_RESULT".into(), result.display().to_string());
+        let agent = Arc::new(PiPoolAgent::new(&config, store(), 2));
+
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let context = AgentContext {
+            workspace: dir.path().to_path_buf(),
+            forge: Some(ForgeKind::Forgejo),
+            repository: "o/r".into(),
+            issue_number: Some(1),
+            ..Default::default()
+        };
+        let key = conversation_key(&context);
+
+        let run = {
+            let agent = Arc::clone(&agent);
+            let request = request.clone();
+            let context = context.clone();
+            tokio::spawn(async move { agent.run(&request, &context).await })
+        };
+
+        // Wait until the run has acquired the process and is waiting for input.
+        let mut bound = None;
+        for _ in 0..500 {
+            if let Some(id) = agent.conversation_binding(&key) {
+                bound = Some(id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        bound.expect("agent should be bound to the thread");
+
+        let follow_up_request = AgentRequest {
+            location: request.location.clone(),
+            message: "also run the linter".into(),
+        };
+        let receipt = agent
+            .follow_up(&follow_up_request, &context)
+            .await
+            .unwrap()
+            .expect("a live run should accept the follow-up");
+        assert!(receipt.notice.contains("Merged"));
+
+        let outcome = run.await.unwrap().unwrap();
+        assert!(outcome.success);
+        // The follow-up went to the same process; no second agent was spawned.
+        assert_eq!(agent.live_agents(), 1);
+        let logged = std::fs::read_to_string(&steer_log).unwrap();
+        assert!(logged.contains("also run the linter"), "{logged}");
+        assert!(
+            outcome.summary.contains("also run the linter"),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_up_without_a_live_run_is_not_accepted() {
+        let config = PiRpcConfig {
+            command: fake_pi_command(),
+            ..Default::default()
+        };
+        let agent = PiPoolAgent::new(&config, store(), 2);
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let context = AgentContext {
+            repository: "o/r".into(),
+            issue_number: Some(1),
+            ..Default::default()
+        };
+
+        // Nothing is running, so the adapter defers to the queue.
+        assert!(agent.follow_up(&request, &context).await.unwrap().is_none());
     }
 
     #[test]

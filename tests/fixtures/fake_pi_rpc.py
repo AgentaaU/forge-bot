@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Minimal pi RPC stand-in for the pi_rpc pool tests."""
+"""Minimal pi RPC stand-in for the pi_rpc pool tests.
+
+Set ``FAKE_PI_WAIT_FOR_STEER=1`` to hold the run open after a prompt until a
+``steer``/``follow_up`` command arrives. ``FAKE_PI_STEER_LOG`` records injected
+follow-ups and ``FAKE_PI_RESULT`` lets the follow-up text become the final
+assistant message.
+"""
 
 import json
 import os
@@ -7,6 +13,11 @@ import sys
 import time
 
 delay = float(os.environ.get("FAKE_PI_DELAY", "0"))
+wait_for_steer = os.environ.get("FAKE_PI_WAIT_FOR_STEER") == "1"
+steer_log = os.environ.get("FAKE_PI_STEER_LOG")
+result_path = os.environ.get("FAKE_PI_RESULT")
+
+waiting = False
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -19,15 +30,40 @@ for line in sys.stdin:
     request_id = message.get("id")
     if kind == "prompt":
         time.sleep(delay)
-        print(json.dumps({"type": "response", "id": request_id, "success": True}), flush=True)
-        print(json.dumps({"type": "agent_settled"}), flush=True)
+        print(
+            json.dumps({"type": "response", "id": request_id, "success": True}),
+            flush=True,
+        )
+        if wait_for_steer:
+            waiting = True
+        else:
+            print(json.dumps({"type": "agent_settled"}), flush=True)
+    elif kind in ("steer", "follow_up"):
+        text = message.get("message", "")
+        if steer_log:
+            with open(steer_log, "a") as handle:
+                handle.write(f"{kind}:{text}\n")
+        if result_path:
+            with open(result_path, "w") as handle:
+                handle.write(text)
+        print(
+            json.dumps({"type": "response", "command": kind, "success": True}),
+            flush=True,
+        )
+        if waiting:
+            waiting = False
+            print(json.dumps({"type": "agent_settled"}), flush=True)
     elif kind == "get_last_assistant_text":
+        text = "fake-result"
+        if result_path and os.path.exists(result_path):
+            with open(result_path) as handle:
+                text = handle.read()
         print(
             json.dumps(
                 {
                     "type": "response",
                     "id": request_id,
-                    "data": {"text": "fake-result"},
+                    "data": {"text": text},
                 }
             ),
             flush=True,

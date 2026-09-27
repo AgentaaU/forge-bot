@@ -105,6 +105,12 @@ Implemented:
 - [x] Per-thread agent sessions: one conversation per `owner/repo` issue or PR,
   resumed by `pi-rpc` and the one-shot `codex`/`pi`/`claude` adapters, so the
   model context (and its prompt cache) is reused across comments
+- [x] Same-thread follow-ups: a second mention while a run is in flight is
+  merged into that same run instead of waiting for it to settle and becoming
+  the next turn. The live `pi-rpc` process receives it as a `steer` (before the
+  next model call), and the thread gets a "📎 Merged into the current run."
+  notice. One-shot CLI adapters have no live stdin channel, so their follow-ups
+  are queued and run as the next turn
 - [x] Agent forge access (credentials via environment, optional checkout)
 - [x] Per-conversation job scheduling: at most one run per issue/PR at a time,
   while different conversations run in parallel. Since a conversation runs at

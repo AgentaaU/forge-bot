@@ -51,6 +51,21 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
     prompt
 }
 
+/// Prompt injected into a live run for a same-thread follow-up.
+///
+/// Deliberately short: the agent already has the workspace and its earlier
+/// context, so a follow-up only needs the new instruction and where it came
+/// from.
+pub(super) fn build_follow_up_prompt(request: &AgentRequest) -> String {
+    format!(
+        "A follow-up comment arrived in this thread while you were working. Treat it \
+         as a continuation of the same task and act on it before you finish.\n\n\
+         Follow-up at {}:\n{}",
+        request.location,
+        request.message.trim()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +96,22 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn follow_up_prompt_carries_only_the_new_instruction() {
+        let request = AgentRequest {
+            location: "https://forge.example/o/r/issues/4#issuecomment-11"
+                .parse()
+                .unwrap(),
+            message: "  also run the linter ".into(),
+        };
+        let prompt = build_follow_up_prompt(&request);
+        assert!(prompt.contains("follow-up comment arrived"));
+        assert!(prompt.contains("https://forge.example/o/r/issues/4#issuecomment-11"));
+        assert!(prompt.contains("also run the linter"));
+        // It must not repeat the full initial prompt.
+        assert!(!prompt.contains("You are an autonomous coding agent"));
     }
 
     #[test]

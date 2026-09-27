@@ -220,6 +220,18 @@ impl AgentRegistry {
             .ok_or_else(|| BotError::UnknownAgent(name.to_owned()))
     }
 
+    /// Register a test agent, keeping the preference order usable.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, name: &str, agent: Arc<dyn Agent>) {
+        self.agents.insert(name.to_owned(), agent);
+        if !self.sequence.iter().any(|existing| existing == name) {
+            self.sequence.push(name.to_owned());
+        }
+        if !self.agents.contains_key(&self.default) {
+            self.default = name.to_owned();
+        }
+    }
+
     /// Resolve an explicit name or fall back to the default.
     pub fn resolve(&self, name: Option<&str>) -> Result<Arc<dyn Agent>> {
         match name {

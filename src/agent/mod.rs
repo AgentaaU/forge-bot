@@ -139,7 +139,6 @@ pub struct AgentOutcome {
     pub summary: String,
     pub duration: Duration,
 }
-
 impl AgentOutcome {
     pub fn success(summary: impl Into<String>, duration: Duration) -> Self {
         Self {
@@ -158,6 +157,25 @@ impl AgentOutcome {
     }
 }
 
+/// Confirmation that a follow-up was delivered into an agent run in flight.
+///
+/// Returned by [`Agent::follow_up`] so the scheduler can post a short notice
+/// instead of silently dropping the comment or queueing a second run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteerReceipt {
+    /// Short status posted in the thread, e.g. `📎 merged into the current run`.
+    pub notice: String,
+}
+
+impl SteerReceipt {
+    /// The default receipt for a follow-up merged into the live run.
+    pub fn merged() -> Self {
+        Self {
+            notice: "📎 Merged into the current run.".to_owned(),
+        }
+    }
+}
+
 /// A coding agent.
 #[async_trait::async_trait]
 pub trait Agent: Send + Sync {
@@ -167,6 +185,20 @@ pub trait Agent: Send + Sync {
     /// Run the agent for one request. Implementations should be idempotent and
     /// must not panic on agent failure.
     async fn run(&self, request: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome>;
+
+    /// Deliver a follow-up into a conversation that already has a run in
+    /// flight, without starting another agent.
+    ///
+    /// `Ok(None)` means the adapter has nothing live to steer (for example a
+    /// one-shot CLI), so the caller queues the job exactly as before. The
+    /// default implementation does exactly that.
+    async fn follow_up(
+        &self,
+        _request: &AgentRequest,
+        _context: &AgentContext,
+    ) -> Result<Option<SteerReceipt>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

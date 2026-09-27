@@ -152,6 +152,12 @@ approve = true
 # Persist the backend session (deterministic `--session-id`) so an evicted or
 # restarted process resumes the same conversation instead of cold-starting.
 no_session = false
+# A same-thread follow-up mention is delivered into the live `pi` process with
+# pi's `steer` command: it is merged into the current run instead of waiting
+# for that run to settle and becoming the next turn, and it can unblock a run
+# that would otherwise never settle. One-shot CLIs (codex, agy, claude, kimi)
+# have no live stdin channel, so their follow-ups are still queued and run as a
+# separate next turn.
 # Start a new session for a new conversation. When true (default) a pooled
 # process only serves the conversation it is bound to; a different conversation
 # in the same workspace spawns a fresh process rather than inheriting that

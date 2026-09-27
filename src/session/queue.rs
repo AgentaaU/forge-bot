@@ -8,7 +8,7 @@
 //! bounds how many agent processes (pooled or one-shot) may be in flight.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent::capacity::is_capacity_limited;
-use crate::agent::{AgentContext, AgentOutcome, AgentRegistry, AgentRequest, UnavailableReason};
+use crate::agent::{
+    Agent, AgentContext, AgentOutcome, AgentRegistry, AgentRequest, UnavailableReason,
+};
 use crate::config::Config;
 use crate::error::{BotError, Result};
 use crate::forge::ForgeMessage;
@@ -39,6 +41,46 @@ struct Inner {
     workspaces: WorkspaceManager,
     policy: Policy,
     tx: mpsc::Sender<Job>,
+    /// Conversation key -> agent currently running for it, so a follow-up can
+    /// be delivered into the live run instead of queueing a second one.
+    running: Mutex<HashMap<String, RunningAgent>>,
+}
+
+/// The agent currently running a conversation, with the context it was given.
+struct RunningAgent {
+    agent: Arc<dyn Agent>,
+    context: AgentContext,
+}
+
+/// Registers a running agent in [`Inner::running`] until the guard drops, even
+/// if the job panics.
+struct RunningGuard<'a> {
+    running: &'a Mutex<HashMap<String, RunningAgent>>,
+    key: String,
+}
+
+impl<'a> RunningGuard<'a> {
+    fn enter(
+        running: &'a Mutex<HashMap<String, RunningAgent>>,
+        key: String,
+        agent: Arc<dyn Agent>,
+        context: AgentContext,
+    ) -> Self {
+        running
+            .lock()
+            .expect("running agent mutex poisoned")
+            .insert(key.clone(), RunningAgent { agent, context });
+        Self { running, key }
+    }
+}
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.running
+            .lock()
+            .expect("running agent mutex poisoned")
+            .remove(&self.key);
+    }
 }
 
 impl Dispatcher {
@@ -61,6 +103,7 @@ impl Dispatcher {
             api,
             policy,
             tx,
+            running: Mutex::new(HashMap::new()),
         });
 
         // Recover jobs that were queued when the process stopped.
@@ -166,9 +209,13 @@ async fn scheduler_loop(
                 let Some(job) = incoming else { break };
                 let key = job.session_key();
                 if running.contains(&key) {
-                    // The conversation is busy: queue behind the current run
-                    // rather than starting a second agent for the same thread.
-                    queues.entry(key).or_default().push_back(job);
+                    // The conversation is busy: try to deliver the follow-up
+                    // into the live run before queueing another one. A
+                    // persistent adapter takes it mid-run; a one-shot adapter
+                    // returns `None` and the job keeps its old queueing path.
+                    if !inner.try_merge_follow_up(&job).await {
+                        queues.entry(key).or_default().push_back(job);
+                    }
                 } else if running.len() < concurrency {
                     running.insert(key.clone());
                     spawn_job(&inner, job, key, &done_tx);
@@ -242,6 +289,70 @@ impl Drop for DoneGuard {
 }
 
 impl Inner {
+    /// Try to deliver `job` into the run already in flight for its
+    /// conversation.
+    ///
+    /// Returns `true` when the message was merged, so the caller must not
+    /// queue the job. An adapter with no live process (or a one-shot CLI)
+    /// returns `None`, keeping the existing "queue the next turn" behaviour.
+    async fn try_merge_follow_up(&self, job: &Job) -> bool {
+        let key = job.session_key();
+        let running = {
+            let agents = self.running.lock().expect("running agent mutex poisoned");
+            agents
+                .get(&key)
+                .map(|running| (running.agent.clone(), running.context.clone()))
+        };
+        let Some((agent, context)) = running else {
+            return false;
+        };
+
+        let request = AgentRequest {
+            location: job.message.location.clone(),
+            message: job.mention.message_or_default().to_owned(),
+        };
+        match agent.follow_up(&request, &context).await {
+            Ok(Some(receipt)) => {
+                tracing::info!(
+                    job = %job.id,
+                    agent = %agent.name(),
+                    key,
+                    "merged follow-up into the running agent"
+                );
+                self.ack_merged(job, &receipt.notice).await;
+                // The follow-up is now part of the run in flight, so drop its
+                // persisted job instead of replaying it after a restart.
+                if let Err(error) = self.sessions.remove_job(job.id) {
+                    tracing::warn!(%error, job = %job.id, "failed to remove merged follow-up job");
+                }
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(job = %job.id, %error, "could not merge follow-up; queueing it");
+                false
+            }
+        }
+    }
+
+    /// Tell the thread that a follow-up was merged into a run already in
+    /// flight, rewriting the tracked acknowledgement when the forge supports
+    /// editing it.
+    async fn ack_merged(&self, job: &Job, notice: &str) {
+        if !self.config.reply.ack {
+            return;
+        }
+        match &job.status_comment {
+            Some(id) => {
+                let body = format!("forge-bot: {notice}");
+                if let Err(error) = self.api.update_reply(&job.message, id, &body).await {
+                    tracing::warn!(%error, "failed to update the merged follow-up status");
+                }
+            }
+            None => self.reply(&job.message, notice).await,
+        }
+    }
+
     async fn handle(&self, job: Job) {
         let key = job.session_key();
 
@@ -394,6 +505,12 @@ impl Inner {
             };
 
             let cooldown = Duration::from_secs(self.config.capacity.cooldown_secs.max(1));
+
+            // Publish the running agent so a same-thread follow-up can be
+            // delivered into it while it works. The guard clears the entry
+            // when this candidate finishes (including on a fallback).
+            let _running =
+                RunningGuard::enter(&self.running, key.clone(), agent.clone(), context.clone());
 
             let outcome = match agent.run(&request, &context).await {
                 Ok(outcome) => outcome,
@@ -1106,6 +1223,191 @@ mod tests {
             comments[index] = body.to_owned();
             Ok(())
         }
+    }
+
+    /// Test agent that blocks in `run` until released by a follow-up, recording
+    /// every injected message so tests can prove mid-run delivery.
+    struct SteeringAgent {
+        runs: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Notify,
+        steers: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SteeringAgent {
+        fn new() -> Self {
+            Self {
+                runs: std::sync::atomic::AtomicUsize::new(0),
+                release: tokio::sync::Notify::new(),
+                steers: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn runs(&self) -> usize {
+            self.runs.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn steers(&self) -> Vec<String> {
+            self.steers.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for SteeringAgent {
+        fn name(&self) -> &str {
+            "steering"
+        }
+
+        async fn run(
+            &self,
+            _request: &AgentRequest,
+            _context: &AgentContext,
+        ) -> Result<AgentOutcome> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.release.notified().await;
+            Ok(AgentOutcome::success("done", Duration::ZERO))
+        }
+
+        async fn follow_up(
+            &self,
+            request: &AgentRequest,
+            _context: &AgentContext,
+        ) -> Result<Option<crate::agent::SteerReceipt>> {
+            self.steers.lock().unwrap().push(request.message.clone());
+            self.release.notify_one();
+            Ok(Some(crate::agent::SteerReceipt::merged()))
+        }
+    }
+
+    #[tokio::test]
+    async fn same_thread_follow_up_is_merged_into_the_running_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.reply.ack = true;
+        config.policy.allow_all = true;
+        config.agent_sequence = vec!["steering".into()];
+        let config = Arc::new(config);
+
+        let steering = Arc::new(SteeringAgent::new());
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test("steering", steering.clone());
+        // Keep the fallback deterministic: only the test agent is available.
+        for name in registry.names() {
+            if name != "steering" {
+                registry.mark_unavailable(&name, Duration::from_secs(3600));
+            }
+        }
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(RecordingForgeApi::new());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(registry),
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        // First mention starts the run, which blocks until steered.
+        dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    agent: Some("steering".into()),
+                    message: "first".into(),
+                },
+                "steering",
+            )
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            if steering.runs() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(steering.runs(), 1);
+
+        // Second mention in the same thread is merged into that run.
+        dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    agent: Some("steering".into()),
+                    message: "second".into(),
+                },
+                "steering",
+            )
+            .await
+            .unwrap();
+
+        wait_for_drain(&sessions).await;
+
+        assert_eq!(
+            steering.runs(),
+            1,
+            "the follow-up must not start a second run"
+        );
+        assert_eq!(steering.steers(), vec!["second".to_owned()]);
+        let comments = api.comments();
+        assert!(
+            comments
+                .iter()
+                .any(|(_, body)| body.contains("Merged into the current run")),
+            "the thread should show the merge notice: {comments:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_steerable_agent_keeps_the_queueing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.policy.allow_all = true;
+        config.agents.overrides.insert(
+            "plain".into(),
+            crate::config::AgentConfig {
+                command: Some("cat".into()),
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(config);
+        let registry = AgentRegistry::from_config(&config);
+        let plain = registry.get("plain").unwrap();
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(registry),
+            sessions,
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        let job = Job {
+            id: Uuid::new_v4(),
+            message: message("o/r"),
+            mention: Mention {
+                agent: Some("plain".into()),
+                message: "second".into(),
+            },
+            agent: "plain".into(),
+            created_at: Utc::now(),
+            status_comment: None,
+        };
+        let key = job.session_key();
+        dispatcher.inner.running.lock().unwrap().insert(
+            key,
+            RunningAgent {
+                agent: plain,
+                context: AgentContext {
+                    repository: "o/r".into(),
+                    issue_number: Some(1),
+                    ..Default::default()
+                },
+            },
+        );
+
+        // The one-shot adapter returns `None`, so the scheduler queues instead.
+        assert!(!dispatcher.inner.try_merge_follow_up(&job).await);
     }
 
     async fn wait_for_drain(sessions: &SessionStore) {
