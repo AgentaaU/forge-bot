@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 async-trait = "0.1.92"
 axum = "0.8.9"
 chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 hex = "0.4.3"
 hmac = "0.13.0"

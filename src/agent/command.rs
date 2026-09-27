@@ -418,7 +418,7 @@ impl Agent for CommandAgent {
                                 .code()
                                 .map(|c| c.to_string())
                                 .unwrap_or_else(|| "signal".into()),
-                            fallback
+                            summarize(&format!("{stdout}\n{stderr}"), "")
                         ),
                         started.elapsed(),
                     ))
@@ -534,6 +534,24 @@ mod tests {
         // The prompt contains the message; cat echoes it back.
         assert!(outcome.success);
         assert!(outcome.summary.contains("PING"));
+    }
+
+    #[tokio::test]
+    async fn failed_command_keeps_retry_hint_from_stderr() {
+        let agent = CommandAgent::new("limited", "sh")
+            .args(["-c", "printf 'structured output\\n'; printf 'rate limit: try again in 2 minutes\\n' >&2; exit 1"]);
+        let request = AgentRequest {
+            location: url::Url::parse("https://forge.example.com/o/r/issues/1").unwrap(),
+            message: "x".into(),
+        };
+        let outcome = agent.run(&request, &AgentContext::default()).await.unwrap();
+        assert!(!outcome.success);
+        assert!(outcome.summary.contains("structured output"));
+        assert!(
+            outcome
+                .summary
+                .contains("rate limit: try again in 2 minutes")
+        );
     }
 
     #[tokio::test]

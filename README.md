@@ -120,7 +120,7 @@ Implemented:
 - [x] GitHub and GitLab adapters
 - [x] Per-user systemd service (no root)
 - [x] Polling ingester for deployments where the bot cannot create a webhook: discovers every repository visible to the token and refreshes the list, so new repositories are picked up automatically
-- [x] Agent capacity / quota handling: a failed run that looks like a usage limit, rate limit or provider overload marks the agent unavailable for a cooldown and the job is retried on another available agent (adapters that cannot even start are skipped too); the fallback notice names each skipped agent with the reason it was taken out of rotation (for example `capacity limit` or `start failed`), and when none is left the bot replies `No available agent` listing those reasons
+- [x] Agent capacity / quota handling: a failed run that looks like a usage limit, rate limit or provider overload marks the agent unavailable for a cooldown and the job is retried on another available agent (adapters that cannot even start are skipped too). The requested (or default) agent is always tried first, even while it is cooling down, so a recovered quota is picked up without a restart; a successful run clears the mark. The cooldown only removes an agent from the *automatic* fallback list, and the fallback notice names each skipped agent with the reason it was taken out of rotation (for example `capacity limit` or `start failed`); when none is left the bot replies `No available agent` listing those reasons
 - [x] Web status page: `/status` renders every known thread with its state
   (running / queued / idle), the agent involved, the queued follow-ups and the
   last result, and searches by comment/issue URL;
@@ -213,8 +213,7 @@ The endpoint also accepts GitHub (`/webhooks/github`) and GitLab
 While the server is running, `GET /status` renders a self-refreshing HTML page
 listing every thread the bot knows about: conversations with an agent in flight
 (*running*), mentions waiting for a worker (*queued*), and idle threads with
-their most recent result. Each row names the agent it is launched with.
-`GET /status.json`
+their most recent result. Each row names the agent. `GET /status.json`
 returns the same snapshot as JSON for dashboards or scripts, and `GET /`
 reports the enabled forges and agents.
 
@@ -236,6 +235,15 @@ When a provider reaches capacity, the default fallback order is `codex` →
 `agy` → `pi-rpc` → `claude` → `kimi`. The one-shot `pi` adapter joins after
 `pi-rpc` when enabled. Authenticate `agy` interactively once before using it
 through the bot.
+
+An agent that hits a capacity limit is skipped for a cooldown as an automatic
+fallback, but the requested (or default) agent is always tried
+first, even while it is cooling down: the quota may have reset, and a
+successful run clears the mark. This is why a thread can still be answered by
+`codex` immediately after an earlier capacity notice. When a failed response
+includes an explicit retry interval or reset time, that sets the cooldown;
+times without a timezone use the bot host's local timezone. Otherwise,
+`[capacity] cooldown_secs` is used.
 
 The example config sets `agent_sequence = ["codex", "agy", "pi-rpc", "claude"]`
 at the top level. Use registered adapter names; `agy` is Antigravity

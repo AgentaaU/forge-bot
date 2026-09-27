@@ -479,17 +479,12 @@ impl Inner {
             credentials,
         };
 
-        // The requested agent first, then every other available agent. Agents
-        // known to be unavailable are skipped entirely.
+        // The requested agent first, then every other available agent. The
+        // requested agent is tried even if it is cooling down, so a stale
+        // capacity mark cannot silence the caller's choice; only automatic
+        // fallbacks skip a known-unavailable agent. The list always contains at
+        // least the requested agent, so it is never empty.
         let candidates = self.candidate_agents(&job.agent);
-        if candidates.is_empty() {
-            if job.status_comment.is_none() {
-                self.flush_status(&job.message, &running_agent, &mut notices)
-                    .await;
-            }
-            self.finish_no_agent(&key, &job).await;
-            return;
-        }
 
         let mut last_outcome: Option<AgentOutcome> = None;
         let mut used_agent = candidates[0].clone();
@@ -503,53 +498,33 @@ impl Inner {
             used_agent = name.clone();
             running_agent = name.clone();
 
-            // Buffer the notice for this step so the whole calling sequence
-            // shares one comment. Every agent skipped because it is unavailable
-            // is named together with the reason it was taken out of rotation,
-            // so an intermediate fallback (for example `agy`) is never silently
-            // passed over and the operator can see *why*.
-            if self.config.reply.ack {
-                let notice = if index == 0 {
-                    if name == &job.agent {
-                        None
-                    } else {
-                        let skipped = self.skipped_agents(&job.agent, name);
-                        Some(if skipped.is_empty() {
-                            format!("⚠️ Running agent **{name}** instead.")
-                        } else {
-                            format!(
-                                "⚠️ {}; running agent **{name}** instead.",
-                                describe_unavailable(&skipped)
-                            )
-                        })
-                    }
-                } else {
-                    let previous = &candidates[index - 1];
-                    let skipped = self.skipped_agents(previous, name);
-                    // `skipped` starts with `previous` when it was marked
-                    // unavailable. Combine it with the just-observed reason so
-                    // the notice names the agent that stopped and every other
-                    // agent passed over on the way to `name`, each with its
-                    // own reason.
-                    let mut stopped = vec![(
-                        previous.clone(),
-                        previous_reason.clone().unwrap_or(UnavailableReason::Failed),
-                    )];
-                    stopped.extend(skipped.into_iter().filter(|(agent, _)| agent != previous));
-                    Some(format!(
-                        "⚠️ {}; switching to **{name}**.",
-                        describe_unavailable(&stopped)
-                    ))
-                };
-                if let Some(notice) = notice {
-                    notices.push(notice);
-                    // When the acknowledgement is a tracked comment, edit it
-                    // instead of posting another one. `running_agent` is the
-                    // candidate about to run, so the headline names it.
-                    if let Some(id) = &job.status_comment {
-                        self.sync_status(&job.message, id, &running_agent, &notices)
-                            .await;
-                    }
+            // The requested agent always leads the candidate list, so index 0
+            // is exactly `job.agent` and needs no "instead" notice. Later
+            // candidates are fallbacks: name every agent passed over with the
+            // reason it left rotation (issues #77, #94).
+            if self.config.reply.ack && index > 0 {
+                let previous = &candidates[index - 1];
+                let skipped = self.skipped_agents(previous, name);
+                // `skipped` starts with `previous` when it was marked
+                // unavailable. Combine it with the just-observed reason so the
+                // notice names the agent that stopped and every other agent
+                // passed over on the way to `name`, each with its own reason.
+                let mut stopped = vec![(
+                    previous.clone(),
+                    previous_reason.clone().unwrap_or(UnavailableReason::Failed),
+                )];
+                stopped.extend(skipped.into_iter().filter(|(agent, _)| agent != previous));
+                let notice = format!(
+                    "⚠️ {}; switching to **{name}**.",
+                    describe_unavailable(&stopped)
+                );
+                notices.push(notice);
+                // When the acknowledgement is a tracked comment, edit it
+                // instead of posting another one. `running_agent` is the
+                // candidate about to run, so the headline names it.
+                if let Some(id) = &job.status_comment {
+                    self.sync_status(&job.message, id, &running_agent, &notices)
+                        .await;
                 }
             }
 
@@ -562,7 +537,8 @@ impl Inner {
                 }
             };
 
-            let cooldown = Duration::from_secs(self.config.capacity.cooldown_secs.max(1));
+            // A start failure has no provider response to inspect.
+            let fallback_cooldown = Duration::from_secs(self.config.capacity.cooldown_secs.max(1));
 
             // Publish the running agent so a same-thread follow-up can be
             // delivered into it while it works. The guard clears the entry
@@ -578,7 +554,7 @@ impl Inner {
                     // configured agent gets a chance.
                     self.agents.mark_unavailable_with_reason(
                         name,
-                        cooldown,
+                        fallback_cooldown,
                         UnavailableReason::StartFailed,
                     );
                     unavailable_hits += 1;
@@ -590,10 +566,20 @@ impl Inner {
                 Err(error) => permission_aware_failure(&job, &error),
             };
 
+            // A successful run clears any earlier capacity/start-failure
+            // cooldown, so the requested agent is not reported as unavailable
+            // once it has recovered.
+            if outcome.success {
+                self.agents.mark_available(name);
+            }
+
             let capacity_limited = !outcome.success
                 && is_capacity_limited(&outcome.summary, &self.config.capacity.markers);
 
             if capacity_limited {
+                let cooldown =
+                    crate::agent::capacity::retry_after(&outcome.summary, chrono::Utc::now())
+                        .unwrap_or(fallback_cooldown);
                 self.agents.mark_unavailable_with_reason(
                     name,
                     cooldown,
@@ -647,11 +633,17 @@ impl Inner {
     }
 
     /// Agents to try for a job, in order.
+    ///
+    /// The requested agent always leads, even when it is cooling down after an
+    /// earlier capacity or start failure. The cooldown is a hint that an agent
+    /// was out of rotation *when it was last called*, not a permanent verdict:
+    /// the quota may have reset, so the caller's chosen (or the configured
+    /// default) agent is tried again and a successful run clears the mark
+    /// (issue #100). The cooldown still keeps an unavailable agent out of the
+    /// automatic fallback list, so a known-bad agent is not retried as a
+    /// fallback by every job.
     fn candidate_agents(&self, requested: &str) -> Vec<String> {
-        let mut candidates = Vec::new();
-        if self.agents.is_available(requested) {
-            candidates.push(requested.to_owned());
-        }
+        let mut candidates = vec![requested.to_owned()];
         if self.config.capacity.fallback {
             for name in self.agents.available_names() {
                 if name != requested {
@@ -665,12 +657,11 @@ impl Inner {
     /// Agents passed over between two fallback steps, with the reason each
     /// one is unavailable.
     ///
-    /// `from` is the agent being left (the requested agent before the first
-    /// candidate, otherwise the previously tried one) and `to` is the next
-    /// candidate that will run. The result follows the configured preference
-    /// order and includes `from` when it is unavailable, so a switch notice can
-    /// name every agent the fallback skipped instead of omitting one (for
-    /// example `agy`) and leaving the operator to guess why.
+    /// `from` is the previously tried agent and `to` is the next candidate
+    /// that will run. The result follows the configured preference order and
+    /// includes `from` when it is unavailable, so a switch notice can name
+    /// every agent the fallback skipped instead of omitting one (for example
+    /// `agy`) and leaving the operator to guess why.
     ///
     /// Naming every skipped agent with its reason keeps each notice accurate;
     /// the notices are collected and posted as a single status comment
@@ -1603,6 +1594,93 @@ mod tests {
         );
     }
 
+    /// A fake adapter whose failed response gives a retry interval.
+    struct CooldownAgent {
+        response: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for CooldownAgent {
+        fn name(&self) -> &str {
+            "cooldown-agent"
+        }
+
+        async fn run(
+            &self,
+            _request: &AgentRequest,
+            _context: &AgentContext,
+        ) -> Result<AgentOutcome> {
+            Ok(AgentOutcome::failure(self.response, Duration::ZERO))
+        }
+    }
+
+    /// A provider retry hint takes precedence over the configured fallback.
+    #[tokio::test]
+    async fn uses_the_agent_response_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.policy.allow_all = true;
+        config.agent_sequence = vec!["cooldown-agent".into(), "good-agent".into()];
+        // Deliberately different from the response value so the test can
+        // tell which one was applied.
+        config.capacity.cooldown_secs = 3600;
+        let config = Arc::new(config);
+
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test(
+            "cooldown-agent",
+            Arc::new(CooldownAgent {
+                response: "You have hit your usage limit. Try again in 30 seconds.",
+            }),
+        );
+        registry.insert_for_test(
+            "good-agent",
+            Arc::new(crate::agent::command::CommandAgent::new(
+                "good-agent",
+                "cat",
+            )),
+        );
+        // Keep the fallback deterministic: only these two agents are available.
+        for name in registry.names() {
+            if name != "cooldown-agent" && name != "good-agent" {
+                registry.mark_unavailable(&name, Duration::from_secs(3600));
+            }
+        }
+        let registry = Arc::new(registry);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(RecordingApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry.clone(),
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    agent: Some("cooldown-agent".into()),
+                    message: "go".into(),
+                },
+                "cooldown-agent",
+            )
+            .await
+            .unwrap();
+
+        wait_for_drain(&sessions).await;
+
+        let remaining = registry
+            .cooldown_remaining("cooldown-agent")
+            .expect("the capacity-limited agent must be cooling down");
+        assert!(
+            remaining > Duration::from_secs(20) && remaining <= Duration::from_secs(30),
+            "the response cooldown must be used, not the config value, got {remaining:?}"
+        );
+    }
+
     #[tokio::test]
     async fn falls_back_when_the_provider_is_overloaded() {
         let dir = tempfile::tempdir().unwrap();
@@ -1906,13 +1984,17 @@ mod tests {
         assert!(registry.is_available("good-agent"));
     }
 
+    /// Issue #100: an agent on cooldown must still be called when it is the
+    /// requested (or default) agent, because the underlying quota may have
+    /// reset. A successful probe clears the cooldown.
     #[tokio::test]
-    async fn skips_an_agent_already_known_to_be_capacity_limited() {
+    async fn retries_the_requested_agent_even_when_cooling_down() {
         let dir = tempfile::tempdir().unwrap();
         let config = Arc::new(capacity_config(dir.path()));
-        let registry = isolated_registry(&config, &["capacity-agent", "good-agent"]);
-        // A previous job already exhausted the requested agent.
-        registry.mark_unavailable("capacity-agent", Duration::from_secs(3600));
+        let registry = isolated_registry(&config, &["good-agent"]);
+        // A previous job already marked the requested agent unavailable.
+        registry.mark_unavailable("good-agent", Duration::from_secs(3600));
+        assert!(!registry.is_available("good-agent"));
         let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
         let api = Arc::new(RecordingApi::default());
         let dispatcher = Dispatcher::new(
@@ -1928,10 +2010,10 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
-                    agent: Some("capacity-agent".into()),
+                    agent: Some("good-agent".into()),
                     message: "go".into(),
                 },
-                "capacity-agent",
+                "good-agent",
             )
             .await
             .unwrap();
@@ -1940,7 +2022,14 @@ mod tests {
 
         let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
         assert_eq!(session.runs[0].success, Some(true));
-        assert_eq!(session.runs[0].agent, "good-agent");
+        assert_eq!(
+            session.runs[0].agent, "good-agent",
+            "the requested agent must be called even while cooling down"
+        );
+        assert!(
+            registry.is_available("good-agent"),
+            "a successful run must clear the cooldown"
+        );
     }
 
     /// The ack is posted once by `submit` as soon as the mention is accepted;
@@ -1992,9 +2081,9 @@ mod tests {
             "the prompt acknowledgement must not be duplicated: {comments:?}"
         );
         assert!(
-            comments
-                .iter()
-                .any(|c| c.contains("unavailable") && c.contains("instead")),
+            comments.iter().any(|c| {
+                c.contains("capacity-agent") && c.contains("switching to **good-agent**")
+            }),
             "the fallback should be announced: {comments:?}"
         );
     }
@@ -2047,7 +2136,7 @@ mod tests {
                 c.contains("capacity-agent")
                     && c.contains("flag-agent")
                     && c.contains("good-agent")
-                    && c.contains("instead")
+                    && c.contains("switching to **good-agent**")
             }),
             "the notice must name every skipped agent, including the middle one: {comments:?}"
         );
@@ -2157,7 +2246,7 @@ mod tests {
                     && c.contains("(capacity limit)")
                     && c.contains("flag-agent")
                     && c.contains("(start failed)")
-                    && c.contains("instead")
+                    && c.contains("switching to **good-agent**")
             }),
             "the notice must explain why each agent is unavailable: {comments:?}"
         );

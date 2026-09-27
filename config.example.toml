@@ -62,11 +62,15 @@ result = false
 # When an agent fails, retry the job on the next available agent instead of
 # leaving the thread unanswered. An agent whose output looks like a quota,
 # rate-limit or capacity/overload error is additionally marked unavailable for
-# `cooldown_secs`; an ordinary failure (non-zero exit, spawn error, ...) is
-# reported but does not disable the agent. When no agent is left the bot
-# replies "No available agent". `[quota]` is accepted as an alias.
+# the retry interval reported by the agent, or `cooldown_secs` if the response
+# has no usable interval. The requested (or default) agent is still tried first
+# while it is cooling down, so a recovered quota is picked up; a successful run
+# clears the mark. A start failure uses the configured cooldown; an ordinary
+# non-capacity run failure does not disable the agent. When no agent is left,
+# the bot replies "No available agent". `[quota]` is accepted as an alias.
+#
 fallback = true
-# Five hours, matching the typical agent quota/reset window.
+# Fallback window for messages without a usable retry interval (five hours).
 cooldown_secs = 18000
 # Extra, case-insensitive phrases that count as a capacity message, in
 # addition to the built-in markers ("usage limit", "rate limit", "too many

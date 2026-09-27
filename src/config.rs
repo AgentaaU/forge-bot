@@ -470,8 +470,9 @@ pub const DEFAULT_CAPACITY_COOLDOWN_SECS: u64 = 5 * 60 * 60;
 /// agent instead of leaving the thread unanswered; a failure whose output
 /// looks like a quota, rate-limit or capacity/overload message (see
 /// [`crate::agent::capacity`]) additionally marks that agent as unavailable for
-/// `cooldown_secs`. Ordinary failures do not disable the agent. If no agent is
-/// available the bot replies `No available agent`, and a run that failed for
+/// the reported retry window or the configured fallback. Ordinary failures do
+/// not disable the agent. If no agent is available the bot replies
+/// `No available agent`, and a run that failed for
 /// any other reason is reported with its error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -480,8 +481,8 @@ pub struct CapacityConfig {
     /// capacity. When false the job simply fails and the agent is still
     /// skipped for `cooldown_secs`.
     pub fallback: bool,
-    /// How long (seconds) an agent is skipped after it reports a limit.
-    /// Defaults to [`DEFAULT_CAPACITY_COOLDOWN_SECS`] (five hours).
+    /// Fallback when a capacity response has no usable retry interval, and
+    /// the window used when an agent cannot be started. Defaults to five hours.
     pub cooldown_secs: u64,
     /// Extra, case-insensitive substrings that count as a capacity message, in
     /// addition to the built-in markers.

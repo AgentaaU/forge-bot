@@ -328,6 +328,26 @@ impl AgentRegistry {
         }
     }
 
+    /// How long `name` still has to cool down, if it is currently unavailable.
+    ///
+    /// Expired entries are forgotten, matching [`Self::is_available`]. Useful
+    /// for assertions and for reporting the cooldown an agent was marked with.
+    pub fn cooldown_remaining(&self, name: &str) -> Option<Duration> {
+        let now = Instant::now();
+        let mut unavailable = self
+            .unavailable
+            .lock()
+            .expect("agent availability mutex poisoned");
+        match unavailable.get(name) {
+            Some(entry) if entry.until > now => Some(entry.until - now),
+            Some(_) => {
+                unavailable.remove(name);
+                None
+            }
+            None => None,
+        }
+    }
+
     /// The reason `name` is currently unavailable, if it is. Expired entries
     /// are forgotten, matching [`Self::is_available`].
     pub fn unavailable_reason(&self, name: &str) -> Option<UnavailableReason> {
@@ -505,6 +525,10 @@ mod tests {
         registry.mark_unavailable("codex", Duration::from_secs(60));
         assert!(!registry.is_available("codex"));
         assert!(!registry.available_names().contains(&"codex".to_owned()));
+        assert!(
+            registry.cooldown_remaining("codex") > Some(Duration::ZERO),
+            "an active cooldown should be reported"
+        );
         // Other agents are unaffected.
         assert!(registry.available_names().contains(&"pi-rpc".to_owned()));
 
