@@ -18,7 +18,7 @@ use url::Url;
 
 use crate::config::Config;
 use crate::error::{BotError, Result};
-use crate::forge::ForgeMessage;
+use crate::forge::{ForgeMessage, ReplyTarget, ReviewCommentTarget};
 use crate::location::ForgeKind;
 use crate::mention::extract_mention;
 use crate::session::Dispatcher;
@@ -28,6 +28,10 @@ use crate::session::Dispatcher;
 struct Cursor {
     last_id: i64,
     last_time: Option<String>,
+    #[serde(default)]
+    review_last_id: i64,
+    #[serde(default)]
+    review_last_time: Option<String>,
 }
 
 /// Cached list of repositories to poll.
@@ -108,6 +112,12 @@ impl Poller {
         for repo in self.repositories(&base, token.as_deref()).await? {
             if let Err(error) = self.poll_repo(&base, token.as_deref(), &repo).await {
                 tracing::warn!(repo = %repo, %error, "failed to poll repository");
+            }
+            if let Err(error) = self
+                .poll_review_comments(&base, token.as_deref(), &repo)
+                .await
+            {
+                tracing::warn!(repo = %repo, %error, "failed to poll review comments");
             }
         }
 
@@ -254,30 +264,152 @@ impl Poller {
             let Some(message) = message_from_comment(repo, &comment) else {
                 continue;
             };
-            if self.dispatcher.policy().is_ignored(&message.author) {
-                continue;
-            }
-            let Some(mention) = extract_mention(&message.body, self.config.trigger()) else {
-                continue;
-            };
-
-            let agent_name = mention
-                .agent
-                .clone()
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| self.dispatcher.default_agent_name().to_owned());
-
-            match self.dispatcher.submit(message, mention, &agent_name).await {
-                Ok(job_id) => tracing::info!(%job_id, repo, "accepted polled trigger"),
-                Err(BotError::Unauthorized(reason)) => {
-                    tracing::info!(%reason, repo, "ignored unauthorized trigger");
-                }
-                Err(error) => tracing::warn!(%error, repo, "failed to enqueue polled trigger"),
-            }
+            self.submit_message(message, repo).await;
         }
 
         self.set_cursor(repo, cursor);
         Ok(())
+    }
+
+    /// Inline review comments are not returned by `/issues/comments`. Scan
+    /// pull requests updated since the previous pass, including closed ones:
+    /// a reply can be added to an existing review after the PR is closed.
+    async fn poll_review_comments(
+        &self,
+        base: &str,
+        token: Option<&str>,
+        repo: &str,
+    ) -> Result<()> {
+        let scan_started = Utc::now();
+        let mut cursor = self.cursor(repo);
+        let since = cursor.review_last_time.clone().unwrap_or_else(|| {
+            (scan_started - chrono::Duration::seconds(self.config.poller.lookback_secs as i64))
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        });
+        let initial_scan = cursor.review_last_time.is_none();
+        let since_time = chrono::DateTime::parse_from_rfc3339(&since).ok();
+        let limit = self.config.poller.page_limit.max(1);
+        let mut comments = Vec::new();
+        let pulls_url = format!("{base}/api/v1/repos/{repo}/pulls");
+
+        for page in 1.. {
+            let mut request = self.client.get(&pulls_url).query(&[
+                ("state", "all".to_owned()),
+                ("sort", "recentupdate".to_owned()),
+                ("limit", limit.to_string()),
+                ("page", page.to_string()),
+            ]);
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("token {token}"));
+            }
+            let response = request.send().await?;
+            if matches!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED
+                    | reqwest::StatusCode::FORBIDDEN
+                    | reqwest::StatusCode::NOT_FOUND
+            ) {
+                return Ok(());
+            }
+            let pulls: Vec<Value> = response.error_for_status()?.json().await?;
+            let count = pulls.len();
+            let mut past_since = false;
+            for pull in pulls {
+                if pull["updated_at"]
+                    .as_str()
+                    .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                    .zip(since_time)
+                    .is_some_and(|(updated, since)| updated < since)
+                {
+                    past_since = true;
+                    break;
+                }
+                let Some(number) = pull["number"].as_u64() else {
+                    continue;
+                };
+                let reviews_url = format!("{pulls_url}/{number}/reviews");
+                for review_page in 1.. {
+                    let mut request = self
+                        .client
+                        .get(&reviews_url)
+                        .query(&[("limit", limit), ("page", review_page)]);
+                    if let Some(token) = token {
+                        request = request.header("Authorization", format!("token {token}"));
+                    }
+                    let reviews: Vec<Value> =
+                        request.send().await?.error_for_status()?.json().await?;
+                    let review_count = reviews.len();
+                    for review in reviews {
+                        let Some(review_id) = review["id"].as_i64() else {
+                            continue;
+                        };
+                        let comments_url = format!("{reviews_url}/{review_id}/comments");
+                        let mut request = self.client.get(&comments_url);
+                        if let Some(token) = token {
+                            request = request.header("Authorization", format!("token {token}"));
+                        }
+                        let review_comments: Vec<Value> =
+                            request.send().await?.error_for_status()?.json().await?;
+                        for comment in review_comments {
+                            let Some(id) = comment["id"].as_i64() else {
+                                continue;
+                            };
+                            if id <= cursor.review_last_id {
+                                continue;
+                            }
+                            if initial_scan
+                                && comment["created_at"]
+                                    .as_str()
+                                    .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                                    .zip(since_time)
+                                    .is_some_and(|(created, since)| created < since)
+                            {
+                                continue;
+                            }
+                            comments.push((id, number, review_id, comment));
+                        }
+                    }
+                    if review_count < limit {
+                        break;
+                    }
+                }
+            }
+            if past_since || count < limit {
+                break;
+            }
+        }
+
+        comments.sort_by_key(|(id, _, _, _)| *id);
+        for (id, number, review_id, comment) in comments {
+            if let Some(message) = message_from_review_comment(repo, number, review_id, &comment) {
+                self.submit_message(message, repo).await;
+            }
+            cursor.review_last_id = id;
+        }
+        cursor.review_last_time = Some(scan_started.to_rfc3339_opts(SecondsFormat::Secs, true));
+        self.set_cursor(repo, cursor);
+        Ok(())
+    }
+
+    async fn submit_message(&self, message: ForgeMessage, repo: &str) {
+        if self.dispatcher.policy().is_ignored(&message.author) {
+            return;
+        }
+        let Some(mention) = extract_mention(&message.body, self.config.trigger()) else {
+            return;
+        };
+        let agent_name = mention
+            .agent
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.dispatcher.default_agent_name().to_owned());
+        match self.dispatcher.submit(message, mention, &agent_name).await {
+            Ok(job_id) => tracing::info!(%job_id, repo, "accepted polled trigger"),
+            Err(BotError::Unauthorized(reason)) => {
+                tracing::info!(%reason, repo, "ignored unauthorized trigger")
+            }
+            Err(error) => tracing::warn!(%error, repo, "failed to enqueue polled trigger"),
+        }
     }
 
     fn cursor(&self, repo: &str) -> Cursor {
@@ -384,6 +516,46 @@ fn message_from_comment(repo: &str, comment: &Value) -> Option<ForgeMessage> {
     })
 }
 
+fn message_from_review_comment(
+    repo: &str,
+    number: u64,
+    review_id: i64,
+    comment: &Value,
+) -> Option<ForgeMessage> {
+    let body = comment["body"].as_str()?.to_owned();
+    let location = Url::parse(comment["html_url"].as_str()?).ok()?;
+    let path = comment["path"].as_str()?.to_owned();
+    let new_position = comment["position"].as_i64().unwrap_or(0);
+    let old_position = comment["original_position"].as_i64().unwrap_or(0);
+    let line = if new_position > 0 {
+        new_position
+    } else {
+        -old_position
+    };
+    Some(ForgeMessage {
+        forge: ForgeKind::Forgejo,
+        location,
+        body,
+        author: comment["user"]["login"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        repository: repo.to_owned(),
+        comment_id: comment["id"].as_i64(),
+        number: Some(number),
+        is_pull_request: true,
+        linked_issue: None,
+        event: "pull_request_comment".into(),
+        title: None,
+        reply_target: ReplyTarget::ReviewComment(ReviewCommentTarget {
+            review_id,
+            path,
+            line,
+            extra_lines_count: comment["extra_lines_count"].as_i64().unwrap_or(0),
+        }),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +624,42 @@ mod tests {
     }
 
     #[test]
+    fn converts_inline_review_comment_to_thread_reply() {
+        let comment = json!({
+            "id": 10227,
+            "body": "@agent change the time",
+            "html_url": "http://forge.local/o/r/pulls/19#issuecomment-10227",
+            "path": ".forgejo/workflows/daily.yml",
+            "position": 7,
+            "original_position": 0,
+            "user": {"login": "alice"}
+        });
+        let message = message_from_review_comment("o/r", 19, 168, &comment).unwrap();
+        assert_eq!(message.comment_id, Some(10227));
+        assert_eq!(message.number, Some(19));
+        assert!(message.is_pull_request);
+        assert_eq!(message.author, "alice");
+        assert_eq!(
+            message.reply_target,
+            ReplyTarget::ReviewComment(ReviewCommentTarget {
+                review_id: 168,
+                path: ".forgejo/workflows/daily.yml".into(),
+                line: 7,
+                extra_lines_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn old_cursor_file_loads_without_review_fields() {
+        let cursor: Cursor =
+            serde_json::from_str(r#"{"last_id":42,"last_time":"2026-09-24T12:00:00Z"}"#).unwrap();
+        assert_eq!(cursor.last_id, 42);
+        assert_eq!(cursor.review_last_id, 0);
+        assert_eq!(cursor.review_last_time, None);
+    }
+
+    #[test]
     fn invalid_time_is_preserved() {
         assert_eq!(normalize_time("not-a-timestamp"), "not-a-timestamp");
     }
@@ -514,6 +722,7 @@ mod tests {
         search: Mutex<Vec<Value>>,
         search_status: Mutex<Option<u16>>,
         comments: Mutex<HashMap<String, MockReply>>,
+        review_endpoints: Mutex<HashMap<String, Value>>,
         requests: Mutex<Vec<String>>,
     }
 
@@ -567,6 +776,10 @@ mod tests {
                 }
                 None => return axum::http::StatusCode::NOT_FOUND.into_response(),
             }
+        }
+
+        if let Some(body) = state.review_endpoints.lock().unwrap().get(&path).cloned() {
+            return axum::response::Json(body).into_response();
         }
 
         axum::http::StatusCode::NOT_FOUND.into_response()
@@ -634,6 +847,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn polls_inline_review_mentions_and_keeps_a_separate_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(MockState::default());
+        state
+            .comments
+            .lock()
+            .unwrap()
+            .insert("o/r".into(), MockReply::Json(json!([])));
+        let base = start_mock(state.clone()).await;
+        let root = "/api/v1/repos/o/r/pulls";
+        {
+            let mut endpoints = state.review_endpoints.lock().unwrap();
+            endpoints.insert(
+                root.into(),
+                json!([{
+                    "number": 19, "updated_at": Utc::now().to_rfc3339()
+                }]),
+            );
+            endpoints.insert(format!("{root}/19/reviews"), json!([{"id": 168}]));
+            endpoints.insert(
+                format!("{root}/19/reviews/168/comments"),
+                json!([
+                    {
+                        "id": 10227, "body": "@agent:custom change the schedule",
+                        "html_url": "http://forge.local/o/r/pulls/19#issuecomment-10227",
+                        "path": ".forgejo/workflows/daily.yml", "position": 7,
+                        "original_position": 0, "pull_request_review_id": 168,
+                        "created_at": Utc::now().to_rfc3339(),
+                        "user": {"login": "alice"}
+                    }
+                ]),
+            );
+        }
+
+        let mut config = test_config(dir.path(), &base);
+        config.poller.repositories = vec!["o/r".into()];
+        let (poller, sessions) = build_poller(config);
+        poller.tick().await.unwrap();
+        for _ in 0..200 {
+            if sessions.get("forgejo:o/r:pr:19").is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(sessions.get("forgejo:o/r:pr:19").is_some());
+        let cursor = poller.cursor("o/r");
+        assert_eq!(cursor.last_id, 0);
+        assert_eq!(cursor.review_last_id, 10227);
+        assert!(cursor.review_last_time.is_some());
+
+        // The same comment returned on another pass does not start another run.
+        poller.tick().await.unwrap();
+        assert_eq!(poller.cursor("o/r").review_last_id, 10227);
+    }
+
+    #[tokio::test]
     async fn polls_explicit_repositories_and_persists_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(MockState::default());
@@ -686,6 +955,7 @@ mod tests {
             Cursor {
                 last_id: 7,
                 last_time: Some("2026-09-24T12:00:00Z".into()),
+                ..Default::default()
             },
         );
 
