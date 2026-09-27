@@ -311,7 +311,7 @@ impl Inner {
         };
 
         // The requested agent first, then every other available agent. Agents
-        // known to be at capacity are skipped entirely.
+        // known to be unavailable are skipped entirely.
         let candidates = self.candidate_agents(&job.agent);
         if candidates.is_empty() {
             if job.status_comment.is_none() {
@@ -335,7 +335,7 @@ impl Inner {
             running_agent = name.clone();
 
             // Buffer the notice for this step so the whole calling sequence
-            // shares one comment. Every agent skipped because it is at capacity
+            // shares one comment. Every agent skipped because it is unavailable
             // is named, so an intermediate fallback (for example `agy`) is
             // never silently passed over.
             if self.config.reply.ack {
@@ -347,10 +347,10 @@ impl Inner {
                         Some(match skipped.as_slice() {
                             [] => format!("⚠️ Running agent **{name}** instead."),
                             [only] => format!(
-                                "⚠️ Agent **{only}** is at capacity; running agent **{name}** instead."
+                                "⚠️ Agent **{only}** is unavailable; running agent **{name}** instead."
                             ),
                             many => format!(
-                                "⚠️ Agents {} are at capacity; running agent **{name}** instead.",
+                                "⚠️ Agents {} are unavailable; running agent **{name}** instead.",
                                 agent_list(many)
                             ),
                         })
@@ -375,7 +375,7 @@ impl Inner {
                         format!("⚠️ Agent **{previous}** failed; switching to **{name}**.")
                     } else {
                         format!(
-                            "⚠️ Agent **{previous}** failed; {} at capacity; switching to **{name}**.",
+                            "⚠️ Agent **{previous}** failed; {} unavailable; switching to **{name}**.",
                             match skipped.as_slice() {
                                 [only] => format!("agent **{only}** is"),
                                 many => format!("agents {} are", agent_list(many)),
@@ -641,8 +641,8 @@ impl Inner {
     }
 }
 
-/// Reply posted when every configured agent is at capacity.
-pub const NO_AVAILABLE_AGENT: &str = "No available agent. Every configured agent has hit a quota or capacity limit; \
+/// Reply posted when every configured agent is currently unavailable.
+pub const NO_AVAILABLE_AGENT: &str = "No available agent. Every configured agent is currently unavailable; \
      please try again later.";
 
 /// Build a failure outcome, replacing forge permission errors with a clear
@@ -1576,7 +1576,7 @@ mod tests {
         assert!(
             comments
                 .iter()
-                .any(|c| c.contains("at capacity") && c.contains("instead")),
+                .any(|c| c.contains("unavailable") && c.contains("instead")),
             "the fallback should be announced: {comments:?}"
         );
     }

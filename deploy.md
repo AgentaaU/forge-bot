@@ -161,7 +161,7 @@ mentions reuse it while it is idle.
 | Webhook `401` | Secret mismatch or missing `X-Forgejo-Signature`. |
 | Forgejo cannot deliver to `127.0.0.1` | Allow loopback in `[webhook] ALLOWED_HOST_LIST`, or use the poller. |
 | Poller never triggers | `poller.enabled = false`, or the token cannot see the repository. Reset `state/poller.json` if a cursor ran ahead. |
-| `failed to spawn pi` | `pi` is not on the service account's `PATH`; set `[pi_rpc] command` to an absolute path. |
+| `failed to spawn pi` (or `agy`) | `~/.local/bin` is not on the service `PATH`. The shipped unit sets it; for a custom unit add `Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin`, or set `[pi_rpc] command` to an absolute path. |
 | User service exits with `status=209/STDOUT` | The log directory is missing. `mkdir -p ~/.local/state/forge-bot` (`install-user.sh` does this) and restart. |
 | No reply comment | `[reply] result = false`, or the token lacks `write:issue`. |
 | Jobs pile up | Raise `[session] workers`, the single cap on concurrent agent runs (pooled `pi-rpc` and one-shot alike). |

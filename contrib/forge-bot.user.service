@@ -8,6 +8,11 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/.config/forge-bot
 EnvironmentFile=-%h/.config/forge-bot/forge-bot.env
+# The systemd user manager's default PATH is /usr/local/bin:/usr/bin, which
+# omits %h/.local/bin where `forge-bot` and the default `pi` agent live. Without
+# this, the pi-rpc (and any custom) adapter fails to spawn with
+# "No such file or directory".
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
 ExecStart=%h/.local/bin/forge-bot --config %h/.config/forge-bot/forge-bot.toml serve
 Restart=on-failure
 RestartSec=5s
