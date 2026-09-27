@@ -401,3 +401,314 @@ async fn comment_from_the_bot_is_ignored() {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert!(harness.sessions.pending_jobs().unwrap().is_empty());
 }
+
+async fn body_text(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn status_page_renders_when_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("forge-bot — thread status"), "{html}");
+    assert!(html.contains("No threads yet."), "{html}");
+}
+
+#[tokio::test]
+async fn status_json_lists_a_finished_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", PAYLOAD))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    for _ in 0..200 {
+        if harness.sessions.pending_jobs().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/status.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = body_text(response).await;
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let threads = value["threads"].as_array().expect("threads array");
+    assert_eq!(threads.len(), 1, "{text}");
+    assert_eq!(threads[0]["state"], "idle");
+    assert_eq!(threads[0]["repository"], "shylock/forge-bot");
+    assert_eq!(threads[0]["thread_type"], "issue");
+    assert_eq!(threads[0]["number"], 1);
+    assert!(threads[0].get("model").is_some(), "{text}");
+}
+
+#[tokio::test]
+async fn status_json_reports_the_agent_model() {
+    let dir = tempfile::tempdir().unwrap();
+    // `true` ignores the configured `--model` flag, so the run still succeeds.
+    let harness = harness_with(dir.path(), |config| {
+        let agent = config.agents.overrides.get_mut("custom").unwrap();
+        agent.command = Some("true".into());
+        agent.args = Some(vec!["--model".into(), "deepseek-flash".into()]);
+    });
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", PAYLOAD))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    for _ in 0..200 {
+        if harness.sessions.pending_jobs().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/status.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = body_text(response).await;
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["threads"][0]["model"], "deepseek-flash", "{text}");
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("<th>Model</th>"), "{html}");
+    assert!(html.contains("deepseek-flash"), "{html}");
+}
+
+#[tokio::test]
+async fn status_search_finds_a_thread_by_comment_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", PAYLOAD))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    for _ in 0..200 {
+        if harness.sessions.pending_jobs().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // `#` is percent-encoded so it reaches the server as part of `q`.
+    let found = "https://forgejo.shylockhg.me/shylock/forge-bot/issues/1%23issuecomment-77";
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/status?q={found}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("1 of 1 thread(s) match"), "{html}");
+    assert!(html.contains("shylock/forge-bot"), "{html}");
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/status.json?q={found}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(value["threads"].as_array().unwrap().len(), 1);
+
+    let missing = "https://forgejo.shylockhg.me/shylock/forge-bot/issues/999";
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/status?q={missing}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("No thread matches"), "{html}");
+}
+
+#[tokio::test]
+async fn status_routes_do_not_change_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", PAYLOAD))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    for _ in 0..200 {
+        if harness.sessions.pending_jobs().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let before = state_fingerprint(dir.path());
+    assert!(
+        !before.is_empty(),
+        "expected persisted state to fingerprint"
+    );
+
+    // Plain and filtered reads of both the HTML and JSON views.
+    for uri in [
+        "/status",
+        "/status.json",
+        "/status?q=https%3A%2F%2Fforge.local%3A3000%2Fshylock%2Fforge-bot%2Fissues%2F1%23issuecomment-77",
+        "/status.json?q=https%3A%2F%2Fforge.local%3A3000%2Fshylock%2Fforge-bot%2Fissues%2F1%23issuecomment-77",
+    ] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let _ = body_text(response).await;
+    }
+
+    // Reading the page must not have created, rewritten or removed anything.
+    assert_eq!(state_fingerprint(dir.path()), before);
+}
+
+/// Sorted `relative path -> contents` for every file under `dir`, so a test can
+/// assert that reading the status page left persisted state byte-for-byte
+/// unchanged.
+fn state_fingerprint(dir: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        for entry in std::fs::read_dir(&path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let relative = path
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                files.insert(relative, std::fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn status_routes_report_storage_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+    // Removing the job queue makes `pending_jobs()` fail, which both routes
+    // surface as a 500 rather than panicking.
+    std::fs::remove_dir(dir.path().join("jobs")).unwrap();
+
+    for (uri, marker) in [
+        ("/status", "failed to read thread status"),
+        ("/status.json", "\"error\""),
+    ] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = body_text(response).await;
+        assert!(text.contains(marker), "{uri}: {text}");
+    }
+}

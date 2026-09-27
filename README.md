@@ -121,6 +121,10 @@ Implemented:
 - [x] Per-user systemd service (no root)
 - [x] Polling ingester for deployments where the bot cannot create a webhook: discovers every repository visible to the token and refreshes the list, so new repositories are picked up automatically
 - [x] Agent capacity / quota handling: a failed run that looks like a usage limit, rate limit or provider overload marks the agent unavailable for a cooldown and the job is retried on another available agent (adapters that cannot even start are skipped too); the fallback notice names each skipped agent with the reason it was taken out of rotation (for example `capacity limit` or `start failed`), and when none is left the bot replies `No available agent` listing those reasons
+- [x] Web status page: `/status` renders every known thread with its state
+  (running / queued / idle), the agent involved, the model it is launched with,
+  the queued follow-ups and the last result, and searches by comment/issue URL;
+  `/status.json` serves the same snapshot (and filter) for scripts
 
 Still open (see the issue's roadmap):
 
@@ -204,6 +208,22 @@ Quick repository hook: **Settings → Webhooks → Add webhook → Forgejo**, ta
 The endpoint also accepts GitHub (`/webhooks/github`) and GitLab
 (`/webhooks/gitlab`) webhooks, selected by URL path.
 
+## Status page
+
+While the server is running, `GET /status` renders a self-refreshing HTML page
+listing every thread the bot knows about: conversations with an agent in flight
+(*running*), mentions waiting for a worker (*queued*), and idle threads with
+their most recent result. Each row names the agent and the model it is launched
+with, read from `[pi_rpc].model` or a `--model`/`-m` in the adapter's `args`
+(shown as `—` when the adapter has no model configured). `GET /status.json`
+returns the same snapshot as JSON for dashboards or scripts, and `GET /`
+reports the enabled forges and agents.
+
+The page has a search box: paste a comment or issue/pull-request URL (for
+example `https://forgejo.example.com/owner/repo/pulls/460#issuecomment-10561`)
+to filter the table to that thread. The same filter is available to scripts as
+`GET /status.json?q=<url>`.
+
 ## Trigger syntax
 
 ```text
@@ -240,6 +260,9 @@ The mention is matched case-insensitively and only at a word boundary, so
   stripped from `origin` afterwards.
 - `workspace.enabled = false` runs agents in an empty directory and lets them
   access the forge themselves.
+- The status page has no authentication: it lists repository names and thread
+  URLs for every conversation the bot has seen. Keep the listener on an
+  internal interface or put it behind a reverse proxy with access control.
 
 ## Project layout
 

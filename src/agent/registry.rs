@@ -240,6 +240,15 @@ impl AgentRegistry {
         }
     }
 
+    /// Model an agent is currently launched with, when known. Powers the
+    /// status page's Model column; it only reads the adapter.
+    pub fn model(&self, name: &str) -> Option<String> {
+        self.agents
+            .get(name)
+            .and_then(|agent| agent.model())
+            .map(str::to_owned)
+    }
+
     /// All registered agent names in preference order: built-ins in
     /// [`BUILTIN_AGENTS`] order (so `codex` leads), then custom adapters
     /// alphabetically.
@@ -414,6 +423,24 @@ mod tests {
         let registry = AgentRegistry::from_config(&config);
         assert_eq!(registry.get("pi").unwrap().name(), "pi");
         assert!(registry.names().contains(&"pi".to_owned()));
+    }
+
+    #[test]
+    fn reports_configured_models() {
+        let mut config = Config::default();
+        config.pi_rpc.model = Some("deepseek-flash".into());
+        config.agents.overrides.insert(
+            "codex".into(),
+            AgentConfig {
+                args: Some(vec!["--model".into(), "gpt-5-codex".into()]),
+                ..Default::default()
+            },
+        );
+        let registry = AgentRegistry::from_config(&config);
+        assert_eq!(registry.model("pi-rpc"), Some("deepseek-flash".to_owned()));
+        assert_eq!(registry.model("codex"), Some("gpt-5-codex".to_owned()));
+        assert_eq!(registry.model("agy"), None);
+        assert_eq!(registry.model("missing"), None);
     }
 
     #[test]

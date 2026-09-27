@@ -634,6 +634,10 @@ impl Agent for PiPoolAgent {
         "pi-rpc"
     }
 
+    fn model(&self) -> Option<&str> {
+        self.inner.config.model.as_deref()
+    }
+
     async fn run(&self, request: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
         let started = Instant::now();
         let key = conversation_key(context);
@@ -698,6 +702,19 @@ mod tests {
 
     fn store() -> Arc<SessionStore> {
         Arc::new(SessionStore::default())
+    }
+
+    #[test]
+    fn reports_the_configured_model() {
+        let config = PiRpcConfig {
+            model: Some("deepseek-flash".into()),
+            ..Default::default()
+        };
+        let agent = PiPoolAgent::new(&config, store(), 1);
+        assert_eq!(agent.model(), Some("deepseek-flash"));
+
+        let agent = PiPoolAgent::new(&PiRpcConfig::default(), store(), 1);
+        assert_eq!(agent.model(), None);
     }
 
     #[test]

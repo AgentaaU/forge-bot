@@ -8,9 +8,9 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
@@ -21,6 +21,7 @@ use crate::error::BotError;
 use crate::forge::ForgeAdapter;
 use crate::mention::extract_mention;
 use crate::session::Dispatcher;
+use crate::session::status;
 
 /// Shared state for the webhook server.
 #[derive(Clone)]
@@ -114,6 +115,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
+        .route("/status", get(status_page))
+        .route("/status.json", get(status_json))
         .route("/webhooks/{forge}", post(receive))
         .route("/webhook/{forge}", post(receive))
         .with_state(state)
@@ -126,7 +129,46 @@ async fn root(State(state): State<AppState>) -> impl IntoResponse {
         "forges": state.adapters.keys().collect::<Vec<_>>(),
         "agents": state.agents.names(),
         "mention": state.config.trigger(),
+        "status": "/status",
     }))
+}
+
+/// Human-readable status page for every thread the bot knows about.
+async fn status_page(State(state): State<AppState>, Query(query): Query<StatusQuery>) -> Response {
+    match state.dispatcher.threads() {
+        Ok(threads) => Html(status::render_html(&threads, query.q.as_deref())).into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "failed to build thread status");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to read thread status: {error}\n"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Machine-readable form of the status page, optionally filtered by `q`.
+async fn status_json(State(state): State<AppState>, Query(query): Query<StatusQuery>) -> Response {
+    match state.dispatcher.threads() {
+        Ok(threads) => {
+            Json(json!({ "threads": status::search(&threads, query.q.as_deref()) })).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to build thread status");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Optional search query for the status routes: a comment or issue/PR URL.
+#[derive(Debug, Default, serde::Deserialize)]
+struct StatusQuery {
+    q: Option<String>,
 }
 
 async fn healthz() -> impl IntoResponse {

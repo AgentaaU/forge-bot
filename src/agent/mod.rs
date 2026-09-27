@@ -182,6 +182,15 @@ pub trait Agent: Send + Sync {
     /// Adapter name, e.g. `codex`.
     fn name(&self) -> &str;
 
+    /// Model the adapter is currently launched with, when known.
+    ///
+    /// The status page shows this next to the agent name. It reports the
+    /// existing configuration and never changes it: adapters that rely on
+    /// their CLI's own default return `None`.
+    fn model(&self) -> Option<&str> {
+        None
+    }
+
     /// Run the agent for one request. Implementations should be idempotent and
     /// must not panic on agent failure.
     async fn run(&self, request: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome>;

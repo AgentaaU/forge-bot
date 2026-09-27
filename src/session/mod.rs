@@ -9,6 +9,7 @@
 //! feel like a conversation.
 
 pub mod queue;
+pub mod status;
 pub mod store;
 
 use chrono::{DateTime, Utc};
@@ -19,6 +20,7 @@ use crate::forge::ForgeMessage;
 use crate::mention::Mention;
 
 pub use queue::Dispatcher;
+pub use status::{ThreadState, ThreadStatus};
 pub use store::{RunRecord, Session, SessionStore};
 
 /// One unit of work handed to an agent.

@@ -25,6 +25,7 @@ use crate::forge::ForgeMessage;
 use crate::forge_api::ForgeApi;
 use crate::mention::Mention;
 use crate::policy::Policy;
+use crate::session::status::{self, ThreadStatus};
 use crate::session::{Job, SessionStore};
 use crate::workspace::WorkspaceManager;
 
@@ -176,6 +177,20 @@ impl Dispatcher {
     /// The agent selected for mentions without an explicit adapter name.
     pub fn default_agent_name(&self) -> &str {
         self.inner.agents.default_name()
+    }
+
+    /// A snapshot of every conversation the bot is tracking, newest activity
+    /// first within each state. Powers the `/status` page.
+    pub fn threads(&self) -> Result<Vec<ThreadStatus>> {
+        let sessions = self.inner.sessions.list();
+        let pending = self.inner.sessions.pending_jobs()?;
+        let mut threads = status::snapshot(sessions, pending);
+        // The snapshot only knows agent names; resolve their current model
+        // from the registry so the page can show it next to the agent.
+        for thread in &mut threads {
+            thread.model = self.inner.agents.model(&thread.agent);
+        }
+        Ok(threads)
     }
 }
 

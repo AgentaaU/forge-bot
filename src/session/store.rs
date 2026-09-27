@@ -156,6 +156,16 @@ impl SessionStore {
             .cloned()
     }
 
+    /// All stored sessions, in no particular order. Used by the status page.
+    pub fn list(&self) -> Vec<Session> {
+        self.sessions
+            .lock()
+            .expect("session mutex poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
     fn persist_locked(&self, session: &Session) -> Result<()> {
         let path = self
             .dir
@@ -293,6 +303,7 @@ mod tests {
         }
         let store = SessionStore::open(dir.path()).unwrap();
         assert!(store.get(&SessionStore::key(&job().message)).is_some());
+        assert_eq!(store.list().len(), 1);
     }
 
     #[test]
