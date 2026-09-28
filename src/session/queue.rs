@@ -19,6 +19,7 @@ use crate::agent::capacity::is_capacity_limited;
 use crate::agent::{
     Agent, AgentContext, AgentOutcome, AgentRegistry, AgentRequest, UnavailableReason,
 };
+use crate::auto_trigger::AUTO_TRIGGER_AUTHOR;
 use crate::config::Config;
 use crate::error::{BotError, Result};
 use crate::forge::ForgeMessage;
@@ -180,10 +181,13 @@ impl Dispatcher {
         // to the same comment (issue #77). Otherwise the worker buffers the
         // notices and posts them together.
         if self.inner.config.reply.ack {
-            let ack = if waiting {
+            // An automatic trigger acknowledges at reception even when the
+            // conversation is busy: the point is to say why the bot is there.
+            // A human mention that has to wait keeps the plain waiting text.
+            let ack = if waiting && !is_auto_trigger(&job.message) {
                 WAITING_ACK.to_owned()
             } else {
-                format!("🤖 On it — running agent **{}**.", job.agent)
+                running_headline(&job.message, &job.agent)
             };
             job.status_comment = self.inner.reply_tracked(&job.message, &ack).await;
         }
@@ -743,7 +747,7 @@ impl Inner {
         agent: &str,
         notices: &[String],
     ) {
-        let body = format!("forge-bot: {}", status_body(agent, notices));
+        let body = format!("forge-bot: {}", status_body(message, agent, notices));
         if let Err(error) = self.api.update_reply(message, comment_id, &body).await {
             tracing::warn!(
                 location = %message.location,
@@ -764,7 +768,7 @@ impl Inner {
         if !self.config.reply.ack && notices.is_empty() {
             return;
         }
-        let body = status_body(agent, notices);
+        let body = status_body(message, agent, notices);
         notices.clear();
         self.reply(message, &body).await;
     }
@@ -908,11 +912,42 @@ fn permission_aware_failure(job: &Job, error: &BotError) -> AgentOutcome {
 
 /// Render the shared status comment: the "on it" headline naming the agent
 /// that runs, followed by every fallback notice collected so far.
-fn status_body(agent: &str, notices: &[String]) -> String {
+fn status_body(message: &ForgeMessage, agent: &str, notices: &[String]) -> String {
     let mut parts = Vec::with_capacity(notices.len() + 1);
-    parts.push(format!("🤖 On it — running agent **{agent}**."));
+    parts.push(running_headline(message, agent));
     parts.extend(notices.iter().cloned());
     parts.join(" ")
+}
+
+/// The "on it" headline. A job started by a signed forge event instead of a
+/// mention states what triggered it, so the thread is not left guessing why the
+/// bot replied.
+fn running_headline(message: &ForgeMessage, agent: &str) -> String {
+    match auto_trigger_origin(message) {
+        Some(origin) => {
+            format!("🤖 On it — triggered by {origin}; running agent **{agent}**.")
+        }
+        None => format!("🤖 On it — running agent **{agent}**."),
+    }
+}
+
+/// True when a signed forge event started this job instead of a human
+/// mention.
+fn is_auto_trigger(message: &ForgeMessage) -> bool {
+    message.author == AUTO_TRIGGER_AUTHOR
+}
+
+/// Describe why a signed forge event started this job, or `None` when the job
+/// came from a human mention.
+fn auto_trigger_origin(message: &ForgeMessage) -> Option<&'static str> {
+    if !is_auto_trigger(message) {
+        return None;
+    }
+    Some(match message.event.as_str() {
+        "action_run_failure" => "a failed CI run",
+        "merge_conflict" => "a merge conflict",
+        _ => "an automatic forge event",
+    })
 }
 
 /// Render one unavailable agent with its reason, e.g.
@@ -2878,6 +2913,146 @@ echo "end:$token" >> "$AGENT_LOG"
 
         release_token(&release, "TOKEN_B");
         wait_for_drain(&sessions).await;
+    }
+
+    /// A signed forge event states what triggered the run instead of implying
+    /// a user mentioned the bot.
+    #[tokio::test]
+    async fn auto_trigger_ack_names_its_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, log, release) = gated_config(dir.path(), 1);
+        config.reply.ack = true;
+        let config = Arc::new(config);
+        let registry = isolated_registry(&config, &["gate"]);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(EditableApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry,
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        let mut message = message_at("o/r", 9);
+        message.author = crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into();
+        message.event = "action_run_failure".into();
+        message.comment_id = None;
+        dispatcher
+            .submit_auto(
+                message,
+                Mention {
+                    agent: None,
+                    message: "TOKEN_A".into(),
+                },
+                "gate",
+            )
+            .await
+            .unwrap();
+
+        let ack = api
+            .comments()
+            .into_iter()
+            .next()
+            .expect("the automatic trigger must be acknowledged");
+        assert_eq!(
+            ack,
+            "forge-bot: 🤖 On it — triggered by a failed CI run; running agent **gate**."
+        );
+
+        wait_for_log(&log, "start:TOKEN_A").await;
+        release_token(&release, "TOKEN_A");
+        wait_for_drain(&sessions).await;
+    }
+
+    /// An automatic trigger is acknowledged at reception, even while the
+    /// conversation is busy, naming what triggered it.
+    #[tokio::test]
+    async fn auto_trigger_is_acknowledged_while_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, log, release) = gated_config(dir.path(), 1);
+        config.reply.ack = true;
+        let config = Arc::new(config);
+        let registry = isolated_registry(&config, &["gate"]);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(EditableApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry,
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        // Occupy the conversation with a human mention first.
+        submit_token(&dispatcher, "o/r", 9, "TOKEN_A").await;
+        wait_for_log(&log, "start:TOKEN_A").await;
+
+        let mut message = message_at("o/r", 9);
+        message.author = crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into();
+        message.event = "merge_conflict".into();
+        message.comment_id = None;
+        dispatcher
+            .submit_auto(
+                message,
+                Mention {
+                    agent: None,
+                    message: "TOKEN_B".into(),
+                },
+                "gate",
+            )
+            .await
+            .unwrap();
+
+        let comments = api.comments();
+        assert!(
+            comments.iter().any(|comment| comment
+                == "forge-bot: 🤖 On it — triggered by a merge conflict; running agent **gate**."),
+            "the automatic trigger must be acknowledged with its origin: {comments:?}"
+        );
+        assert!(
+            !comments.iter().any(|comment| comment.contains("Waiting")),
+            "the waiting acknowledgement must stay unchanged: {comments:?}"
+        );
+
+        release_token(&release, "TOKEN_A");
+        wait_for_log(&log, "start:TOKEN_B").await;
+        release_token(&release, "TOKEN_B");
+        wait_for_drain(&sessions).await;
+    }
+
+    /// The origin wording only applies to signed forge events; a human mention
+    /// keeps the plain headline.
+    #[test]
+    fn auto_trigger_origin_maps_events() {
+        let mut message = message_at("o/r", 1);
+        message.author = crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into();
+        message.event = "action_run_failure".into();
+        assert!(is_auto_trigger(&message));
+        assert_eq!(auto_trigger_origin(&message), Some("a failed CI run"));
+        assert_eq!(
+            running_headline(&message, "codex"),
+            "🤖 On it — triggered by a failed CI run; running agent **codex**."
+        );
+
+        message.event = "merge_conflict".into();
+        assert_eq!(auto_trigger_origin(&message), Some("a merge conflict"));
+
+        message.event = "future_event".into();
+        assert_eq!(
+            auto_trigger_origin(&message),
+            Some("an automatic forge event")
+        );
+
+        let human = message_at("o/r", 2);
+        assert!(!is_auto_trigger(&human));
+        assert_eq!(auto_trigger_origin(&human), None);
+        assert_eq!(
+            running_headline(&human, "codex"),
+            "🤖 On it — running agent **codex**."
+        );
     }
 
     /// Jobs recovered from disk after a restart must respect the same

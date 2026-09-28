@@ -16,6 +16,11 @@ use crate::session::Dispatcher;
 
 const MAX_SEEN: usize = 4096;
 
+/// Synthetic author recorded on messages that a signed forge event starts
+/// without a user mention. The queue uses it to word its acknowledgement as an
+/// automatic trigger instead of implying a human mentioned the bot.
+pub(crate) const AUTO_TRIGGER_AUTHOR: &str = "forgejo-event";
+
 pub(crate) struct AutoTrigger {
     client: reqwest::Client,
     path: PathBuf,
@@ -336,7 +341,7 @@ fn auto_message(
         forge: ForgeKind::Forgejo,
         location,
         body: instruction.to_owned(),
-        author: "forgejo-event".into(),
+        author: AUTO_TRIGGER_AUTHOR.into(),
         repository: repo.to_owned(),
         comment_id: None,
         number: Some(number),
