@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// The result of matching the configured trigger in a comment body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mention {
-    /// Optional agent selected inline, e.g. `@agent:codex`.
+    /// Optional agent selected inline, e.g. `@agent --agent=codex`.
     pub agent: Option<String>,
     /// The instruction left after removing the trigger.
     pub message: String,
@@ -34,8 +34,9 @@ impl Mention {
 /// Find the first mention of `trigger` in `body`.
 ///
 /// The trigger is matched case-insensitively at a word boundary (the character
-/// before it must not be alphanumeric or `_`). An optional `:<agent>` suffix
-/// selects a specific adapter, e.g. `@agent:codex fix the lint errors`.
+/// before it must not be alphanumeric or `_`). An optional `--agent=<name>`
+/// argument selects a specific adapter, e.g. `@agent --agent=codex fix it`.
+/// The space lets forges render `@agent` as a clickable mention.
 ///
 /// Returns `None` when the trigger is absent.
 pub fn extract_mention(body: &str, trigger: &str) -> Option<Mention> {
@@ -58,14 +59,25 @@ pub fn extract_mention(body: &str, trigger: &str) -> Option<Mention> {
         };
         let after = &body[idx + len..];
 
-        // Optional `:agent` selector directly after the trigger.
-        let (agent, rest) = match after.strip_prefix(':') {
-            Some(after_colon) => {
-                let end = after_colon
+        // Reject the old colon selector rather than treating it as a default-agent request.
+        let after_spaces = after.trim_start_matches([' ', '\t']);
+        if after_spaces.strip_prefix(':').is_some_and(|rest| {
+            rest.starts_with(|c: char| c.is_alphanumeric() || c == '-' || c == '_')
+        }) {
+            continue;
+        }
+        let selector = if after_spaces.len() < after.len() {
+            after_spaces.strip_prefix("--agent=")
+        } else {
+            None
+        };
+        let (agent, rest) = match selector {
+            Some(after_argument) => {
+                let end = after_argument
                     .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-                    .unwrap_or(after_colon.len());
-                let name = &after_colon[..end];
-                let rest = &after_colon[end..];
+                    .unwrap_or(after_argument.len());
+                let name = &after_argument[..end];
+                let rest = &after_argument[end..];
                 let name = name.trim();
                 (
                     if name.is_empty() {
@@ -119,10 +131,32 @@ mod tests {
     }
 
     #[test]
-    fn extracts_inline_agent() {
-        let m = extract_mention("@agent:codex fix it", "@agent").unwrap();
+    fn rejects_old_colon_selectors() {
+        assert!(extract_mention("@agent:codex fix it", "@agent").is_none());
+        assert!(extract_mention("@agent :pi-rpc fix it", "@agent").is_none());
+        assert!(extract_mention("@agent\t:codex fix it", "@agent").is_none());
+    }
+
+    #[test]
+    fn extracts_agent_argument_after_clickable_mention() {
+        let m = extract_mention("@agent --agent=pi-rpc review the diff", "@agent").unwrap();
+        assert_eq!(m.agent.as_deref(), Some("pi-rpc"));
+        assert_eq!(m.message, "review the diff");
+
+        let m = extract_mention("@agent\t--agent=codex fix it", "@agent").unwrap();
         assert_eq!(m.agent.as_deref(), Some("codex"));
         assert_eq!(m.message, "fix it");
+    }
+
+    #[test]
+    fn agent_argument_only_selects_at_start_after_whitespace() {
+        let m = extract_mention("@agent fix --agent=pi-rpc", "@agent").unwrap();
+        assert_eq!(m.agent, None);
+        assert_eq!(m.message, "fix --agent=pi-rpc");
+
+        let m = extract_mention("@agent--agent=pi-rpc fix it", "@agent").unwrap();
+        assert_eq!(m.agent, None);
+        assert_eq!(m.message, "--agent=pi-rpc fix it");
     }
 
     #[test]
@@ -145,7 +179,7 @@ mod tests {
 
     #[test]
     fn matches_unicode_trigger_with_different_byte_lengths() {
-        let m = extract_mention("@ⱥgent:codex fix it", "@Ⱥgent").unwrap();
+        let m = extract_mention("@ⱥgent --agent=codex fix it", "@Ⱥgent").unwrap();
         assert_eq!(m.agent.as_deref(), Some("codex"));
         assert_eq!(m.message, "fix it");
     }
@@ -158,7 +192,7 @@ mod tests {
 
     #[test]
     fn matches_complete_unicode_lowercase_expansions() {
-        let m = extract_mention("@İ:codex fix it", "@i\u{307}").unwrap();
+        let m = extract_mention("@İ --agent=codex fix it", "@i\u{307}").unwrap();
         assert_eq!(m.agent.as_deref(), Some("codex"));
         assert_eq!(m.message, "fix it");
 

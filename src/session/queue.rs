@@ -1001,7 +1001,7 @@ mod tests {
         ForgeMessage {
             forge: ForgeKind::Forgejo,
             location: Url::parse("http://forge.local/o/r/issues/1").unwrap(),
-            body: "@agent:custom go".into(),
+            body: "@agent --agent=custom go".into(),
             author: "alice".into(),
             repository: repo.into(),
             comment_id: Some(1),

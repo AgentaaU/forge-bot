@@ -22,7 +22,7 @@ mention = "@agent"
 # Ordered agents for unqualified mentions and capacity fallback. When omitted,
 # the built-in order starts with codex. Use adapter names (`agy` for
 # Antigravity, `claude` for Claude Code).
-# Only listed agents are tried as fallbacks; explicit @agent:<name> still works.
+# Only listed agents are tried as fallbacks; use @agent --agent=<name> to select one.
 agent_sequence = ["codex", "agy", "pi-rpc", "claude"]
 
 [forgejo]
