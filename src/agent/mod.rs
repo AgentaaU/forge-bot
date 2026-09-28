@@ -60,8 +60,31 @@ pub struct AgentContext {
     pub reply_target: ReplyTarget,
     /// Environment variables carrying forge credentials.
     pub credentials: Vec<(String, String)>,
+    /// Recent output from the current run, shared with the status page.
+    pub live_output: Option<LiveOutput>,
     /// Shared with the status page while this run is active.
     pub reported_model: Arc<Mutex<Option<String>>>,
+}
+
+/// Bounded output buffer for a run in progress. It is never persisted.
+#[derive(Debug, Clone, Default)]
+pub struct LiveOutput(Arc<Mutex<Vec<u8>>>);
+
+impl LiveOutput {
+    const LIMIT: usize = 1024 * 1024;
+
+    pub fn append(&self, bytes: &[u8]) {
+        let mut output = self.0.lock().expect("live output mutex poisoned");
+        output.extend_from_slice(bytes);
+        if output.len() > Self::LIMIT {
+            let excess = output.len() - Self::LIMIT;
+            output.drain(..excess);
+        }
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("live output mutex poisoned")).into_owned()
+    }
 }
 
 impl AgentContext {
@@ -230,6 +253,7 @@ mod tests {
             title: None,
             reply_target: ReplyTarget::Conversation,
             credentials: vec![("FORGEJO_TOKEN".into(), "secret".into())],
+            live_output: None,
             reported_model: Default::default(),
         };
         let env = ctx.environment(&request);
@@ -242,5 +266,15 @@ mod tests {
             env.iter()
                 .any(|(k, v)| k == "FORGE_BOT_ISSUE_NUMBER" && v == "1")
         );
+    }
+
+    #[test]
+    fn live_output_keeps_only_recent_bytes() {
+        let output = LiveOutput::default();
+        output.append(&vec![b'a'; LiveOutput::LIMIT]);
+        output.append(b"end");
+        let text = output.text();
+        assert_eq!(text.len(), LiveOutput::LIMIT);
+        assert!(text.ends_with("end"));
     }
 }

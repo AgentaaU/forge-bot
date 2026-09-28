@@ -212,6 +212,15 @@ impl Dispatcher {
         }
         Ok(threads)
     }
+
+    /// Read the persisted run history for one conversation.
+    pub fn session(&self, key: &str) -> Option<crate::session::Session> {
+        self.inner.sessions.get(key)
+    }
+
+    pub fn live_output(&self, job_id: Uuid) -> Option<crate::agent::LiveOutput> {
+        self.inner.sessions.live_output(job_id)
+    }
 }
 
 /// Receive jobs and run them with bounded concurrency.
@@ -493,6 +502,7 @@ impl Inner {
             title: job.message.title.clone(),
             reply_target: job.message.reply_target.clone(),
             credentials,
+            live_output: self.sessions.live_output(job.id),
             reported_model: Default::default(),
         };
 

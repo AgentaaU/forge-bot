@@ -116,6 +116,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(root))
         .route("/healthz", get(healthz))
         .route("/status", get(status_page))
+        .route("/status/details", get(status_details))
         .route("/status.json", get(status_json))
         .route("/webhooks/{forge}", post(receive))
         .route("/webhook/{forge}", post(receive))
@@ -146,6 +147,51 @@ async fn status_page(State(state): State<AppState>, Query(query): Query<StatusQu
                 .into_response()
         }
     }
+}
+
+/// Run history for a thread selected from the status table.
+async fn status_details(
+    State(state): State<AppState>,
+    Query(query): Query<DetailsQuery>,
+) -> Response {
+    match state.dispatcher.threads() {
+        Ok(threads) => match threads.iter().find(|thread| thread.key == query.key) {
+            Some(thread) => {
+                let session = state.dispatcher.session(&query.key);
+                let live_output = session
+                    .as_ref()
+                    .and_then(|session| {
+                        session
+                            .runs
+                            .iter()
+                            .rev()
+                            .find(|run| run.finished_at.is_none())
+                    })
+                    .and_then(|run| state.dispatcher.live_output(run.job_id))
+                    .map(|output| output.text());
+                Html(status::render_details(
+                    thread,
+                    session.as_ref(),
+                    live_output.as_deref(),
+                ))
+                .into_response()
+            }
+            None => (StatusCode::NOT_FOUND, "thread not found\n").into_response(),
+        },
+        Err(error) => {
+            tracing::warn!(%error, "failed to build thread status");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to read thread status: {error}\n"),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DetailsQuery {
+    key: String,
 }
 
 /// Machine-readable form of the status page, optionally filtered by `q`.

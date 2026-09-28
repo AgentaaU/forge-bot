@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::agent::prompt::{build_follow_up_prompt, build_prompt};
 use crate::agent::session::SessionStore;
 use crate::agent::{
-    Agent, AgentContext, AgentOutcome, AgentRequest, SteerReceipt, conversation_key,
+    Agent, AgentContext, AgentOutcome, AgentRequest, LiveOutput, SteerReceipt, conversation_key,
 };
 use crate::config::PiRpcConfig;
 use crate::error::{BotError, Result};
@@ -268,6 +268,15 @@ impl PiRpcClient {
     /// final text. When `timeout` is `None` the wait is unbounded: the call
     /// only returns once the agent settles or its process exits.
     pub async fn prompt(&mut self, message: &str, timeout: Option<Duration>) -> Result<String> {
+        self.prompt_with_output(message, timeout, None).await
+    }
+
+    async fn prompt_with_output(
+        &mut self,
+        message: &str,
+        timeout: Option<Duration>,
+        live_output: Option<&LiveOutput>,
+    ) -> Result<String> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let request_id = self.next_request_id();
         self.send(&json!({
@@ -301,6 +310,9 @@ impl PiRpcClient {
                         && let Some(delta) = event["delta"].as_str()
                     {
                         streamed.push_str(delta);
+                        if let Some(live_output) = live_output {
+                            live_output.append(delta.as_bytes());
+                        }
                     }
                 }
                 "agent_settled" => break,
@@ -664,7 +676,11 @@ impl Agent for PiPoolAgent {
 
         let model = guard.client_mut()?.current_model().await.unwrap_or(None);
         *context.reported_model.lock().expect("model mutex poisoned") = model.clone();
-        match guard.client_mut()?.prompt(&prompt, timeout).await {
+        match guard
+            .client_mut()?
+            .prompt_with_output(&prompt, timeout, context.live_output.as_ref())
+            .await
+        {
             Ok(text) => {
                 let mut outcome = AgentOutcome::success(text, started.elapsed());
                 outcome.model = model;
@@ -1122,17 +1138,22 @@ mod tests {
         config
             .env
             .insert("FAKE_PI_RESULT".into(), result.display().to_string());
+        config
+            .env
+            .insert("FAKE_PI_STREAM_TEXT".into(), "working now".into());
         let agent = Arc::new(PiPoolAgent::new(&config, store(), 2));
 
         let request = AgentRequest {
             location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
             message: "go".into(),
         };
+        let output = LiveOutput::default();
         let context = AgentContext {
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
             issue_number: Some(1),
+            live_output: Some(output.clone()),
             ..Default::default()
         };
         let key = conversation_key(&context);
@@ -1161,6 +1182,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(prompt_log.exists(), "agent should have received the prompt");
+
+        for _ in 0..100 {
+            if output.text().contains("working now") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(output.text().contains("working now"));
+        assert!(!run.is_finished(), "Pi text should appear during the run");
 
         let follow_up_request = AgentRequest {
             location: request.location.clone(),

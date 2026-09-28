@@ -10,17 +10,36 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::agent::prompt::build_prompt;
 use crate::agent::session::SessionStore;
-use crate::agent::{Agent, AgentContext, AgentOutcome, AgentRequest, conversation_key};
+use crate::agent::{Agent, AgentContext, AgentOutcome, AgentRequest, LiveOutput, conversation_key};
 use crate::config::PromptDelivery;
 use crate::error::{BotError, Result};
 
 /// Maximum number of characters of captured output kept in the summary.
 const OUTPUT_LIMIT: usize = 4000;
+
+async fn capture_stream<R: AsyncRead + Unpin>(
+    mut reader: R,
+    live_output: Option<LiveOutput>,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        output.extend_from_slice(&chunk[..count]);
+        if let Some(live_output) = &live_output {
+            live_output.append(&chunk[..count]);
+        }
+    }
+    Ok(output)
+}
 
 /// An [`Agent`] implemented by spawning a child process.
 #[derive(Debug, Clone)]
@@ -371,6 +390,7 @@ impl Agent for CommandAgent {
         let program = self.program.clone();
         let name = self.name.clone();
         let prompt_for_spawn = prompt.clone();
+        let live_output = context.live_output.clone();
 
         let run = async move {
             let mut child = cmd.spawn().map_err(|e| BotError::Agent {
@@ -398,7 +418,14 @@ impl Agent for CommandAgent {
                 drop(stdin);
             }
 
-            child.wait_with_output().await.map_err(|e| BotError::Agent {
+            let stdout = child.stdout.take().expect("stdout was piped");
+            let stderr = child.stderr.take().expect("stderr was piped");
+            tokio::try_join!(
+                child.wait(),
+                capture_stream(stdout, live_output.clone()),
+                capture_stream(stderr, live_output),
+            )
+            .map_err(|e| BotError::Agent {
                 name: name.clone(),
                 reason: format!("failed while waiting for `{program}`: {e}"),
             })
@@ -419,9 +446,9 @@ impl Agent for CommandAgent {
 
         match result {
             Err(err) => Err(err),
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok((status, stdout_bytes, stderr_bytes)) => {
+                let stdout = String::from_utf8_lossy(&stdout_bytes);
+                let stderr = String::from_utf8_lossy(&stderr_bytes);
                 let fallback = summarize(&stdout, &stderr);
                 let observed_model = match self.name.as_str() {
                     "codex" => {
@@ -446,7 +473,7 @@ impl Agent for CommandAgent {
                 *context.reported_model.lock().expect("model mutex poisoned") =
                     observed_model.clone();
 
-                if output.status.success() {
+                if status.success() {
                     let summary = match &plan.reply_file {
                         Some(path) => {
                             let text = std::fs::read_to_string(path).unwrap_or_default();
@@ -471,8 +498,7 @@ impl Agent for CommandAgent {
                     let mut outcome = AgentOutcome::failure(
                         format!(
                             "agent exited with {}: {}",
-                            output
-                                .status
+                            status
                                 .code()
                                 .map(|c| c.to_string())
                                 .unwrap_or_else(|| "signal".into()),
@@ -600,6 +626,32 @@ mod tests {
         // The prompt contains the message; cat echoes it back.
         assert!(outcome.success);
         assert!(outcome.summary.contains("PING"));
+    }
+
+    #[tokio::test]
+    async fn streams_output_before_the_command_finishes() {
+        let agent = CommandAgent::new("streamer", "sh")
+            .args(["-c", "printf 'first\\n'; sleep 0.3; printf 'last\\n'"]);
+        let request = AgentRequest {
+            location: url::Url::parse("https://forge.example.com/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let output = LiveOutput::default();
+        let context = AgentContext {
+            live_output: Some(output.clone()),
+            ..Default::default()
+        };
+        let run = tokio::spawn(async move { agent.run(&request, &context).await });
+        for _ in 0..50 {
+            if output.text().contains("first") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(output.text().contains("first"));
+        assert!(!run.is_finished(), "output must be visible while running");
+        assert!(run.await.unwrap().unwrap().success);
+        assert!(output.text().contains("last"));
     }
 
     #[tokio::test]

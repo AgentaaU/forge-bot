@@ -217,6 +217,15 @@ their most recent result. Each row names the agent. `GET /status.json`
 returns the same snapshot as JSON for dashboards or scripts, and `GET /`
 reports the enabled forges and agents.
 
+The **Details** link opens `/status/details?key=...`, showing each run's
+request, agent, timestamps, and result summary. Requests are saved for new
+runs; older runs show “Unavailable for this run.” The result is the summary
+recorded by the agent adapter, which may be shorter than its full transcript.
+While a run is active, the details page refreshes every two seconds and shows
+recent command output or Pi RPC assistant text as it arrives. Live output is
+kept in memory (up to 1 MiB per run) and disappears when the run finishes;
+the final result summary remains in the run history.
+
 The Model column shows the model known for the current or most recent run.
 Pi RPC reads the live model through `get_state`; Codex and Claude read their
 session records after a run. Antigravity and Kimi read the selected model from
@@ -273,8 +282,8 @@ The mention is matched case-insensitively and only at a word boundary, so
   stripped from `origin` afterwards.
 - `workspace.enabled = false` runs agents in an empty directory and lets them
   access the forge themselves.
-- The status page has no authentication: it lists repository names and thread
-  URLs for every conversation the bot has seen. Keep the listener on an
+- The status pages have no authentication: they list thread URLs and show
+  agent requests and result summaries. Keep the listener on an
   internal interface or put it behind a reverse proxy with access control.
 
 ## Project layout

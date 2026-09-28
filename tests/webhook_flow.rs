@@ -433,6 +433,72 @@ async fn status_page_renders_when_idle() {
 }
 
 #[tokio::test]
+async fn details_show_output_while_the_agent_is_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), |config| {
+        let agent = config.agents.overrides.get_mut("custom").unwrap();
+        agent.command = Some("sh".into());
+        agent.args = Some(vec![
+            "-c".into(),
+            "printf 'live tick\\n'; sleep 1; printf 'finished\\n'".into(),
+        ]);
+    });
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", PAYLOAD))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let key = "forgejo:shylock/forge-bot:issue:1";
+    let mut live = None;
+    for _ in 0..100 {
+        if let Some(session) = harness.sessions.get(key)
+            && let Some(run) = session.runs.last()
+            && let Some(output) = harness.sessions.live_output(run.job_id)
+            && output.text().contains("live tick")
+        {
+            live = Some(run.job_id);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let job_id = live.expect("output should be available before the run finishes");
+    assert!(
+        harness.sessions.get(key).unwrap().runs[0]
+            .finished_at
+            .is_none()
+    );
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/status/details?key=forgejo%3Ashylock%2Fforge-bot%3Aissue%3A1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("<h3>Live output</h3>"), "{html}");
+    assert!(html.contains("live tick"), "{html}");
+
+    for _ in 0..200 {
+        if harness.sessions.get(key).unwrap().runs[0]
+            .finished_at
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(harness.sessions.live_output(job_id).is_none());
+}
+
+#[tokio::test]
 async fn status_json_lists_a_finished_thread() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(dir.path());
@@ -473,6 +539,30 @@ async fn status_json_lists_a_finished_thread() {
     assert_eq!(threads[0]["repository"], "shylock/forge-bot");
     assert_eq!(threads[0]["thread_type"], "issue");
     assert_eq!(threads[0]["number"], 1);
+
+    let key = threads[0]["key"].as_str().unwrap();
+    let uri = format!(
+        "/status/details?{}",
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("key", key)
+            .finish()
+    );
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let details = body_text(response).await;
+    assert!(details.contains("<h3>Request</h3>"), "{details}");
+    assert!(details.contains("<h3>Result</h3>"), "{details}");
 }
 
 #[tokio::test]
@@ -575,6 +665,7 @@ async fn status_routes_do_not_change_state() {
     for uri in [
         "/status",
         "/status.json",
+        "/status/details?key=forgejo%3Ashylock%2Fforge-bot%3Aissue%3A1",
         "/status?q=https%3A%2F%2Fforge.local%3A3000%2Fshylock%2Fforge-bot%2Fissues%2F1%23issuecomment-77",
         "/status.json?q=https%3A%2F%2Fforge.local%3A3000%2Fshylock%2Fforge-bot%2Fissues%2F1%23issuecomment-77",
     ] {

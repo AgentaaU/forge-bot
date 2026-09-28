@@ -323,7 +323,7 @@ pub fn render_html(threads: &[ThreadStatus], query: Option<&str>) -> String {
             None => "No threads yet.".to_owned(),
         };
         rows.push_str(&format!(
-            "<tr><td colspan=\"8\" class=\"empty\">{message}</td></tr>"
+            "<tr><td colspan=\"9\" class=\"empty\">{message}</td></tr>"
         ));
     }
     for thread in &matched {
@@ -387,7 +387,7 @@ a {{ color: inherit; }}
 </form>
 <p class="sub">{summary} Refreshes every 15s.</p>
 <table>
-<thead><tr><th>State</th><th>Thread</th><th>Agent</th><th>Model</th><th>Queued</th><th>Runs</th><th>Updated</th><th>Last result</th></tr></thead>
+<thead><tr><th>State</th><th>Thread</th><th>Agent</th><th>Model</th><th>Queued</th><th>Runs</th><th>Updated</th><th>Last result</th><th>Details</th></tr></thead>
 <tbody>
 {rows}
 </tbody>
@@ -403,6 +403,12 @@ a {{ color: inherit; }}
 }
 
 fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
+    let details_url = format!(
+        "/status/details?{}",
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("key", &thread.key)
+            .finish()
+    );
     let number = thread.number.map(|n| format!(" #{n}")).unwrap_or_default();
     let thread_cell = format!(
         "<a href=\"{location}\">{repository}{number}</a><div class=\"repo\">{kind}</div>",
@@ -451,7 +457,8 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
 <td>{queued}</td>\
 <td>{runs}</td>\
 <td>{updated}</td>\
-<td>{last}</td></tr>\n",
+<td>{last}</td>\
+<td><a href=\"{details_url}\">View</a></td></tr>\n",
         state = thread.state.label(),
         label = thread.state.label(),
         model = thread
@@ -462,6 +469,85 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
         queued = thread.queued,
         runs = thread.runs,
         updated = escape_html(&humanize_age(now, thread.updated_at)),
+    )
+}
+
+/// Render the persisted conversation history. A queued thread may have no
+/// session yet, so its details page still renders with an empty run list.
+pub fn render_details(
+    thread: &ThreadStatus,
+    session: Option<&Session>,
+    live_output: Option<&str>,
+) -> String {
+    let title = format!(
+        "{} #{}",
+        thread.repository,
+        thread.number.unwrap_or_default()
+    );
+    let mut runs = String::new();
+    if let Some(session) = session {
+        for (index, run) in session.runs.iter().enumerate().rev() {
+            let result = match run.success {
+                Some(true) => "Succeeded",
+                Some(false) => "Failed",
+                None => "Running",
+            };
+            let message = run
+                .message
+                .as_deref()
+                .unwrap_or("Unavailable for this run.");
+            let summary = run.summary.as_deref().unwrap_or("No result yet.");
+            let finished = run
+                .finished_at
+                .map(|time| time.to_rfc3339())
+                .unwrap_or_else(|| "In progress".to_owned());
+            runs.push_str(&format!(
+                "<section><h2>Run {number}: {agent} · {result}</h2>\
+<p>Started: <time>{started}</time> · Finished: <time>{finished}</time></p>\
+<h3>Request</h3><pre>{message}</pre>\
+<h3>Result</h3><pre>{summary}</pre></section>",
+                number = index + 1,
+                agent = escape_html(&run.agent),
+                started = escape_html(&run.started_at.to_rfc3339()),
+                finished = escape_html(&finished),
+                message = escape_html(message),
+                summary = escape_html(summary),
+            ));
+            if run.finished_at.is_none() {
+                let output = live_output
+                    .filter(|output| !output.is_empty())
+                    .unwrap_or("Waiting for agent output.");
+                runs.push_str(&format!(
+                    "<h3>Live output</h3><pre>{}</pre>",
+                    escape_html(output)
+                ));
+            }
+        }
+    }
+    if runs.is_empty() {
+        runs.push_str("<p>No runs yet.</p>");
+    }
+    let refresh = if thread.state == ThreadState::Running {
+        "<meta http-equiv=\"refresh\" content=\"2\">"
+    } else {
+        ""
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+{refresh}<title>{title} — session details</title><style>\
+:root {{ color-scheme: light dark; }}\
+body {{ font-family: system-ui, sans-serif; max-width: 70rem; margin: 2rem auto; padding: 0 1rem; }}\
+section {{ border-top: 1px solid #8885; margin-top: 1.5rem; }}\
+pre {{ white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; background: #8882; border-radius: .4rem; }}\
+a {{ color: inherit; }}</style></head><body>\
+<p><a href=\"/status\">← Status</a></p><h1>{title}</h1>\
+<p><a href=\"{location}\">Open thread</a> · {state} · {count} run(s)</p>\
+{runs}</body></html>",
+        title = escape_html(&title),
+        location = escape_html(&thread.location),
+        state = thread.state.label(),
+        count = thread.runs,
     )
 }
 
@@ -551,6 +637,7 @@ mod tests {
         RunRecord {
             job_id: uuid::Uuid::new_v4(),
             agent: "codex".into(),
+            message: Some("fix the issue".into()),
             started_at: Utc::now() - chrono::Duration::seconds(30),
             finished_at: Some(Utc::now() - chrono::Duration::seconds(10)),
             success: Some(success),
@@ -563,6 +650,7 @@ mod tests {
         RunRecord {
             job_id: uuid::Uuid::new_v4(),
             agent: "pi-rpc".into(),
+            message: Some("continue".into()),
             started_at: Utc::now() - chrono::Duration::seconds(5),
             finished_at: None,
             success: None,
@@ -696,6 +784,35 @@ mod tests {
         assert!(html.contains("owner/repo"));
         assert!(html.contains("pi-rpc"));
         assert!(html.contains("http://forge.local/owner/repo/issues/1"));
+        assert!(html.contains("<th>Details</th>"));
+        assert!(html.contains("/status/details?key=forgejo%3Aowner%2Frepo%3Aissue%3A1"));
+    }
+
+    #[test]
+    fn details_show_run_history_and_escape_content() {
+        let key = "forgejo:owner/repo:issue:1";
+        let mut record = finished(true);
+        record.message = Some("<script>alert(1)</script>".into());
+        record.summary = Some("<img src=x>".into());
+        let stored = session(key, vec![record]);
+        let threads = snapshot(vec![stored.clone()], vec![]);
+        let html = render_details(&threads[0], Some(&stored), None);
+        assert!(html.contains("Run 1: codex · Succeeded"));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(html.contains("&lt;img src=x&gt;"));
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("<img"));
+    }
+
+    #[test]
+    fn details_show_escaped_live_output_and_refresh() {
+        let stored = session("forgejo:owner/repo:issue:1", vec![running()]);
+        let threads = snapshot(vec![stored.clone()], vec![]);
+        let html = render_details(&threads[0], Some(&stored), Some("<script>live</script>"));
+        assert!(html.contains("http-equiv=\"refresh\" content=\"2\""));
+        assert!(html.contains("<h3>Live output</h3>"));
+        assert!(html.contains("&lt;script&gt;live&lt;/script&gt;"));
+        assert!(!html.contains("<script>"));
     }
 
     #[test]

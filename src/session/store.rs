@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::AgentOutcome;
+use crate::agent::{AgentOutcome, LiveOutput};
 use crate::error::Result;
 use crate::forge::ForgeMessage;
 use crate::session::Job;
@@ -18,6 +18,9 @@ use crate::session::Job;
 pub struct RunRecord {
     pub job_id: Uuid,
     pub agent: String,
+    /// The instruction from the triggering mention. Older records omit it.
+    #[serde(default)]
+    pub message: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub success: Option<bool>,
@@ -42,6 +45,7 @@ pub struct Session {
 pub struct SessionStore {
     dir: PathBuf,
     sessions: Mutex<HashMap<String, Session>>,
+    live_output: Mutex<HashMap<Uuid, LiveOutput>>,
 }
 
 impl SessionStore {
@@ -74,6 +78,7 @@ impl SessionStore {
         Ok(Self {
             dir,
             sessions: Mutex::new(sessions),
+            live_output: Mutex::new(HashMap::new()),
         })
     }
 
@@ -113,6 +118,7 @@ impl SessionStore {
         session.runs.push(RunRecord {
             job_id: job.id,
             agent: job.agent.clone(),
+            message: Some(job.mention.message.clone()),
             started_at: Utc::now(),
             finished_at: None,
             success: None,
@@ -121,6 +127,10 @@ impl SessionStore {
         });
 
         self.persist_locked(session)?;
+        self.live_output
+            .lock()
+            .expect("live output map poisoned")
+            .insert(job.id, LiveOutput::default());
         Ok(session.clone())
     }
 
@@ -148,6 +158,10 @@ impl SessionStore {
         session.agent = agent.to_owned();
         session.updated_at = Utc::now();
         self.persist_locked(session)?;
+        self.live_output
+            .lock()
+            .expect("live output map poisoned")
+            .remove(&job_id);
         Ok(())
     }
 
@@ -157,6 +171,14 @@ impl SessionStore {
             .lock()
             .expect("session mutex poisoned")
             .get(key)
+            .cloned()
+    }
+
+    pub fn live_output(&self, job_id: Uuid) -> Option<LiveOutput> {
+        self.live_output
+            .lock()
+            .expect("live output map poisoned")
+            .get(&job_id)
             .cloned()
     }
 

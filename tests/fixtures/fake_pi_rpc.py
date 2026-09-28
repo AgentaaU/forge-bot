@@ -16,6 +16,7 @@ delay = float(os.environ.get("FAKE_PI_DELAY", "0"))
 wait_for_steer = os.environ.get("FAKE_PI_WAIT_FOR_STEER") == "1"
 steer_log = os.environ.get("FAKE_PI_STEER_LOG")
 result_path = os.environ.get("FAKE_PI_RESULT")
+stream_text = os.environ.get("FAKE_PI_STREAM_TEXT")
 prompt_log = os.environ.get("FAKE_PI_PROMPT_LOG")
 
 waiting = False
@@ -38,6 +39,8 @@ for line in sys.stdin:
             json.dumps({"type": "response", "id": request_id, "success": True}),
             flush=True,
         )
+        if stream_text:
+            print(json.dumps({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": stream_text}}), flush=True)
         if wait_for_steer:
             waiting = True
         else:
