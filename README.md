@@ -188,7 +188,7 @@ most important options:
 | `[policy]` | `allow_all`, `allowed_users`, `allowed_repos`. |
 | `[workspace]` | Whether to clone a checkout, and where. |
 | `[reply]` | `ack` defaults to true; the acknowledgement and any fallback notices share one status comment. `result` defaults to false because agents normally reply themselves; set `result = true` to also post completion summaries. |
-| `[session]` | Queue/state directory, worker count (the global cap on concurrent agent runs), recovery. |
+| `[session]` | Queue/state directory, worker count (the global cap on concurrent agent runs), recovery, and how long an idle thread keeps its status (`retention_secs`, `0` disables eviction). |
 | `[capacity]` | Capacity/quota detection: `fallback`, `cooldown_secs` (default 5 h), extra `markers` (`[quota]` is an alias). |
 | `[agents.<name>]` | Per-agent `command`, `args`, `prompt`, `timeout_secs`, `env`. |
 
@@ -237,6 +237,12 @@ The page has a search box: paste a comment or issue/pull-request URL (for
 example `https://forgejo.example.com/owner/repo/pulls/460#issuecomment-10561`)
 to filter the table to that thread. The same filter is available to scripts as
 `GET /status.json?q=<url>`.
+
+An idle thread is kept for `[session] retention_secs` (default seven days)
+and then evicted from memory and disk, so a bot that runs for a long time does
+not accumulate status until it runs out of memory. A thread with a run in
+flight or a mention waiting is never evicted. Set `retention_secs = 0` to keep
+every thread forever.
 
 ## Trigger syntax
 

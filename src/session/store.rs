@@ -1,8 +1,9 @@
 //! On-disk session and job persistence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -241,6 +242,59 @@ impl SessionStore {
             .collect()
     }
 
+    /// Evict idle sessions whose last activity is older than `retention`.
+    ///
+    /// The status page is rebuilt from the persisted sessions, so dropping the
+    /// stale ones bounds both the memory the store holds and the size of the
+    /// page. A session with a run in flight or a pending job is kept: a
+    /// follow-up that is about to continue the conversation must not lose the
+    /// history it resumes. Evicted sessions are removed from memory and disk so
+    /// a restart does not load them again.
+    ///
+    /// A zero `retention` disables eviction. Returns how many sessions were
+    /// evicted.
+    pub fn evict_stale(&self, retention: Duration) -> Result<usize> {
+        if retention.is_zero() {
+            return Ok(0);
+        }
+        // A running job's own file is still pending until it finishes, so this
+        // also protects the run in flight even if its session record was lost.
+        let protected: HashSet<String> = self
+            .pending_jobs()?
+            .into_iter()
+            .map(|job| job.session_key())
+            .collect();
+
+        let now = Utc::now();
+        let mut sessions = self.sessions.lock().expect("session mutex poisoned");
+        let stale: Vec<String> = sessions
+            .values()
+            .filter(|session| {
+                !session.is_running()
+                    && !protected.contains(&session.key)
+                    && now
+                        .signed_duration_since(session.updated_at)
+                        .to_std()
+                        .is_ok_and(|age| age >= retention)
+            })
+            .map(|session| session.key.clone())
+            .collect();
+
+        for key in &stale {
+            sessions.remove(key);
+            let path = self
+                .dir
+                .join("sessions")
+                .join(format!("{}.json", file_key(key)));
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(key = %key, %error, "failed to remove evicted session");
+            }
+        }
+        Ok(stale.len())
+    }
+
     /// Close every run left in flight by a previous process.
     ///
     /// The store is opened once when the bot starts. Any run persisted without
@@ -456,5 +510,84 @@ mod tests {
         assert_eq!(pending.len(), 1);
         store.remove_job(job.id).unwrap();
         assert!(store.pending_jobs().unwrap().is_empty());
+    }
+
+    /// Age a stored session so the eviction test does not have to wait.
+    fn age_session(store: &SessionStore, key: &str, age: chrono::Duration) {
+        let mut sessions = store.sessions.lock().unwrap();
+        sessions.get_mut(key).unwrap().updated_at = Utc::now() - age;
+    }
+
+    #[test]
+    fn evicts_idle_sessions_past_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let job = job();
+        let key = job.session_key();
+        store.begin(&job).unwrap();
+        let outcome = AgentOutcome::success("done", Duration::from_millis(5));
+        store.finish(&key, job.id, "pi", &outcome).unwrap();
+        age_session(&store, &key, chrono::Duration::days(8));
+
+        let removed = store
+            .evict_stale(Duration::from_secs(7 * 24 * 60 * 60))
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(store.get(&key).is_none());
+        let path = dir
+            .path()
+            .join("sessions")
+            .join(format!("{}.json", file_key(&key)));
+        assert!(
+            !path.exists(),
+            "an evicted session must leave no file behind"
+        );
+    }
+
+    #[test]
+    fn keeps_a_session_with_a_pending_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let job = job();
+        let key = job.session_key();
+        store.begin(&job).unwrap();
+        let outcome = AgentOutcome::success("done", Duration::from_millis(5));
+        store.finish(&key, job.id, "pi", &outcome).unwrap();
+        store.save_job(&job).unwrap();
+        age_session(&store, &key, chrono::Duration::days(30));
+
+        // A queued mention is about to continue the conversation, so its
+        // history must survive even though it is idle right now.
+        assert_eq!(store.evict_stale(Duration::from_secs(60)).unwrap(), 0);
+        assert!(store.get(&key).is_some());
+    }
+
+    #[test]
+    fn keeps_a_session_with_a_run_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let job = job();
+        let key = job.session_key();
+        // `begin` leaves the run unfinished: the agent is still working.
+        store.begin(&job).unwrap();
+        age_session(&store, &key, chrono::Duration::days(30));
+
+        assert_eq!(store.evict_stale(Duration::from_secs(60)).unwrap(), 0);
+        assert!(store.get(&key).is_some());
+    }
+
+    #[test]
+    fn zero_retention_disables_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let job = job();
+        let key = job.session_key();
+        store.begin(&job).unwrap();
+        let outcome = AgentOutcome::success("done", Duration::from_millis(5));
+        store.finish(&key, job.id, "pi", &outcome).unwrap();
+        age_session(&store, &key, chrono::Duration::days(365));
+
+        assert_eq!(store.evict_stale(Duration::ZERO).unwrap(), 0);
+        assert!(store.get(&key).is_some());
     }
 }

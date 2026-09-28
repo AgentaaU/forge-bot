@@ -379,6 +379,12 @@ pub struct SessionConfig {
     pub queue_capacity: usize,
     /// Requeue persisted (unfinished) jobs on startup.
     pub recover: bool,
+    /// How long an idle thread keeps its status and run history. A thread
+    /// untouched for longer is evicted from memory and disk, which bounds the
+    /// memory a long-running process uses. A thread with a run in flight or a
+    /// mention waiting is never evicted. `0` disables eviction and keeps every
+    /// thread forever.
+    pub retention_secs: u64,
 }
 
 impl Default for SessionConfig {
@@ -388,6 +394,10 @@ impl Default for SessionConfig {
             workers: 16,
             queue_capacity: 256,
             recover: true,
+            // Seven days: long enough that a quiet thread still shows up in
+            // the status page, short enough that an always-on bot does not
+            // accumulate status forever.
+            retention_secs: 7 * 24 * 60 * 60,
         }
     }
 }
@@ -640,6 +650,7 @@ mod tests {
         assert_eq!(config.mention, "@agent");
         assert!(config.agent_sequence.is_empty());
         assert_eq!(config.session.workers, 16);
+        assert_eq!(config.session.retention_secs, 7 * 24 * 60 * 60);
         assert!(config.workspace.enabled);
         assert!(config.reply.ack);
         assert!(!config.reply.result);
@@ -649,6 +660,12 @@ mod tests {
     fn result_reply_can_be_enabled_explicitly() {
         let config: Config = toml::from_str("[reply]\nresult = true\n").unwrap();
         assert!(config.reply.result);
+    }
+
+    #[test]
+    fn session_retention_is_configurable() {
+        let config: Config = toml::from_str("[session]\nretention_secs = 120\n").unwrap();
+        assert_eq!(config.session.retention_secs, 120);
     }
 
     #[test]

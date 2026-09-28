@@ -94,6 +94,11 @@ dir = "~/.local/state/forge-bot/state"
 workers = 16
 queue_capacity = 256
 recover = true
+# How long an idle thread keeps its status and run history. A thread untouched
+# for longer is evicted from memory and disk, which bounds the memory a bot
+# that runs for a long time uses. A thread with a run in flight or a mention
+# waiting is never evicted. `0` disables eviction and keeps every thread.
+retention_secs = 604800
 
 # --- agents -----------------------------------------------------------------
 #

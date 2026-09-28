@@ -127,6 +127,18 @@ impl Dispatcher {
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         tokio::spawn(scheduler_loop(inner.clone(), rx, done_tx, done_rx));
 
+        // Thread status is rebuilt from the persisted sessions, so an
+        // always-on process would otherwise accumulate one record per thread
+        // forever and eventually run out of memory (issue #119). Drop the
+        // idle threads past the retention window now, then keep doing so in
+        // the background.
+        if inner.config.session.retention_secs > 0 {
+            if let Err(error) = evict_stale_sessions(&inner) {
+                tracing::warn!(%error, "failed to evict stale thread status at startup");
+            }
+            tokio::spawn(eviction_loop(inner.clone()));
+        }
+
         Ok(Arc::new(Self { inner }))
     }
 
@@ -324,6 +336,30 @@ async fn scheduler_loop(
             }
             running.insert(key.clone());
             spawn_job(&inner, job, key, &done_tx);
+        }
+    }
+}
+
+/// How often the dispatcher looks for stale thread status. The scan is cheap
+/// and running it every few minutes keeps memory close to the retention
+/// window instead of waiting for an exact deadline.
+const EVICTION_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Evict every idle thread older than the configured retention window.
+fn evict_stale_sessions(inner: &Arc<Inner>) -> Result<usize> {
+    let retention = Duration::from_secs(inner.config.session.retention_secs);
+    inner.sessions.evict_stale(retention)
+}
+
+/// Periodically drop idle thread status past the retention window so a
+/// long-running bot does not grow without bound.
+async fn eviction_loop(inner: Arc<Inner>) {
+    loop {
+        tokio::time::sleep(EVICTION_INTERVAL).await;
+        match evict_stale_sessions(&inner) {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "evicted stale thread status"),
+            Err(error) => tracing::warn!(%error, "failed to evict stale thread status"),
         }
     }
 }
@@ -3196,5 +3232,51 @@ echo "end:$token" >> "$AGENT_LOG"
         wait_for_log(&log, "start:TOKEN_B").await;
         release_token(&release, "TOKEN_B");
         wait_for_drain(&sessions).await;
+    }
+
+    /// A stale thread left on disk must not survive the next start, or a bot
+    /// that never runs long enough to evict in the background would keep
+    /// growing its status forever (issue #119).
+    #[tokio::test]
+    async fn dispatcher_evicts_stale_thread_status_on_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.session.retention_secs = 60;
+        let config = Arc::new(config);
+
+        let key = "forgejo:o/r:issue:1";
+        let old = Utc::now() - chrono::Duration::hours(2);
+        let session = crate::session::Session {
+            key: key.into(),
+            repository: "o/r".into(),
+            location: "http://forge.local/o/r/issues/1".into(),
+            agent: "codex".into(),
+            created_at: old,
+            updated_at: old,
+            runs: Vec::new(),
+        };
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(
+            dir.path().join("sessions").join("stale.json"),
+            serde_json::to_vec_pretty(&session).unwrap(),
+        )
+        .unwrap();
+
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        assert!(sessions.get(key).is_some(), "the store loads it first");
+
+        let _dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(AgentRegistry::from_config(&config)),
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        assert!(
+            sessions.get(key).is_none(),
+            "an idle thread past the retention window is evicted at start"
+        );
     }
 }
