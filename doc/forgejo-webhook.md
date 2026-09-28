@@ -57,7 +57,7 @@ export BOT_URL=http://127.0.0.1:8080/webhooks/forgejo
 export HOOK_BODY='{
   "type": "forgejo",
   "active": true,
-  "events": ["issue_comment", "pull_request_comment", "pull_request_review_comment", "issues", "pull_request"],
+  "events": ["issue_comment", "pull_request_comment", "pull_request_review_comment", "issues", "pull_request", "action_run_failure", "push"],
   "config": {
     "url": "'"$BOT_URL"'",
     "content_type": "json",
@@ -201,7 +201,29 @@ permission required to comment at all.
 
 Description events are deduplicated by a hash of the body, so an edit that
 changes the text triggers once while re-deliveries of the same text are
-ignored. Other events are accepted (`202` with `accepted: 0`) and ignored.
+ignored. Events without a mention or supported automatic trigger are accepted
+(`202` with `accepted: 0`) and ignored.
+
+## Automatic CI and conflict triggers
+
+The webhook's scope determines which repositories send events, and its event
+selection determines which automatic triggers run. Subscribe to
+`action_run_failure` for Forgejo Actions failures, and `pull_request` plus
+`push` for merge conflicts. These triggers start the default agent without a
+mention and require a configured Forgejo API token and webhook secret. The
+normal mention authorization policy continues to apply to mentions.
+
+`action_run_failure` handles Forgejo Actions runs associated with a current
+open pull request. A run for an older PR head is ignored. `pull_request` events
+and pushes to a PR's base branch check the current PR API `mergeable` value and
+start an agent only when it is `false` and the PR is not a draft. Forgejo also
+reports `mergeable = false` while conflict checking is in progress or has
+failed, so an event arriving during that interval may start an agent. The bot
+remembers processed run IDs and head/base commit pairs in
+`auto-triggers.json` under the session directory, including across restarts.
+
+When updating an existing hook, add `action_run_failure` and `push` to its
+events. The registration script includes them in its default event list.
 
 ---
 

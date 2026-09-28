@@ -16,6 +16,7 @@ use axum::{Json, Router};
 use serde_json::json;
 
 use crate::agent::AgentRegistry;
+use crate::auto_trigger::AutoTrigger;
 use crate::config::Config;
 use crate::error::BotError;
 use crate::forge::ForgeAdapter;
@@ -31,6 +32,7 @@ pub struct AppState {
     pub agents: Arc<AgentRegistry>,
     pub dispatcher: Arc<Dispatcher>,
     dedupe: Arc<Mutex<RecentComments>>,
+    auto: Arc<AutoTrigger>,
 }
 
 impl AppState {
@@ -40,12 +42,14 @@ impl AppState {
         agents: Arc<AgentRegistry>,
         dispatcher: Arc<Dispatcher>,
     ) -> Self {
+        let auto = Arc::new(AutoTrigger::new(&config));
         Self {
             config,
             adapters: Arc::new(adapters),
             agents,
             dispatcher,
             dedupe: Arc::new(Mutex::new(RecentComments::new(1024))),
+            auto,
         }
     }
 
@@ -305,6 +309,29 @@ async fn receive(
                 tracing::error!(%error, "failed to enqueue job");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": error.to_string() })),
+                );
+            }
+        }
+    }
+
+    // A mentioned PR description already started a job for this delivery.
+    if forge == "forgejo" && accepted == 0 {
+        match state
+            .auto
+            .handle(
+                &state.config,
+                &state.dispatcher,
+                &adapter.event(&headers),
+                &body,
+            )
+            .await
+        {
+            Ok(count) => accepted += count,
+            Err(error) => {
+                tracing::warn!(%error, "failed to process automatic trigger");
+                return (
+                    StatusCode::BAD_GATEWAY,
                     Json(json!({ "error": error.to_string() })),
                 );
             }

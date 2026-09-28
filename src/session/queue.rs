@@ -137,6 +137,26 @@ impl Dispatcher {
         agent_name: &str,
     ) -> Result<Uuid> {
         self.inner.policy.authorize(&message)?;
+        self.enqueue(message, mention, agent_name).await
+    }
+
+    /// Queue a signed Forgejo event selected by the webhook subscription.
+    /// The event has no human author to evaluate with the mention policy.
+    pub(crate) async fn submit_auto(
+        &self,
+        message: ForgeMessage,
+        mention: Mention,
+        agent_name: &str,
+    ) -> Result<Uuid> {
+        self.enqueue(message, mention, agent_name).await
+    }
+
+    async fn enqueue(
+        &self,
+        message: ForgeMessage,
+        mention: Mention,
+        agent_name: &str,
+    ) -> Result<Uuid> {
         // Resolve eagerly so an unknown agent fails before we persist a job.
         let _ = self.inner.agents.get(agent_name)?;
 

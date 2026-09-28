@@ -44,7 +44,7 @@ readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCOPE="${SCOPE:-user}"
 FORGEJO_URL="${FORGEJO_URL:-http://127.0.0.1:3000}"
 BOT_URL="${BOT_URL:-http://127.0.0.1:8080/webhooks/forgejo}"
-EVENTS="${EVENTS:-[\"issue_comment\",\"pull_request_comment\",\"issues\",\"pull_request\",\"pull_request_review_comment\"]}"
+EVENTS="${EVENTS:-[\"issue_comment\",\"pull_request_comment\",\"issues\",\"pull_request\",\"pull_request_review_comment\",\"action_run_failure\",\"push\"]}"
 HOOK_ID="${HOOK_ID:-}"
 
 case "$SCOPE" in

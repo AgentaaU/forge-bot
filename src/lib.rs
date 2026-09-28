@@ -13,6 +13,7 @@
 //! replying.
 
 pub mod agent;
+mod auto_trigger;
 pub mod config;
 pub mod error;
 pub mod forge;

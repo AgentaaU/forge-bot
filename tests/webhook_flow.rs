@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::{Json, Router, routing::get};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use forge_bot::agent::AgentRegistry;
@@ -103,6 +105,147 @@ fn signed_request(event: &str, payload: &str) -> Request<Body> {
         .header("content-type", "application/json")
         .body(Body::from(payload.to_owned()))
         .unwrap()
+}
+
+async fn mock_pr_api(mergeable: bool) -> (String, tokio::task::JoinHandle<()>) {
+    let pr = json!({
+        "number": 7, "state": "open", "title": "Fix it", "body": "",
+        "mergeable": mergeable,
+        "head": {"sha": "head123"},
+        "base": {"sha": "base123", "ref": "main"}
+    });
+    let detail = pr.clone();
+    let list = pr.clone();
+    let app = Router::new()
+        .route(
+            "/api/v1/repos/shylock/forge-bot/pulls/7",
+            get(move || async move { Json(detail) }),
+        )
+        .route(
+            "/api/v1/repos/shylock/forge-bot/pulls",
+            get(move || async move { Json(vec![list]) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, task)
+}
+
+async fn accepted(app: &Router, event: &str, payload: &str) -> usize {
+    let response = app
+        .clone()
+        .oneshot(signed_request(event, payload))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice::<Value>(&bytes).unwrap()["accepted"]
+        .as_u64()
+        .unwrap() as usize
+}
+
+#[tokio::test]
+async fn auto_ci_failure_requires_secret_and_current_pr_and_dedupes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = mock_pr_api(true).await;
+    let payload = json!({
+        "action": "failure", "run": {
+            "id": 88, "commit_sha": "merge123", "html_url": "https://forge.test/actions/runs/88",
+            "repository": {"full_name": "shylock/forge-bot"},
+            "event_payload": "{\"pull_request\":{\"number\":7,\"head\":{\"sha\":\"head123\"}}}"
+        }
+    })
+    .to_string();
+    let disabled = harness_with(dir.path(), |config| {
+        config.forges.forgejo.as_mut().unwrap().base_url = url.clone();
+        config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+        config.forges.forgejo.as_mut().unwrap().webhook_secret = None;
+    });
+    assert_eq!(
+        accepted(&disabled.app, "action_run_failure", &payload).await,
+        0
+    );
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let enabled = harness_with(dir2.path(), |config| {
+        config.forges.forgejo.as_mut().unwrap().base_url = url.clone();
+        config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+    });
+    assert_eq!(
+        accepted(&enabled.app, "action_run_failure", &payload).await,
+        1
+    );
+    assert_eq!(
+        accepted(&enabled.app, "action_run_failure", &payload).await,
+        0
+    );
+    let restarted = harness_with(dir2.path(), |config| {
+        config.forges.forgejo.as_mut().unwrap().base_url = url;
+        config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+    });
+    assert_eq!(
+        accepted(&restarted.app, "action_run_failure", &payload).await,
+        0
+    );
+    let stale = payload.replace("head123", "oldhead");
+    assert_eq!(
+        accepted(&enabled.app, "action_run_failure", &stale).await,
+        0
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn auto_conflict_handles_pr_and_base_push_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = mock_pr_api(false).await;
+    let harness = harness_with(dir.path(), |config| {
+        config.forges.forgejo.as_mut().unwrap().base_url = url;
+        config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+    });
+    let pr = json!({"action":"opened", "repository":{"full_name":"shylock/forge-bot"},
+        "pull_request":{"number":7,"body":""}})
+    .to_string();
+    let push = json!({"ref":"refs/heads/main", "repository":{"full_name":"shylock/forge-bot"}})
+        .to_string();
+    assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 1);
+    assert_eq!(accepted(&harness.app, "push", &push).await, 0);
+    assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn auto_conflict_base_push_detects_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = mock_pr_api(false).await;
+    let harness = harness_with(dir.path(), |config| {
+        config.forges.forgejo.as_mut().unwrap().base_url = url;
+        config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+    });
+    let other = json!({"ref":"refs/heads/other", "repository":{"full_name":"shylock/forge-bot"}})
+        .to_string();
+    let push = json!({"ref":"refs/heads/main", "repository":{"full_name":"shylock/forge-bot"}})
+        .to_string();
+    assert_eq!(accepted(&harness.app, "push", &other).await, 0);
+    assert_eq!(accepted(&harness.app, "push", &push).await, 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn auto_conflict_ignores_mergeable_pr() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = mock_pr_api(true).await;
+    let harness = harness_with(dir.path(), |config| {
+        config.forges.forgejo.as_mut().unwrap().base_url = url;
+        config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+    });
+    let pr = json!({"action":"opened", "repository":{"full_name":"shylock/forge-bot"},
+        "pull_request":{"number":7,"body":""}})
+    .to_string();
+    assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 0);
+    server.abort();
 }
 
 #[tokio::test]

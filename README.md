@@ -120,6 +120,7 @@ Implemented:
 - [x] GitHub and GitLab adapters
 - [x] Per-user systemd service (no root)
 - [x] Polling ingester for deployments where the bot cannot create a webhook: discovers every repository visible to the token and refreshes the list, so new repositories are picked up automatically
+- [x] Forgejo Actions failure and pull-request conflict triggers for repositories covered by the signed webhook
 - [x] Agent capacity / quota handling: a failed run that looks like a usage limit, rate limit or provider overload marks the agent unavailable for a cooldown and the job is retried on another available agent (adapters that cannot even start are skipped too). The requested (or default) agent is always tried first, even while it is cooling down, so a recovered quota is picked up without a restart; a successful run clears the mark. The cooldown only removes an agent from the *automatic* fallback list, and the fallback notice names each skipped agent with the reason it was taken out of rotation (for example `capacity limit` or `start failed`); when none is left the bot replies `No available agent` listing those reasons
 - [x] Web status page: `/status` renders every known thread with its state
   (running / queued / idle), the agent involved, the queued follow-ups and the
