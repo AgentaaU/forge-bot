@@ -22,6 +22,8 @@ pub struct RunRecord {
     pub finished_at: Option<DateTime<Utc>>,
     pub success: Option<bool>,
     pub summary: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// A conversation with the bot about one forge object.
@@ -115,6 +117,7 @@ impl SessionStore {
             finished_at: None,
             success: None,
             summary: None,
+            model: None,
         });
 
         self.persist_locked(session)?;
@@ -140,6 +143,7 @@ impl SessionStore {
             run.finished_at = Some(Utc::now());
             run.success = Some(outcome.success);
             run.summary = Some(outcome.summary.clone());
+            run.model = outcome.model.clone();
         }
         session.agent = agent.to_owned();
         session.updated_at = Utc::now();
@@ -280,19 +284,17 @@ mod tests {
         assert_eq!(session.runs.len(), 1);
         assert_eq!(session.runs[0].success, None);
 
-        store
-            .finish(
-                &key,
-                job.id,
-                "pi",
-                &AgentOutcome::success("done", Duration::from_millis(5)),
-            )
-            .unwrap();
+        let mut outcome = AgentOutcome::success("done", Duration::from_millis(5));
+        outcome.model = Some("test/example".into());
+        store.finish(&key, job.id, "pi", &outcome).unwrap();
 
         let stored = store.get(&key).unwrap();
         assert_eq!(stored.runs[0].success, Some(true));
         assert_eq!(stored.runs[0].agent, "pi");
         assert_eq!(stored.runs[0].summary.as_deref(), Some("done"));
+        assert_eq!(stored.runs[0].model.as_deref(), Some("test/example"));
+        let reopened = SessionStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.get(&key).unwrap().runs[0].model, outcome.model);
     }
 
     #[test]

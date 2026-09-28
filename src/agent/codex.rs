@@ -10,6 +10,7 @@
 //! same thread resumes it with `codex exec resume <id>`, which keeps the model
 //! context (and the provider's prompt cache) warm.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent::command::{CommandAgent, SessionStyle};
@@ -56,6 +57,42 @@ pub fn build(config: &AgentConfig, sessions: Arc<SessionStore>) -> CommandAgent 
     )
 }
 
+/// Read the model Codex recorded for its most recent turn in this thread.
+/// Codex's `exec --json` stream currently omits the model, but the rollout
+/// records the effective model in each `turn_context`.
+pub(crate) fn model_from_session(thread_id: &str, home: Option<&Path>) -> Option<String> {
+    let root = home.map(Path::to_path_buf).or_else(|| {
+        std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+    })?;
+    let mut dirs = vec![root.join("sessions")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&format!("-{thread_id}.jsonl")))
+            {
+                let contents = std::fs::read_to_string(path).ok()?;
+                return contents.lines().rev().find_map(|line| {
+                    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+                    (value["type"] == "turn_context")
+                        .then(|| value["payload"]["model"].as_str().map(str::to_owned))
+                        .flatten()
+                });
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +100,22 @@ mod tests {
 
     fn store() -> Arc<SessionStore> {
         Arc::new(SessionStore::default())
+    }
+
+    #[test]
+    fn reads_latest_model_from_codex_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions/2026/09/28");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-2026-09-28T00-00-00-thread-123.jsonl"),
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"old\"}}\n{\"type\":\"event_msg\"}\n{\"type\":\"turn_context\",\"payload\":{\"model\":\"new\"}}\n",
+        ).unwrap();
+        assert_eq!(
+            model_from_session("thread-123", Some(dir.path())).as_deref(),
+            Some("new")
+        );
+        assert_eq!(model_from_session("other", Some(dir.path())), None);
     }
 
     #[test]

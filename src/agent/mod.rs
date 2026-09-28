@@ -17,6 +17,7 @@ pub mod registry;
 pub mod session;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,8 @@ pub struct AgentContext {
     pub reply_target: ReplyTarget,
     /// Environment variables carrying forge credentials.
     pub credentials: Vec<(String, String)>,
+    /// Shared with the status page while this run is active.
+    pub reported_model: Arc<Mutex<Option<String>>>,
 }
 
 impl AgentContext {
@@ -138,6 +141,9 @@ pub struct AgentOutcome {
     pub success: bool,
     pub summary: String,
     pub duration: Duration,
+    /// Model reported by the agent, when its protocol exposes one.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 impl AgentOutcome {
     pub fn success(summary: impl Into<String>, duration: Duration) -> Self {
@@ -145,6 +151,7 @@ impl AgentOutcome {
             success: true,
             summary: summary.into(),
             duration,
+            model: None,
         }
     }
 
@@ -153,6 +160,7 @@ impl AgentOutcome {
             success: false,
             summary: summary.into(),
             duration,
+            model: None,
         }
     }
 }
@@ -222,6 +230,7 @@ mod tests {
             title: None,
             reply_target: ReplyTarget::Conversation,
             credentials: vec![("FORGEJO_TOKEN".into(), "secret".into())],
+            reported_model: Default::default(),
         };
         let env = ctx.environment(&request);
         assert!(

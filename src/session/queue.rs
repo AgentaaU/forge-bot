@@ -194,7 +194,23 @@ impl Dispatcher {
     pub fn threads(&self) -> Result<Vec<ThreadStatus>> {
         let sessions = self.inner.sessions.list();
         let pending = self.inner.sessions.pending_jobs()?;
-        Ok(status::snapshot(sessions, pending))
+        let mut threads = status::snapshot(sessions, pending);
+        let running = self
+            .inner
+            .running
+            .lock()
+            .expect("running agent mutex poisoned");
+        for thread in &mut threads {
+            if let Some(entry) = running.get(&thread.key) {
+                thread.model = entry
+                    .context
+                    .reported_model
+                    .lock()
+                    .expect("model mutex poisoned")
+                    .clone();
+            }
+        }
+        Ok(threads)
     }
 }
 
@@ -477,6 +493,7 @@ impl Inner {
             title: job.message.title.clone(),
             reply_target: job.message.reply_target.clone(),
             credentials,
+            reported_model: Default::default(),
         };
 
         // The requested agent first, then every other available agent. The
@@ -497,6 +514,7 @@ impl Inner {
         for (index, name) in candidates.iter().enumerate() {
             used_agent = name.clone();
             running_agent = name.clone();
+            *context.reported_model.lock().expect("model mutex poisoned") = None;
 
             // The requested agent always leads the candidate list, so index 0
             // is exactly `job.agent` and needs no "instead" notice. Later

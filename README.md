@@ -217,6 +217,12 @@ their most recent result. Each row names the agent. `GET /status.json`
 returns the same snapshot as JSON for dashboards or scripts, and `GET /`
 reports the enabled forges and agents.
 
+The Model column shows the model known for the current or most recent run.
+Pi RPC reads the live model through `get_state`; Codex and Claude read their
+session records after a run. Antigravity and Kimi read the selected model from
+their CLI arguments or configuration. A dash means no model was available.
+The JSON snapshot includes `model` as a nullable field.
+
 The page has a search box: paste a comment or issue/pull-request URL (for
 example `https://forgejo.example.com/owner/repo/pulls/460#issuecomment-10561`)
 to filter the table to that thread. The same filter is available to scripts as

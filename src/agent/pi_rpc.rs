@@ -89,6 +89,30 @@ impl PiRpcWriter {
 }
 
 impl PiRpcClient {
+    /// Ask the live agent for its selected model. A missing model is normal
+    /// before provider selection or with older RPC implementations.
+    pub async fn current_model(&mut self) -> Result<Option<String>> {
+        let request_id = self.next_request_id();
+        self.send(&json!({ "id": request_id, "type": "get_state" }))
+            .await?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let record = self.next_record_before(Some(deadline)).await?;
+            if record["type"] == "response" && record["id"].as_str() == Some(request_id.as_str()) {
+                if record["success"].as_bool() == Some(false) {
+                    return Ok(None);
+                }
+                let model = &record["data"]["model"];
+                return Ok(match (model["provider"].as_str(), model["id"].as_str()) {
+                    (Some(provider), Some(id)) if !provider.is_empty() && !id.is_empty() => {
+                        Some(format!("{provider}/{id}"))
+                    }
+                    (_, Some(id)) if !id.is_empty() => Some(id.to_owned()),
+                    _ => None,
+                });
+            }
+        }
+    }
     /// Spawn a new RPC agent in `workspace`.
     ///
     /// When `session_id` is set (and sessions are persisted) the process is
@@ -638,11 +662,19 @@ impl Agent for PiPoolAgent {
         let timeout = (self.inner.config.timeout_secs != 0)
             .then(|| Duration::from_secs(self.inner.config.timeout_secs));
 
+        let model = guard.client_mut()?.current_model().await.unwrap_or(None);
+        *context.reported_model.lock().expect("model mutex poisoned") = model.clone();
         match guard.client_mut()?.prompt(&prompt, timeout).await {
-            Ok(text) => Ok(AgentOutcome::success(text, started.elapsed())),
+            Ok(text) => {
+                let mut outcome = AgentOutcome::success(text, started.elapsed());
+                outcome.model = model;
+                Ok(outcome)
+            }
             Err(error) => {
                 guard.invalidate();
-                Ok(AgentOutcome::failure(error.to_string(), started.elapsed()))
+                let mut outcome = AgentOutcome::failure(error.to_string(), started.elapsed());
+                outcome.model = model;
+                Ok(outcome)
             }
         }
     }
@@ -1069,6 +1101,7 @@ mod tests {
     async fn injects_a_follow_up_into_a_waiting_run_without_spawning() {
         let dir = tempfile::tempdir().unwrap();
         let steer_log = dir.path().join("steer.log");
+        let prompt_log = dir.path().join("prompt.log");
         let result = dir.path().join("result.txt");
 
         let mut config = PiRpcConfig {
@@ -1082,6 +1115,10 @@ mod tests {
         config
             .env
             .insert("FAKE_PI_STEER_LOG".into(), steer_log.display().to_string());
+        config.env.insert(
+            "FAKE_PI_PROMPT_LOG".into(),
+            prompt_log.display().to_string(),
+        );
         config
             .env
             .insert("FAKE_PI_RESULT".into(), result.display().to_string());
@@ -1117,6 +1154,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         bound.expect("agent should be bound to the thread");
+        for _ in 0..500 {
+            if prompt_log.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(prompt_log.exists(), "agent should have received the prompt");
 
         let follow_up_request = AgentRequest {
             location: request.location.clone(),
@@ -1131,6 +1175,7 @@ mod tests {
 
         let outcome = run.await.unwrap().unwrap();
         assert!(outcome.success);
+        assert_eq!(outcome.model.as_deref(), Some("test/fake-pi"));
         // The follow-up went to the same process; no second agent was spawned.
         assert_eq!(agent.live_agents(), 1);
         let logged = std::fs::read_to_string(&steer_log).unwrap();

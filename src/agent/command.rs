@@ -79,6 +79,8 @@ struct SessionPlan {
     capture: Option<String>,
     /// Drop the base args and use `args` alone (resume subcommands).
     replace_base: bool,
+    /// Existing backend session id, if this invocation resumes one.
+    session_id: Option<String>,
 }
 
 /// Substitute `{session}` / `{reply_file}` into a session arg template.
@@ -105,6 +107,25 @@ fn parse_thread_id(stdout: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Read a model option supplied by the operator without adding or changing
+/// any argument passed to the agent.
+pub(crate) fn model_arg(args: &[String], short: bool) -> Option<String> {
+    args.iter()
+        .enumerate()
+        .filter_map(|(index, arg)| {
+            if arg == "--model" || (short && arg == "-m") {
+                args.get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .cloned()
+            } else {
+                arg.strip_prefix("--model=")
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            }
+        })
+        .next_back()
 }
 
 impl CommandAgent {
@@ -202,6 +223,7 @@ impl CommandAgent {
 
         match continuation.store.get(&self.name, &key) {
             Some(id) => {
+                plan.session_id = Some(id.clone());
                 plan.args = interpolate(&style.resume_args, &id, reply.as_deref());
                 plan.at = style.resume_at;
                 plan.replace_base = style.replace_on_resume;
@@ -306,6 +328,18 @@ impl Agent for CommandAgent {
             None => args.extend(plan.args.iter().cloned()),
         }
 
+        let configured_model = match self.name.as_str() {
+            "agy" => crate::agent::agy::configured_model(&args, self.env.get("HOME")),
+            "kimi" => crate::agent::kimi::configured_model(
+                &args,
+                self.env.get("HOME"),
+                self.env.get("KIMI_CODE_HOME"),
+                &workspace,
+            ),
+            _ => None,
+        };
+        *context.reported_model.lock().expect("model mutex poisoned") = configured_model.clone();
+
         let mut cmd = Command::new(&self.program);
         cmd.args(&args)
             .envs(self.env.clone())
@@ -389,6 +423,28 @@ impl Agent for CommandAgent {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let fallback = summarize(&stdout, &stderr);
+                let observed_model = match self.name.as_str() {
+                    "codex" => {
+                        let id = parse_thread_id(&stdout).or_else(|| plan.session_id.clone());
+                        let home = self.env.get("CODEX_HOME").map(PathBuf::from);
+                        id.as_deref().and_then(|id| {
+                            crate::agent::codex::model_from_session(id, home.as_deref())
+                        })
+                    }
+                    "claude" => {
+                        let id = plan
+                            .session_id
+                            .as_deref()
+                            .or_else(|| plan.persist.as_ref().map(|(_, id)| id.as_str()));
+                        let root = self.env.get("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+                        id.and_then(|id| {
+                            crate::agent::claude::model_from_session(id, root.as_deref())
+                        })
+                    }
+                    _ => configured_model,
+                };
+                *context.reported_model.lock().expect("model mutex poisoned") =
+                    observed_model.clone();
 
                 if output.status.success() {
                     let summary = match &plan.reply_file {
@@ -405,12 +461,14 @@ impl Agent for CommandAgent {
                         None => fallback,
                     };
                     self.record_session(&plan, &stdout);
-                    Ok(AgentOutcome::success(summary, started.elapsed()))
+                    let mut outcome = AgentOutcome::success(summary, started.elapsed());
+                    outcome.model = observed_model;
+                    Ok(outcome)
                 } else {
                     if let Some(path) = &plan.reply_file {
                         let _ = std::fs::remove_file(path);
                     }
-                    Ok(AgentOutcome::failure(
+                    let mut outcome = AgentOutcome::failure(
                         format!(
                             "agent exited with {}: {}",
                             output
@@ -421,7 +479,15 @@ impl Agent for CommandAgent {
                             summarize(&format!("{stdout}\n{stderr}"), "")
                         ),
                         started.elapsed(),
-                    ))
+                    );
+                    outcome.model = if matches!(self.name.as_str(), "agy" | "kimi") {
+                        None
+                    } else {
+                        observed_model
+                    };
+                    *context.reported_model.lock().expect("model mutex poisoned") =
+                        outcome.model.clone();
+                    Ok(outcome)
                 }
             }
         }
@@ -671,6 +737,10 @@ with open(os.environ["FAKE_LOG"], "a") as f:
     f.write(" ".join(args) + "\n")
 sys.stdin.read()
 print('{"type":"thread.started","thread_id":"tid-123"}')
+from pathlib import Path
+sessions = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "09" / "28"
+sessions.mkdir(parents=True, exist_ok=True)
+(sessions / "rollout-2026-09-28T00-00-00-tid-123.jsonl").write_text('{"type":"turn_context","payload":{"model":"test/codex-model"}}\n')
 if out:
     with open(out, "w") as f:
         f.write("CODEX-REPLY")
@@ -682,6 +752,7 @@ if out:
         let agent = CommandAgent::new("codex", script.display().to_string())
             .arg("exec")
             .env("FAKE_LOG", log.display().to_string())
+            .env("CODEX_HOME", dir.path().display().to_string())
             .session(
                 SessionStyle {
                     create_args: vec!["--json".into(), "-o".into(), "{reply_file}".into()],
@@ -708,11 +779,13 @@ if out:
         let first = agent.run(&request, &context).await.unwrap();
         assert!(first.success);
         assert_eq!(first.summary, "CODEX-REPLY");
+        assert_eq!(first.model.as_deref(), Some("test/codex-model"));
         assert_eq!(store.get("codex", "o/r:1"), Some("tid-123".to_string()));
 
         let second = agent.run(&request, &context).await.unwrap();
         assert!(second.success);
         assert_eq!(second.summary, "CODEX-REPLY");
+        assert_eq!(second.model.as_deref(), Some("test/codex-model"));
 
         let logged = std::fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = logged.lines().collect();

@@ -16,6 +16,7 @@ delay = float(os.environ.get("FAKE_PI_DELAY", "0"))
 wait_for_steer = os.environ.get("FAKE_PI_WAIT_FOR_STEER") == "1"
 steer_log = os.environ.get("FAKE_PI_STEER_LOG")
 result_path = os.environ.get("FAKE_PI_RESULT")
+prompt_log = os.environ.get("FAKE_PI_PROMPT_LOG")
 
 waiting = False
 for line in sys.stdin:
@@ -29,6 +30,9 @@ for line in sys.stdin:
     kind = message.get("type")
     request_id = message.get("id")
     if kind == "prompt":
+        if prompt_log:
+            with open(prompt_log, "w") as handle:
+                handle.write("received")
         time.sleep(delay)
         print(
             json.dumps({"type": "response", "id": request_id, "success": True}),
@@ -68,3 +72,6 @@ for line in sys.stdin:
             ),
             flush=True,
         )
+    elif kind == "get_state":
+        print(json.dumps({"type": "response", "id": request_id, "success": True,
+                          "data": {"model": {"provider": "test", "id": "fake-pi"}}}), flush=True)

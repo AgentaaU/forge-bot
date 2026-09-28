@@ -63,6 +63,8 @@ pub struct ThreadStatus {
     pub state: ThreadState,
     /// Agent currently running, next to run, or the one that ran last.
     pub agent: String,
+    /// Model reported by the active or most recent run, if known.
+    pub model: Option<String>,
     /// Follow-up mentions waiting behind the current run.
     pub queued: usize,
     /// Total number of runs recorded for the conversation.
@@ -116,6 +118,7 @@ pub fn snapshot(sessions: Vec<Session>, pending: Vec<Job>) -> Vec<ThreadStatus> 
             thread_type: thread_type(first.message.is_pull_request).to_owned(),
             state: ThreadState::Queued,
             agent: first.agent.clone(),
+            model: None,
             queued: waiting.len() + 1,
             runs: 0,
             created_at: first.created_at,
@@ -176,6 +179,7 @@ fn from_session(session: Session, waiting: Vec<Job>) -> ThreadStatus {
         thread_type,
         state,
         agent,
+        model: running.or(last).and_then(|run| run.model.clone()),
         queued,
         runs: session.runs.len(),
         created_at: session.created_at,
@@ -383,7 +387,7 @@ a {{ color: inherit; }}
 </form>
 <p class="sub">{summary} Refreshes every 15s.</p>
 <table>
-<thead><tr><th>State</th><th>Thread</th><th>Agent</th><th>Queued</th><th>Runs</th><th>Updated</th><th>Last result</th></tr></thead>
+<thead><tr><th>State</th><th>Thread</th><th>Agent</th><th>Model</th><th>Queued</th><th>Runs</th><th>Updated</th><th>Last result</th></tr></thead>
 <tbody>
 {rows}
 </tbody>
@@ -443,12 +447,18 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
         "<tr><td><span class=\"state {state}\">{label}</span></td>\
 <td>{thread_cell}</td>\
 <td>{agent}</td>\
+<td>{model}</td>\
 <td>{queued}</td>\
 <td>{runs}</td>\
 <td>{updated}</td>\
 <td>{last}</td></tr>\n",
         state = thread.state.label(),
         label = thread.state.label(),
+        model = thread
+            .model
+            .as_deref()
+            .map(escape_html)
+            .unwrap_or_else(|| "—".to_owned()),
         queued = thread.queued,
         runs = thread.runs,
         updated = escape_html(&humanize_age(now, thread.updated_at)),
@@ -545,6 +555,7 @@ mod tests {
             finished_at: Some(Utc::now() - chrono::Duration::seconds(10)),
             success: Some(success),
             summary: Some("done".into()),
+            model: Some("openai/test-model".into()),
         }
     }
 
@@ -556,6 +567,7 @@ mod tests {
             finished_at: None,
             success: None,
             summary: None,
+            model: None,
         }
     }
 
@@ -567,6 +579,7 @@ mod tests {
         let thread = &threads[0];
         assert_eq!(thread.state, ThreadState::Idle);
         assert_eq!(thread.agent, "codex");
+        assert_eq!(thread.model.as_deref(), Some("openai/test-model"));
         assert_eq!(thread.number, Some(1));
         assert_eq!(thread.thread_type, "issue");
         assert_eq!(thread.runs, 1);
@@ -703,6 +716,7 @@ mod tests {
             thread_type: "issue".into(),
             state: ThreadState::Idle,
             agent: "<img src=x>".into(),
+            model: Some("<script>model</script>".into()),
             queued: 0,
             runs: 0,
             created_at: now,
@@ -715,7 +729,9 @@ mod tests {
         let html = render_row(&thread, now);
         assert!(!html.contains("<script>"));
         assert!(!html.contains("<img"));
+        assert!(!html.contains("<script>model"));
         assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&lt;script&gt;model&lt;/script&gt;"));
         assert!(html.contains("&quot; onmouseover=&quot;"));
         assert!(html.contains("❌"));
     }

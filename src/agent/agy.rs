@@ -9,7 +9,9 @@
 //! argument, so `--print` must be the last configured argument; a flag placed
 //! between `--print` and the prompt is consumed as the prompt.
 
-use crate::agent::command::CommandAgent;
+use std::path::PathBuf;
+
+use crate::agent::command::{CommandAgent, model_arg};
 use crate::config::{AgentConfig, PromptDelivery};
 
 /// Built-in Antigravity CLI adapter defaults.
@@ -35,6 +37,24 @@ pub fn build(config: &AgentConfig) -> CommandAgent {
     // appended after all configured arguments. Add `--print` last so agy does
     // not mistake `--dangerously-skip-permissions` for the prompt.
     agent.arg("--print")
+}
+
+/// AGY's print output omits its default model. Read the same persisted
+/// selection that the CLI loads when no model argument was supplied.
+pub(crate) fn configured_model(args: &[String], home: Option<&String>) -> Option<String> {
+    if let Some(model) = model_arg(args, false) {
+        return Some(model);
+    }
+    let home = home
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
+    let path = home.join(".gemini/antigravity-cli/settings.json");
+    let data = std::fs::read(path).ok()?;
+    let settings: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    settings["model"]
+        .as_str()
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -64,6 +84,23 @@ mod tests {
         assert_eq!(agent.arguments(), ["--print"]);
     }
 
+    #[test]
+    fn reads_selected_model_without_changing_agent_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".gemini/antigravity-cli/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(settings, r#"{"model":"Gemini 3.8 Flash (Medium)"}"#).unwrap();
+        let home = dir.path().display().to_string();
+        assert_eq!(
+            configured_model(&[], Some(&home)).as_deref(),
+            Some("Gemini 3.8 Flash (Medium)")
+        );
+        assert_eq!(
+            configured_model(&["--model=gemini-test".into()], Some(&home)).as_deref(),
+            Some("gemini-test")
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn passes_prompt_as_argument_and_captures_reply() {
@@ -80,8 +117,12 @@ mod tests {
 
         let agent = build(&AgentConfig {
             command: Some(script.display().to_string()),
+            env: [("HOME".into(), dir.path().display().to_string())].into(),
             ..Default::default()
         });
+        let settings = dir.path().join(".gemini/antigravity-cli/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(settings, r#"{"model":"agy-test-model"}"#).unwrap();
         let request = AgentRequest {
             location: url::Url::parse("https://forge.example.com/o/r/issues/1").unwrap(),
             message: "PING".into(),
@@ -89,5 +130,6 @@ mod tests {
         let outcome = agent.run(&request, &AgentContext::default()).await.unwrap();
         assert!(outcome.success);
         assert_eq!(outcome.summary, "agy reply");
+        assert_eq!(outcome.model.as_deref(), Some("agy-test-model"));
     }
 }
