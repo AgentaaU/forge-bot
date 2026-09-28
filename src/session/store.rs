@@ -29,6 +29,22 @@ pub struct RunRecord {
     pub model: Option<String>,
 }
 
+impl RunRecord {
+    /// Close a run that can no longer be executing. Used when a restart finds a
+    /// run still marked in flight: the process that owned it is gone, so it can
+    /// never finish on its own.
+    fn interrupt(&mut self, at: DateTime<Utc>) {
+        self.finished_at = Some(at);
+        self.success = Some(false);
+        if self.summary.is_none() {
+            self.summary = Some(INTERRUPTED_SUMMARY.to_owned());
+        }
+    }
+}
+
+/// Summary stored on a run that a restart interrupted before it finished.
+const INTERRUPTED_SUMMARY: &str = "Run interrupted before it finished (the bot restarted).";
+
 /// A conversation with the bot about one forge object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -39,6 +55,20 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub runs: Vec<RunRecord>,
+}
+
+impl Session {
+    /// Whether the newest run is still in flight.
+    ///
+    /// A session runs at most one job at a time, so only the last record can be
+    /// unfinished. Checking the newest run (rather than any run) keeps the
+    /// status page honest even if older records were left open by an earlier
+    /// process.
+    pub fn is_running(&self) -> bool {
+        self.runs
+            .last()
+            .is_some_and(|run| run.finished_at.is_none())
+    }
 }
 
 /// Persists sessions and pending jobs under a directory.
@@ -75,11 +105,17 @@ impl SessionStore {
             }
         }
 
-        Ok(Self {
+        let store = Self {
             dir,
             sessions: Mutex::new(sessions),
             live_output: Mutex::new(HashMap::new()),
-        })
+        };
+        // A run can only be executing in the process that started it, so any
+        // run persisted without an end time when the store opens is stale.
+        // Close it now so the status page does not report a phantom running
+        // thread after a restart (issue #110).
+        store.interrupt_stale_runs();
+        Ok(store)
     }
 
     /// Stable key for the conversation a message belongs to.
@@ -112,14 +148,27 @@ impl SessionStore {
             runs: Vec::new(),
         });
 
+        let now = Utc::now();
         session.agent = job.agent.clone();
         session.location = job.message.location.to_string();
-        session.updated_at = Utc::now();
+        session.updated_at = now;
+
+        // A session runs at most one job at a time, so any run still marked
+        // unfinished here cannot belong to a live process: the store was just
+        // reopened, or a replayed job reached `begin` a second time. Close it
+        // so `finish` cannot close this older record and leave the new run
+        // unfinished forever (issue #110).
+        for run in &mut session.runs {
+            if run.finished_at.is_none() {
+                run.interrupt(now);
+            }
+        }
+
         session.runs.push(RunRecord {
             job_id: job.id,
             agent: job.agent.clone(),
             message: Some(job.mention.message.clone()),
-            started_at: Utc::now(),
+            started_at: now,
             finished_at: None,
             success: None,
             summary: None,
@@ -148,7 +197,7 @@ impl SessionStore {
         let Some(session) = sessions.get_mut(key) else {
             return Ok(());
         };
-        if let Some(run) = session.runs.iter_mut().find(|r| r.job_id == job_id) {
+        if let Some(run) = session.runs.iter_mut().rev().find(|r| r.job_id == job_id) {
             run.agent = agent.to_owned();
             run.finished_at = Some(Utc::now());
             run.success = Some(outcome.success);
@@ -190,6 +239,29 @@ impl SessionStore {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Close every run left in flight by a previous process.
+    ///
+    /// The store is opened once when the bot starts. Any run persisted without
+    /// an end time belonged to a process that is gone, so it can never
+    /// complete; leaving it open would make the status page report a phantom
+    /// running thread forever (issue #110).
+    fn interrupt_stale_runs(&self) {
+        let now = Utc::now();
+        let mut sessions = self.sessions.lock().expect("session mutex poisoned");
+        for session in sessions.values_mut() {
+            let mut interrupted = false;
+            for run in &mut session.runs {
+                if run.finished_at.is_none() {
+                    run.interrupt(now);
+                    interrupted = true;
+                }
+            }
+            if interrupted && let Err(error) = self.persist_locked(session) {
+                tracing::warn!(key = %session.key, %error, "failed to persist interrupted run");
+            }
+        }
     }
 
     fn persist_locked(&self, session: &Session) -> Result<()> {
@@ -317,6 +389,49 @@ mod tests {
         assert_eq!(stored.runs[0].model.as_deref(), Some("test/example"));
         let reopened = SessionStore::open(dir.path()).unwrap();
         assert_eq!(reopened.get(&key).unwrap().runs[0].model, outcome.model);
+    }
+
+    #[test]
+    fn reopening_interrupts_a_run_left_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = {
+            let store = SessionStore::open(dir.path()).unwrap();
+            let job = job();
+            store.begin(&job).unwrap();
+            job.session_key()
+        };
+
+        // A restart reopens the store. The run could not have survived it, so
+        // the status page must no longer report it as running (issue #110).
+        let store = SessionStore::open(dir.path()).unwrap();
+        let session = store.get(&key).unwrap();
+        assert!(!session.is_running());
+        let run = &session.runs[0];
+        assert!(run.finished_at.is_some());
+        assert_eq!(run.success, Some(false));
+        assert!(run.summary.as_deref().unwrap().contains("interrupted"));
+    }
+
+    #[test]
+    fn finish_closes_the_newest_record_for_a_replayed_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let job = job();
+        let key = job.session_key();
+
+        // A job replayed before the first record finished must not leave the
+        // second record open when `finish` runs.
+        store.begin(&job).unwrap();
+        store.begin(&job).unwrap();
+        let outcome = AgentOutcome::success("done", Duration::from_millis(5));
+        store.finish(&key, job.id, "pi", &outcome).unwrap();
+
+        let session = store.get(&key).unwrap();
+        assert_eq!(session.runs.len(), 2);
+        assert!(!session.is_running());
+        assert!(session.runs.iter().all(|run| run.finished_at.is_some()));
+        assert_eq!(session.runs[1].success, Some(true));
+        assert_eq!(session.runs[1].agent, "pi");
     }
 
     #[test]

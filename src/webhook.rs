@@ -164,13 +164,8 @@ async fn status_details(
                 let session = state.dispatcher.session(&query.key);
                 let live_output = session
                     .as_ref()
-                    .and_then(|session| {
-                        session
-                            .runs
-                            .iter()
-                            .rev()
-                            .find(|run| run.finished_at.is_none())
-                    })
+                    .and_then(|session| session.runs.last())
+                    .filter(|run| run.finished_at.is_none())
                     .and_then(|run| state.dispatcher.live_output(run.job_id))
                     .map(|output| output.text());
                 Html(status::render_details(

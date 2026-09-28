@@ -359,7 +359,7 @@ impl Inner {
     fn thread_is_busy(&self, key: &str) -> bool {
         // A run in flight for this conversation.
         if let Some(session) = self.sessions.get(key)
-            && session.runs.iter().any(|run| run.finished_at.is_none())
+            && session.is_running()
         {
             return true;
         }
@@ -377,7 +377,7 @@ impl Inner {
         self.sessions
             .list()
             .iter()
-            .filter(|session| session.runs.iter().any(|run| run.finished_at.is_none()))
+            .filter(|session| session.is_running())
             .count()
             >= workers
     }

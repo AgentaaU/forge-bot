@@ -141,11 +141,7 @@ pub fn snapshot(sessions: Vec<Session>, pending: Vec<Job>) -> Vec<ThreadStatus> 
 }
 
 fn from_session(session: Session, waiting: Vec<Job>) -> ThreadStatus {
-    let running = session
-        .runs
-        .iter()
-        .rev()
-        .find(|run| run.finished_at.is_none());
+    let running = session.runs.last().filter(|run| run.finished_at.is_none());
     let last = session
         .runs
         .iter()
@@ -691,6 +687,19 @@ mod tests {
         assert_eq!(thread.runs, 2);
         // The last *finished* run is reported, not the in-flight one.
         assert_eq!(thread.last_success, Some(false));
+    }
+
+    #[test]
+    fn stale_older_run_does_not_make_a_thread_running() {
+        let key = "forgejo:owner/repo:issue:1";
+        // A record left open by an earlier process must not shadow the fact
+        // that the newest run finished (issue #110).
+        let threads = snapshot(vec![session(key, vec![running(), finished(true)])], vec![]);
+        let thread = &threads[0];
+        assert_eq!(thread.state, ThreadState::Idle);
+        assert_eq!(thread.agent, "codex");
+        assert_eq!(thread.last_success, Some(true));
+        assert!(thread.running_since.is_none());
     }
 
     #[test]
