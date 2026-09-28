@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::agent::{AgentOutcome, LiveOutput};
 use crate::error::Result;
-use crate::forge::ForgeMessage;
+use crate::forge::{ForgeMessage, ReplyTarget};
 use crate::session::Job;
 
 /// One execution of an agent inside a session.
@@ -55,6 +55,12 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub runs: Vec<RunRecord>,
+    /// Where the newest reply in this conversation went. It carries an inline
+    /// review thread forward: an automatic trigger has no line of its own, so
+    /// it reuses the thread the conversation is already using instead of
+    /// opening a second, top-level one (issue #116). Older sessions omit it.
+    #[serde(default)]
+    pub reply_target: ReplyTarget,
 }
 
 impl Session {
@@ -146,12 +152,14 @@ impl SessionStore {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             runs: Vec::new(),
+            reply_target: job.message.reply_target.clone(),
         });
 
         let now = Utc::now();
         session.agent = job.agent.clone();
         session.location = job.message.location.to_string();
         session.updated_at = now;
+        session.reply_target = job.message.reply_target.clone();
 
         // A session runs at most one job at a time, so any run still marked
         // unfinished here cannot belong to a live process: the store was just

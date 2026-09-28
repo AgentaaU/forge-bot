@@ -197,7 +197,9 @@ A mention in an inline review comment is answered **in the same thread**: the
 bot posts the acknowledgement and the agent's summary back as a review comment
 on the same review, file and line, instead of appending a top-level comment to
 the pull request. This needs write access to the repository, which is the same
-permission required to comment at all.
+permission required to comment at all. An automatic trigger has no line of its
+own, so it continues in the review thread the conversation is already using
+rather than opening a second, top-level one.
 
 Description events are deduplicated by a hash of the body, so an edit that
 changes the text triggers once while re-deliveries of the same text are

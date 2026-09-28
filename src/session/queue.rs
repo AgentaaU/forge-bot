@@ -22,7 +22,7 @@ use crate::agent::{
 use crate::auto_trigger::AUTO_TRIGGER_AUTHOR;
 use crate::config::Config;
 use crate::error::{BotError, Result};
-use crate::forge::ForgeMessage;
+use crate::forge::{ForgeMessage, ReplyTarget};
 use crate::forge_api::ForgeApi;
 use crate::mention::Mention;
 use crate::policy::Policy;
@@ -154,7 +154,7 @@ impl Dispatcher {
 
     async fn enqueue(
         &self,
-        message: ForgeMessage,
+        mut message: ForgeMessage,
         mention: Mention,
         agent_name: &str,
     ) -> Result<Uuid> {
@@ -165,6 +165,19 @@ impl Dispatcher {
         // run already in flight instead of starting, so say that rather than
         // claiming the agent is running.
         let key = SessionStore::key(&message);
+
+        // An automatic forge event has no line of its own, but the conversation
+        // may already be running in an inline review thread. Reuse that thread
+        // for the acknowledgement and the result instead of opening a second,
+        // top-level one (issue #116).
+        if is_auto_trigger(&message)
+            && matches!(message.reply_target, ReplyTarget::Conversation)
+            && let Some(session) = self.inner.sessions.get(&key)
+            && matches!(session.reply_target, ReplyTarget::ReviewComment(_))
+        {
+            message.reply_target = session.reply_target;
+        }
+
         let waiting = self.inner.thread_is_busy(&key);
         let mut job = Job {
             id: Uuid::new_v4(),
@@ -1197,6 +1210,94 @@ mod tests {
             replies[0],
             ReplyTarget::ReviewComment(ReviewCommentTarget { review_id: 9, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn auto_trigger_reuses_the_conversation_review_thread() {
+        use crate::forge::{ReplyTarget, ReviewCommentTarget};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.reply.ack = true;
+        config.policy.allow_all = true;
+        config.agents.overrides.insert(
+            "custom".into(),
+            crate::config::AgentConfig {
+                command: Some("cat".into()),
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(ThreadAwareApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(AgentRegistry::from_config(&config)),
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        let target = ReplyTarget::ReviewComment(ReviewCommentTarget {
+            review_id: 9,
+            path: "src/lib.rs".into(),
+            line: 4,
+            extra_lines_count: 0,
+        });
+
+        // The conversation starts in an inline review thread.
+        let mut inline = message("o/r");
+        inline.is_pull_request = true;
+        inline.number = Some(22);
+        inline.location = Url::parse("http://forge.local/o/r/pulls/22#issuecomment-1").unwrap();
+        inline.reply_target = target;
+        dispatcher
+            .submit(
+                inline,
+                Mention {
+                    agent: Some("custom".into()),
+                    message: "go".into(),
+                },
+                "custom",
+            )
+            .await
+            .unwrap();
+        wait_for_drain(&sessions).await;
+
+        // A signed forge event has no line of its own, so it must continue in
+        // the thread already in use instead of opening a top-level one.
+        let mut auto = message("o/r");
+        auto.is_pull_request = true;
+        auto.number = Some(22);
+        auto.location = Url::parse("http://forge.local/o/r/pulls/22").unwrap();
+        auto.author = crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into();
+        auto.event = "merge_conflict".into();
+        auto.comment_id = None;
+        auto.reply_target = ReplyTarget::Conversation;
+        dispatcher
+            .submit_auto(
+                auto,
+                Mention {
+                    agent: None,
+                    message: "resolve".into(),
+                },
+                "custom",
+            )
+            .await
+            .unwrap();
+        wait_for_drain(&sessions).await;
+
+        let replies = api.replies.lock().unwrap().clone();
+        assert_eq!(replies.len(), 2, "one acknowledgement per run");
+        assert!(
+            matches!(
+                &replies[1],
+                ReplyTarget::ReviewComment(ReviewCommentTarget { review_id: 9, .. })
+            ),
+            "the automatic trigger must reuse the inline review thread: {replies:?}"
+        );
     }
 
     #[tokio::test]
