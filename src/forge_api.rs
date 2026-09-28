@@ -174,6 +174,23 @@ impl HttpForgeApi {
         target: &ReviewCommentTarget,
         body: &str,
     ) -> Result<()> {
+        self.tracked_forgejo_review(loc, target, body)
+            .await
+            .map(|_| ())
+    }
+
+    /// Post a reply inside the inline review thread `target` identifies and
+    /// return the new comment id.
+    ///
+    /// The review-comment route has no edit method, but Forgejo edits a review
+    /// comment through the generic issue-comment endpoint, so the id is enough
+    /// to update this reply in place later.
+    async fn tracked_forgejo_review(
+        &self,
+        loc: &ForgeLocation,
+        target: &ReviewCommentTarget,
+        body: &str,
+    ) -> Result<Option<String>> {
         let cfg = self
             .config
             .forges
@@ -206,7 +223,16 @@ impl HttpForgeApi {
         if let Some(token) = &cfg.token {
             req = req.header("Authorization", format!("token {token}"));
         }
-        send(req).await
+        let response = req.send().await?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(forge_error(status, &text));
+        }
+        Ok(serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|comment| comment.get("id").and_then(serde_json::Value::as_i64))
+            .map(|id| id.to_string()))
     }
 
     async fn post_github(&self, loc: &ForgeLocation, body: &str) -> Result<()> {
@@ -291,12 +317,16 @@ impl ForgeApi for HttpForgeApi {
     }
 
     async fn reply_tracked(&self, message: &ForgeMessage, body: &str) -> Result<Option<String>> {
-        // Inline review comments use a different edit endpoint, so leave them
-        // to the buffered single-comment fallback.
-        if matches!(&message.reply_target, ReplyTarget::ReviewComment(_)) {
-            return Ok(None);
-        }
         let loc = ForgeLocation::parse(&message.location)?;
+        if let ReplyTarget::ReviewComment(target) = &message.reply_target
+            && target.line != 0
+            && matches!(loc.forge, ForgeKind::Forgejo | ForgeKind::Gitea)
+        {
+            // The review-comment route has no edit method, but Forgejo edits
+            // review comments through the generic issue-comment endpoint, so
+            // track the new id and update it in place later.
+            return self.tracked_forgejo_review(&loc, target, body).await;
+        }
         match loc.forge {
             ForgeKind::Forgejo | ForgeKind::Gitea => self.tracked_forgejo(&loc, body).await,
             _ => Ok(None),
@@ -783,24 +813,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_comments_are_not_tracked_for_editing() {
-        let api = HttpForgeApi::new(config_with(
+    async fn tracks_and_edits_forgejo_review_comments() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response_body in ["{\"id\":42}", "{}"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 8192];
+                let read = socket.read(&mut buffer).await.unwrap();
+                requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+            requests
+        });
+
+        let config = config_with(
             Some(ForgejoConfig {
-                base_url: "http://127.0.0.1:1".into(),
-                token: None,
+                base_url: format!("http://{addr}"),
+                token: Some("secret".into()),
                 ..Default::default()
             }),
             None,
             None,
-        ))
-        .unwrap();
-        // The review endpoint has no matching edit endpoint here, so the
-        // acknowledgement is left to the buffered single-comment fallback.
+        );
+        let api = HttpForgeApi::new(config).unwrap();
+
         let id = api
             .reply_tracked(&review_message(), "On it.")
             .await
             .unwrap();
-        assert_eq!(id, None);
+        assert_eq!(id.as_deref(), Some("42"));
+
+        // The review endpoint has no edit route, but the generic issue-comment
+        // endpoint updates the review comment in place.
+        api.update_reply(&review_message(), "42", "On it. Switching.")
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert!(
+            requests[0].starts_with("POST /api/v1/repos/a/b/pulls/22/reviews/103/comments "),
+            "unexpected request: {}",
+            requests[0]
+        );
+        assert!(
+            requests[0].contains("\"path\":\"src/agent/registry.rs\""),
+            "unexpected request: {}",
+            requests[0]
+        );
+        assert!(
+            requests[1].starts_with("PATCH /api/v1/repos/a/b/issues/comments/42 "),
+            "unexpected request: {}",
+            requests[1]
+        );
+        assert!(requests[1].contains("On it. Switching."));
     }
 
     #[tokio::test]

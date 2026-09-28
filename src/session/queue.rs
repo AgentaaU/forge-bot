@@ -2506,6 +2506,66 @@ mod tests {
         );
     }
 
+    /// Inline review comments use the same tracked flow as any other comment:
+    /// the acknowledgement is posted on accept and fallback notices edit that
+    /// same review comment in place.
+    #[tokio::test]
+    async fn inline_review_acknowledgement_is_edited_in_place() {
+        use crate::forge::{ReplyTarget, ReviewCommentTarget};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = capacity_config(dir.path());
+        config.reply.ack = true;
+        let config = Arc::new(config);
+        let registry = isolated_registry(&config, &["capacity-agent", "good-agent"]);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(EditableApi::default());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry,
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        let mut review = message("o/r");
+        review.is_pull_request = true;
+        review.location = Url::parse("http://forge.local/o/r/pulls/1#issuecomment-1").unwrap();
+        review.reply_target = ReplyTarget::ReviewComment(ReviewCommentTarget {
+            review_id: 9,
+            path: "src/lib.rs".into(),
+            line: 4,
+            extra_lines_count: 0,
+        });
+
+        dispatcher
+            .submit(
+                review,
+                Mention {
+                    agent: Some("capacity-agent".into()),
+                    message: "go".into(),
+                },
+                "capacity-agent",
+            )
+            .await
+            .unwrap();
+
+        wait_for_drain(&sessions).await;
+
+        let comments = api.comments();
+        assert_eq!(
+            comments.len(),
+            1,
+            "the inline acknowledgement must be edited, not duplicated: {comments:?}"
+        );
+        assert!(comments[0].contains("On it"), "{comments:?}");
+        assert!(
+            comments[0].contains("switching to **good-agent**"),
+            "the fallback notice must edit the same review comment: {comments:?}"
+        );
+    }
+
     /// The tracked acknowledgement is posted by `submit`, before the worker
     /// runs, so a busy or slow agent still does not leave the thread silent.
     #[tokio::test]
