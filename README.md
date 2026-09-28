@@ -87,7 +87,7 @@ Implemented:
 
 - [x] Forgejo webhook receiver
 - [x] Webhook signature verification (HMAC-SHA256)
-- [x] `@agent` mention detection (case-insensitive, optional `@agent:<name>`)
+- [x] `@agent` mention detection (case-insensitive, optional `@agent --agent=<name>`)
 - [x] Authorization (allow-list users/repos, ignore self)
 - [x] Location URL + message extraction
 - [x] Codex adapter
@@ -183,7 +183,7 @@ most important options:
 | --- | --- |
 | `bind` | Address the webhook server listens on. |
 | `mention` | Trigger string, default `@agent`. |
-| `agent_sequence` | Ordered agent names for unqualified mentions and capacity fallback. The first registered name becomes the default; only listed agents are fallback candidates. When omitted, the built-in order starts with `codex`. Explicit `@agent:<name>` still takes priority. |
+| `agent_sequence` | Ordered agent names for unqualified mentions and capacity fallback. The first registered name becomes the default; only listed agents are fallback candidates. When omitted, the built-in order starts with `codex`. Explicit `@agent --agent=<name>` still takes priority. |
 | `[forgejo]` | `base_url`, `webhook_secret`, `token`, `bot_username`. |
 | `[policy]` | `allow_all`, `allowed_users`, `allowed_repos`. |
 | `[workspace]` | Whether to clone a checkout, and where. |
@@ -242,9 +242,9 @@ to filter the table to that thread. The same filter is available to scripts as
 
 ```text
 @agent fix the failing test          # default agent
-@agent:codex refactor this module    # pick an agent explicitly
-@agent:agy fix the build             # Antigravity CLI
-@agent:pi review the diff            # any configured adapter
+@agent --agent=codex refactor this module   # pick an agent explicitly
+@agent --agent=agy fix the build            # Antigravity CLI
+@agent --agent=pi-rpc review the diff       # any configured adapter
 ```
 
 When a provider reaches capacity, the default fallback order is `codex` →
@@ -263,8 +263,10 @@ times without a timezone use the bot host's local timezone. Otherwise,
 
 The example config sets `agent_sequence = ["codex", "agy", "pi-rpc", "claude"]`
 at the top level. Use registered adapter names; `agy` is Antigravity
-and `claude` is Claude Code. An explicit `@agent:<name>` runs first even if it
+and `claude` is Claude Code. An explicit `@agent --agent=<name>` runs first even if it
 is absent from the sequence. Agents not listed are not tried as fallbacks.
+Keep the space before `--agent` so Forgejo renders `@agent` as a clickable
+mention. Colon selector forms are no longer accepted.
 
 The mention is matched case-insensitively and only at a word boundary, so
 `foo@agent.com` does not trigger it. Bot comments are ignored to avoid loops.

@@ -28,7 +28,7 @@ const PAYLOAD: &str = r#"{
     },
     "comment": {
         "id": 77,
-        "body": "@agent:custom please do the thing",
+        "body": "@agent --agent=custom please do the thing",
         "html_url": "http://forge.local:3000/shylock/forge-bot/issues/1#issuecomment-77",
         "user": {"login": "shylock"}
     },
@@ -252,7 +252,6 @@ async fn auto_conflict_ignores_mergeable_pr() {
 async fn accepts_signed_mention_and_runs_agent() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(dir.path());
-
     let response = harness
         .app
         .clone()
@@ -286,7 +285,7 @@ async fn accepts_signed_mention_and_runs_agent() {
 async fn unqualified_mention_uses_first_agent_in_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(dir.path());
-    let payload = PAYLOAD.replace("@agent:custom", "@agent");
+    let payload = PAYLOAD.replace("@agent --agent=custom", "@agent");
 
     let response = harness
         .app
@@ -321,7 +320,7 @@ const REVIEW_PAYLOAD: &str = r#"{
         "body": "This closes #5.",
         "html_url": "http://forge.local:3000/shylock/forge-bot/pulls/16"
     },
-    "review": {"type": "pull_request_review_comment", "content": "@agent:custom review this please"},
+    "review": {"type": "pull_request_review_comment", "content": "@agent --agent=custom review this please"},
     "repository": {"full_name": "shylock/forge-bot"},
     "sender": {"login": "shylock"}
 }"#;
@@ -383,7 +382,10 @@ async fn ignores_comment_without_mention() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(dir.path());
 
-    let payload = PAYLOAD.replace("@agent:custom please do the thing", "just a normal comment");
+    let payload = PAYLOAD.replace(
+        "@agent --agent=custom please do the thing",
+        "just a normal comment",
+    );
     let response = harness
         .app
         .clone()
@@ -496,7 +498,7 @@ async fn malformed_payload_is_rejected() {
 async fn unknown_agent_is_not_fatal() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(dir.path());
-    let payload = PAYLOAD.replace("@agent:custom", "@agent:missing");
+    let payload = PAYLOAD.replace("@agent --agent=custom", "@agent --agent=missing");
 
     let response = harness
         .app

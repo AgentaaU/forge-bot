@@ -867,10 +867,10 @@ mod tests {
         state.comments.lock().unwrap().insert(
             "o/r".into(),
             MockReply::Json(json!([
-                comment(1, "@agent:custom go", "shylock-bot"),
+                comment(1, "@agent --agent=custom go", "shylock-bot"),
                 comment(2, "just chatting", "alice"),
-                comment(3, "@agent:missing go", "alice"),
-                comment(4, "@agent:custom go", "alice")
+                comment(3, "@agent --agent=missing go", "alice"),
+                comment(4, "@agent --agent=custom go", "alice")
             ])),
         );
         let base = start_mock(state).await;
@@ -901,7 +901,7 @@ mod tests {
         let state = Arc::new(MockState::default());
         state.comments.lock().unwrap().insert(
             "o/r".into(),
-            MockReply::Json(json!([comment(1, "@agent:custom go", "alice")])),
+            MockReply::Json(json!([comment(1, "@agent --agent=custom go", "alice")])),
         );
         let base = start_mock(state).await;
 
