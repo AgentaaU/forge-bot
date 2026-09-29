@@ -446,6 +446,7 @@ mod tests {
             webhook_secret: Some("hush".into()),
             token: None,
             bot_username: Some("botty".into()),
+            ..Default::default()
         })
     }
 
@@ -931,6 +932,7 @@ mod tests {
             webhook_secret: None,
             token: Some("test-token".into()),
             bot_username: None,
+            ..Default::default()
         });
         let body = review_payload("");
         let mut messages = Vec::new();

@@ -596,6 +596,7 @@ mod tests {
             token: Some("tok".into()),
             webhook_secret: None,
             bot_username: Some("shylock-bot".into()),
+            ..Default::default()
         });
         config.agents.overrides.insert(
             "custom".into(),

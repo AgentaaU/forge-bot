@@ -233,6 +233,10 @@ pub struct Forges {
 pub struct ForgejoConfig {
     /// Base URL of the Forgejo instance, e.g. `https://forge.example.com`.
     pub base_url: String,
+    /// Public web URL used for user-facing links when it differs from
+    /// `base_url` (for example when API traffic goes over loopback). Defaults
+    /// to `base_url` when unset.
+    pub web_url: Option<String>,
     /// Shared secret configured on the webhook.
     pub webhook_secret: Option<String>,
     /// Token used by the bot to post comments / clone repositories.
@@ -245,10 +249,18 @@ impl Default for ForgejoConfig {
     fn default() -> Self {
         Self {
             base_url: "http://localhost:3000".to_owned(),
+            web_url: None,
             webhook_secret: None,
             token: None,
             bot_username: None,
         }
+    }
+}
+
+impl ForgejoConfig {
+    /// Web base used for links shown to users, falling back to [`Self::base_url`].
+    pub fn web_base(&self) -> &str {
+        self.web_url.as_deref().unwrap_or(&self.base_url)
     }
 }
 

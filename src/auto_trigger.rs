@@ -331,7 +331,15 @@ fn auto_message(
     event: &str,
     instruction: &str,
 ) -> Result<ForgeMessage> {
-    let location_text = format!("{base}/{repo}/pulls/{number}");
+    // Prefer the public `html_url` the API returns so every user-facing link
+    // (the status page, the agent prompt) points at the web UI rather than the
+    // internal API `base_url`.
+    let location_text = pr
+        .get("html_url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{base}/{repo}/pulls/{number}"));
     let location = Url::parse(&location_text).map_err(|error| BotError::InvalidLocation {
         location: location_text,
         reason: error.to_string(),
@@ -351,4 +359,50 @@ fn auto_message(
         title: pr.get("title").and_then(Value::as_str).map(str::to_owned),
         reply_target: ReplyTarget::Conversation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn auto_message_prefers_the_public_html_url() {
+        let pr = json!({
+            "html_url": "https://forgejo.example.com/o/r/pulls/7",
+            "title": "t",
+            "body": "Fixes #3",
+        });
+        let message = auto_message(
+            "http://127.0.0.1:3000",
+            "o/r",
+            7,
+            &pr,
+            "merge_conflict",
+            "resolve",
+        )
+        .unwrap();
+        assert_eq!(
+            message.location.as_str(),
+            "https://forgejo.example.com/o/r/pulls/7"
+        );
+    }
+
+    #[test]
+    fn auto_message_falls_back_to_the_api_base() {
+        let pr = json!({ "title": "t" });
+        let message = auto_message(
+            "http://127.0.0.1:3000",
+            "o/r",
+            7,
+            &pr,
+            "merge_conflict",
+            "resolve",
+        )
+        .unwrap();
+        assert_eq!(
+            message.location.as_str(),
+            "http://127.0.0.1:3000/o/r/pulls/7"
+        );
+    }
 }

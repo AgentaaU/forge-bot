@@ -231,6 +231,17 @@ impl Dispatcher {
         let sessions = self.inner.sessions.list();
         let pending = self.inner.sessions.pending_jobs()?;
         let mut threads = status::snapshot(sessions, pending);
+        // Locations built from the internal API base (auto-triggers) must link
+        // to the public web UI when the two differ.
+        if let Some(forgejo) = self.inner.config.forges.forgejo.as_ref() {
+            let web = forgejo.web_base();
+            if web.trim_end_matches('/') != forgejo.base_url.trim_end_matches('/') {
+                for thread in &mut threads {
+                    thread.location =
+                        status::public_location(&thread.location, &forgejo.base_url, web);
+                }
+            }
+        }
         let running = self
             .inner
             .running

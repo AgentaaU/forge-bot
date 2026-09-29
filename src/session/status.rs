@@ -206,6 +206,24 @@ fn thread_type(is_pull_request: bool) -> &'static str {
     }
 }
 
+/// Point a status link at the public web base when the stored location was
+/// built from an internal API base (for example loopback).
+///
+/// Locations captured from webhook payloads already carry the public
+/// `html_url`; this rewrites the ones the bot built from `base_url` so every
+/// row on the status page is clickable from a browser.
+pub fn public_location(location: &str, api_base: &str, web_base: &str) -> String {
+    let api = api_base.trim_end_matches('/');
+    let web = web_base.trim_end_matches('/');
+    if api.is_empty() || web == api {
+        return location.to_owned();
+    }
+    match location.strip_prefix(api) {
+        Some(rest) if rest.starts_with('/') => format!("{web}{rest}"),
+        _ => location.to_owned(),
+    }
+}
+
 /// Coordinates parsed from a comment or issue/PR URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadRef {
@@ -946,5 +964,44 @@ mod tests {
         let html = render_html(&threads, Some("https://forge/owner/repo/issues/999"));
         assert!(html.contains("No thread matches"), "{html}");
         assert!(html.contains("0 of 1 thread(s) match"), "{html}");
+    }
+
+    #[test]
+    fn public_location_rewrites_the_internal_api_base() {
+        assert_eq!(
+            public_location(
+                "http://127.0.0.1:3000/shylock/stock-analysis/pulls/499",
+                "http://127.0.0.1:3000",
+                "https://forgejo.shylockhg.me/",
+            ),
+            "https://forgejo.shylockhg.me/shylock/stock-analysis/pulls/499"
+        );
+        // A location already on the public base is not touched.
+        assert_eq!(
+            public_location(
+                "https://forgejo.shylockhg.me/a/b/pulls/1",
+                "http://127.0.0.1:3000",
+                "https://forgejo.shylockhg.me",
+            ),
+            "https://forgejo.shylockhg.me/a/b/pulls/1"
+        );
+        // No override (web == api) keeps the stored location.
+        assert_eq!(
+            public_location(
+                "http://127.0.0.1:3000/a/b/pulls/1",
+                "http://127.0.0.1:3000",
+                "http://127.0.0.1:3000",
+            ),
+            "http://127.0.0.1:3000/a/b/pulls/1"
+        );
+        // A host that merely shares the prefix is not rewritten.
+        assert_eq!(
+            public_location(
+                "http://127.0.0.1:30001/a/b/pulls/1",
+                "http://127.0.0.1:3000",
+                "https://forgejo.shylockhg.me",
+            ),
+            "http://127.0.0.1:30001/a/b/pulls/1"
+        );
     }
 }

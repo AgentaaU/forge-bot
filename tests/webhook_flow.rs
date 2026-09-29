@@ -62,6 +62,7 @@ fn harness_with(dir: &std::path::Path, configure: impl FnOnce(&mut Config)) -> H
         webhook_secret: Some(SECRET.into()),
         token: None,
         bot_username: Some("shylock-bot".into()),
+        ..Default::default()
     });
     // `cat` echoes the prompt, standing in for a real CLI agent.
     config.agents.overrides.insert(
