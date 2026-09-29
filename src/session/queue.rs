@@ -486,6 +486,7 @@ impl Inner {
         if !self.config.reply.ack {
             return;
         }
+        let notice = merged_notice(job, notice);
         match &job.status_comment {
             Some(id) => {
                 let body = format!("forge-bot: {notice}");
@@ -493,7 +494,7 @@ impl Inner {
                     tracing::warn!(%error, "failed to update the merged follow-up status");
                 }
             }
-            None => self.reply(&job.message, notice).await,
+            None => self.reply(&job.message, &notice).await,
         }
     }
 
@@ -995,6 +996,18 @@ fn auto_trigger_origin(message: &ForgeMessage) -> Option<&'static str> {
         "merge_conflict" => "a merge conflict",
         _ => "an automatic forge event",
     })
+}
+
+/// Name the follow-up that was merged into a live run so the thread can tell an
+/// automatic trigger from a human reply.
+fn merged_notice(job: &Job, notice: &str) -> String {
+    match auto_trigger_origin(&job.message) {
+        Some(origin) => format!("{notice} Triggered by {origin}."),
+        None if !job.message.author.is_empty() => {
+            format!("{notice} Follow-up from @{}.", job.message.author)
+        }
+        None => notice.to_owned(),
+    }
 }
 
 /// Render one unavailable agent with its reason, e.g.
@@ -1535,10 +1548,138 @@ mod tests {
         assert_eq!(steering.steers(), vec!["second".to_owned()]);
         let comments = api.comments();
         assert!(
-            comments
-                .iter()
-                .any(|(_, body)| body.contains("Merged into the current run")),
-            "the thread should show the merge notice: {comments:?}"
+            comments.iter().any(|(_, body)| body
+                == "forge-bot: 📎 Merged into the current run. Follow-up from @alice."),
+            "the thread should show the merge notice and its author: {comments:?}"
+        );
+    }
+
+    /// An automatic trigger merged into a live run names its origin, so the
+    /// thread can tell it apart from a human follow-up.
+    #[tokio::test]
+    async fn merged_auto_trigger_names_its_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.reply.ack = true;
+        config.policy.allow_all = true;
+        config.agent_sequence = vec!["steering".into()];
+        let config = Arc::new(config);
+
+        let steering = Arc::new(SteeringAgent::new());
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test("steering", steering.clone());
+        for name in registry.names() {
+            if name != "steering" {
+                registry.mark_unavailable(&name, Duration::from_secs(3600));
+            }
+        }
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(RecordingForgeApi::new());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(registry),
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        // A human mention starts a run, which blocks until steered.
+        dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    agent: Some("steering".into()),
+                    message: "first".into(),
+                },
+                "steering",
+            )
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            if steering.runs() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(steering.runs(), 1);
+
+        // An automatic merge-conflict trigger arrives while the run is live and
+        // is merged into it instead of starting a second run.
+        let mut auto = message_at("o/r", 1);
+        auto.author = crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into();
+        auto.event = "merge_conflict".into();
+        auto.comment_id = None;
+        dispatcher
+            .submit_auto(
+                auto,
+                Mention {
+                    agent: Some("steering".into()),
+                    message: "resolve".into(),
+                },
+                "steering",
+            )
+            .await
+            .unwrap();
+
+        wait_for_drain(&sessions).await;
+
+        let comments = api.comments();
+        assert!(
+            comments.iter().any(|(_, body)| body
+                == "forge-bot: 📎 Merged into the current run. Triggered by a merge conflict."),
+            "the merged acknowledgement must name the automatic trigger: {comments:?}"
+        );
+    }
+
+    /// The merged acknowledgement names every automatic origin (and the author
+    /// for a human follow-up).
+    #[test]
+    fn merged_notice_names_the_trigger() {
+        let auto_job = |event: &str| Job {
+            id: Uuid::new_v4(),
+            message: ForgeMessage {
+                forge: crate::location::ForgeKind::Forgejo,
+                location: Url::parse("http://forge.local/o/r/pulls/1").unwrap(),
+                body: String::new(),
+                author: crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into(),
+                repository: "o/r".into(),
+                comment_id: None,
+                number: Some(1),
+                is_pull_request: true,
+                linked_issue: None,
+                event: event.into(),
+                title: None,
+                reply_target: Default::default(),
+            },
+            mention: Mention {
+                agent: None,
+                message: "x".into(),
+            },
+            agent: "codex".into(),
+            created_at: Utc::now(),
+            status_comment: None,
+            waiting: false,
+        };
+        let notice = "📎 Merged into the current run.";
+        assert_eq!(
+            merged_notice(&auto_job("action_run_failure"), notice),
+            "📎 Merged into the current run. Triggered by a failed CI run."
+        );
+        assert_eq!(
+            merged_notice(&auto_job("merge_conflict"), notice),
+            "📎 Merged into the current run. Triggered by a merge conflict."
+        );
+        assert_eq!(
+            merged_notice(&auto_job("future_event"), notice),
+            "📎 Merged into the current run. Triggered by an automatic forge event."
+        );
+
+        let mut human = auto_job("issue_comment");
+        human.message.author = "shylock".into();
+        assert_eq!(
+            merged_notice(&human, notice),
+            "📎 Merged into the current run. Follow-up from @shylock."
         );
     }
 
