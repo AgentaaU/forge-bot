@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use super::Job;
 use super::store::Session;
+use crate::agent::TokenUsage;
 
 /// What a conversation is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -65,6 +66,8 @@ pub struct ThreadStatus {
     pub agent: String,
     /// Model reported by the active or most recent run, if known.
     pub model: Option<String>,
+    /// Prompt-cache usage reported by the active or most recent run.
+    pub cache: Option<TokenUsage>,
     /// Follow-up mentions waiting behind the current run.
     pub queued: usize,
     /// Total number of runs recorded for the conversation.
@@ -119,6 +122,7 @@ pub fn snapshot(sessions: Vec<Session>, pending: Vec<Job>) -> Vec<ThreadStatus> 
             state: ThreadState::Queued,
             agent: first.agent.clone(),
             model: None,
+            cache: None,
             queued: waiting.len() + 1,
             runs: 0,
             created_at: first.created_at,
@@ -176,6 +180,7 @@ fn from_session(session: Session, waiting: Vec<Job>) -> ThreadStatus {
         state,
         agent,
         model: running.or(last).and_then(|run| run.model.clone()),
+        cache: running.or(last).and_then(|run| run.cache),
         queued,
         runs: session.runs.len(),
         created_at: session.created_at,
@@ -401,7 +406,7 @@ a {{ color: inherit; }}
 </form>
 <p class="sub">{summary} Refreshes every 15s.</p>
 <table>
-<thead><tr><th>State</th><th>Thread</th><th>Agent</th><th>Model</th><th>Queued</th><th>Runs</th><th>Updated</th><th>Last result</th><th>Details</th></tr></thead>
+<thead><tr><th>State</th><th>Thread</th><th>Agent</th><th>Model</th><th>Cache</th><th>Queued</th><th>Runs</th><th>Updated</th><th>Last result</th><th>Details</th></tr></thead>
 <tbody>
 {rows}
 </tbody>
@@ -414,6 +419,28 @@ a {{ color: inherit; }}
         clear = clear,
         rows = rows,
     )
+}
+
+/// Short cache hit rate for the overview table.
+fn cache_rate(cache: Option<TokenUsage>) -> String {
+    cache
+        .and_then(|cache| cache.hit_rate())
+        .map(|hit| format!("{hit:.1}%"))
+        .unwrap_or_else(|| "—".to_owned())
+}
+
+/// Full cache accounting for one run on the details page.
+fn cache_text(cache: Option<TokenUsage>) -> String {
+    match cache {
+        Some(cache) => match cache.hit_rate() {
+            Some(hit) => format!(
+                "Cache {hit:.1}% ({}/{} prompt tokens)",
+                cache.cached_tokens, cache.prompt_tokens
+            ),
+            None => format!("Cache: {} prompt tokens", cache.prompt_tokens),
+        },
+        None => "Cache: not reported".to_owned(),
+    }
 }
 
 fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
@@ -468,6 +495,7 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
 <td>{thread_cell}</td>\
 <td>{agent}</td>\
 <td>{model}</td>\
+<td>{cache}</td>\
 <td>{queued}</td>\
 <td>{runs}</td>\
 <td>{updated}</td>\
@@ -480,6 +508,7 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
             .as_deref()
             .map(escape_html)
             .unwrap_or_else(|| "—".to_owned()),
+        cache = cache_rate(thread.cache),
         queued = thread.queued,
         runs = thread.runs,
         updated = escape_html(&humanize_age(now, thread.updated_at)),
@@ -517,13 +546,14 @@ pub fn render_details(
                 .unwrap_or_else(|| "In progress".to_owned());
             runs.push_str(&format!(
                 "<section><h2>Run {number}: {agent} · {result}</h2>\
-<p>Started: <time>{started}</time> · Finished: <time>{finished}</time></p>\
+<p>Started: <time>{started}</time> · Finished: <time>{finished}</time> · {cache}</p>\
 <h3>Request</h3><pre>{message}</pre>\
 <h3>Result</h3><pre>{summary}</pre></section>",
                 number = index + 1,
                 agent = escape_html(&run.agent),
                 started = escape_html(&run.started_at.to_rfc3339()),
                 finished = escape_html(&finished),
+                cache = escape_html(&cache_text(run.cache)),
                 message = escape_html(message),
                 summary = escape_html(summary),
             ));
@@ -657,6 +687,10 @@ mod tests {
             success: Some(success),
             summary: Some("done".into()),
             model: Some("openai/test-model".into()),
+            cache: Some(TokenUsage {
+                prompt_tokens: 10_000,
+                cached_tokens: 9_000,
+            }),
         }
     }
 
@@ -670,6 +704,7 @@ mod tests {
             success: None,
             summary: None,
             model: None,
+            cache: None,
         }
     }
 
@@ -682,11 +717,38 @@ mod tests {
         assert_eq!(thread.state, ThreadState::Idle);
         assert_eq!(thread.agent, "codex");
         assert_eq!(thread.model.as_deref(), Some("openai/test-model"));
+        assert_eq!(
+            thread.cache,
+            Some(TokenUsage {
+                prompt_tokens: 10_000,
+                cached_tokens: 9_000,
+            })
+        );
         assert_eq!(thread.number, Some(1));
         assert_eq!(thread.thread_type, "issue");
         assert_eq!(thread.runs, 1);
         assert_eq!(thread.last_success, Some(true));
         assert_eq!(thread.queued, 0);
+    }
+
+    #[test]
+    fn formats_cache_usage() {
+        assert_eq!(cache_rate(None), "—");
+        assert_eq!(
+            cache_rate(Some(TokenUsage {
+                prompt_tokens: 100,
+                cached_tokens: 90,
+            })),
+            "90.0%"
+        );
+        assert_eq!(cache_text(None), "Cache: not reported");
+        assert!(
+            cache_text(Some(TokenUsage {
+                prompt_tokens: 100,
+                cached_tokens: 90,
+            }))
+            .contains("90.0% (90/100 prompt tokens)")
+        );
     }
 
     #[test]
@@ -861,6 +923,7 @@ mod tests {
             state: ThreadState::Idle,
             agent: "<img src=x>".into(),
             model: Some("<script>model</script>".into()),
+            cache: None,
             queued: 0,
             runs: 0,
             created_at: now,

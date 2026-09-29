@@ -28,7 +28,8 @@ use uuid::Uuid;
 use crate::agent::prompt::{build_follow_up_prompt, build_prompt};
 use crate::agent::session::SessionStore;
 use crate::agent::{
-    Agent, AgentContext, AgentOutcome, AgentRequest, LiveOutput, SteerReceipt, conversation_key,
+    Agent, AgentContext, AgentOutcome, AgentRequest, LiveOutput, SteerReceipt, TokenUsage,
+    conversation_key,
 };
 use crate::config::PiRpcConfig;
 use crate::error::{BotError, Result};
@@ -268,7 +269,9 @@ impl PiRpcClient {
     /// final text. When `timeout` is `None` the wait is unbounded: the call
     /// only returns once the agent settles or its process exits.
     pub async fn prompt(&mut self, message: &str, timeout: Option<Duration>) -> Result<String> {
-        self.prompt_with_output(message, timeout, None).await
+        self.prompt_with_output(message, timeout, None)
+            .await
+            .map(|(text, _)| text)
     }
 
     async fn prompt_with_output(
@@ -276,7 +279,7 @@ impl PiRpcClient {
         message: &str,
         timeout: Option<Duration>,
         live_output: Option<&LiveOutput>,
-    ) -> Result<String> {
+    ) -> Result<(String, TokenUsage)> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let request_id = self.next_request_id();
         self.send(&json!({
@@ -287,6 +290,8 @@ impl PiRpcClient {
         .await?;
 
         let mut streamed = String::new();
+        let mut usage = TokenUsage::default();
+        let mut streamed_usage = TokenUsage::default();
         loop {
             let record = self.next_record_before(deadline).await?;
             match record["type"].as_str().unwrap_or_default() {
@@ -314,6 +319,17 @@ impl PiRpcClient {
                             live_output.append(delta.as_bytes());
                         }
                     }
+                    // The partial message carries the running usage; keep it
+                    // as a fallback in case the final `message_end` is missed.
+                    if let Some(partial) = assistant_usage(&record["usage"]) {
+                        streamed_usage = partial;
+                    }
+                }
+                "message_end" => {
+                    if let Some(settled) = assistant_usage(&record["message"]["usage"]) {
+                        usage.prompt_tokens += settled.prompt_tokens;
+                        usage.cached_tokens += settled.cached_tokens;
+                    }
                 }
                 "agent_settled" => break,
                 _ => {}
@@ -321,10 +337,14 @@ impl PiRpcClient {
         }
 
         // Prefer pi's authoritative final message; fall back to the stream.
-        match self.get_last_assistant_text(deadline).await {
-            Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
-            _ => Ok(streamed),
+        let text = match self.get_last_assistant_text(deadline).await {
+            Ok(Some(text)) if !text.trim().is_empty() => text,
+            _ => streamed,
+        };
+        if usage.prompt_tokens == 0 {
+            usage = streamed_usage;
         }
+        Ok((text, usage))
     }
 
     async fn get_last_assistant_text(
@@ -345,6 +365,25 @@ impl PiRpcClient {
             }
         }
     }
+}
+
+/// Read one pi usage object (`input` = cache miss, `cacheRead` = cache hit).
+///
+/// Returns `None` when the object carries neither field, so an unrelated
+/// `message_end` (for example a tool result) does not count as a zero-token
+/// model call.
+fn assistant_usage(value: &Value) -> Option<TokenUsage> {
+    let input = value["input"].as_u64();
+    let cached = value["cacheRead"].as_u64();
+    if input.is_none() && cached.is_none() {
+        return None;
+    }
+    let input = input.unwrap_or(0);
+    let cached = cached.unwrap_or(0);
+    Some(TokenUsage {
+        prompt_tokens: input + cached,
+        cached_tokens: cached,
+    })
 }
 
 /// State of the pool.
@@ -681,9 +720,10 @@ impl Agent for PiPoolAgent {
             .prompt_with_output(&prompt, timeout, context.live_output.as_ref())
             .await
         {
-            Ok(text) => {
+            Ok((text, usage)) => {
                 let mut outcome = AgentOutcome::success(text, started.elapsed());
                 outcome.model = model;
+                outcome.usage = (usage.prompt_tokens > 0).then_some(usage);
                 Ok(outcome)
             }
             Err(error) => {
@@ -738,6 +778,17 @@ mod tests {
 
     fn store() -> Arc<SessionStore> {
         Arc::new(SessionStore::default())
+    }
+
+    #[test]
+    fn normalizes_pi_usage() {
+        let usage =
+            assistant_usage(&json!({"input": 100, "cacheRead": 900, "output": 12})).unwrap();
+        assert_eq!(usage.prompt_tokens, 1_000);
+        assert_eq!(usage.cached_tokens, 900);
+        assert!((usage.hit_rate().unwrap() - 90.0).abs() < f64::EPSILON);
+        // A tool-result message carries no prompt usage and must be ignored.
+        assert_eq!(assistant_usage(&json!({"output": 1})), None);
     }
 
     #[test]
@@ -1111,6 +1162,35 @@ mod tests {
         let outcome = agent.run(&request, &context).await.unwrap();
         assert!(outcome.success);
         assert_eq!(outcome.summary, "fake-result");
+    }
+
+    #[tokio::test]
+    async fn reports_pi_prompt_cache_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PiRpcConfig {
+            command: fake_pi_command(),
+            timeout_secs: 5,
+            ..Default::default()
+        };
+        let agent = PiPoolAgent::new(&config, store(), 1);
+
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let context = AgentContext {
+            workspace: dir.path().to_path_buf(),
+            forge: Some(ForgeKind::Forgejo),
+            repository: "o/r".into(),
+            issue_number: Some(1),
+            ..Default::default()
+        };
+
+        let outcome = agent.run(&request, &context).await.unwrap();
+        let usage = outcome.usage.expect("pi reports prompt usage");
+        assert_eq!(usage.prompt_tokens, 1_000);
+        assert_eq!(usage.cached_tokens, 900);
+        assert_eq!(usage.hit_rate(), Some(90.0));
     }
 
     #[tokio::test]

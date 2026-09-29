@@ -186,6 +186,7 @@ with open(os.environ["FAKE_LOG"], "a") as f:
 out = args[args.index("-o") + 1]
 sys.stdin.read()
 print(json.dumps({"type": "thread.started", "thread_id": "tid-123"}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 750, "output_tokens": 5}}))
 with open(out, "w") as f:
     f.write("CODEX-REPLY")
 "##;
@@ -211,8 +212,14 @@ with open(out, "w") as f:
             ..Default::default()
         };
 
-        assert!(agent.run(&request, &context).await.unwrap().success);
-        assert!(agent.run(&request, &context).await.unwrap().success);
+        let first = agent.run(&request, &context).await.unwrap();
+        assert!(first.success);
+        let first_usage = first.usage.expect("codex reports prompt usage");
+        assert_eq!(first_usage.prompt_tokens, 1_000);
+        assert_eq!(first_usage.cached_tokens, 750);
+        let second = agent.run(&request, &context).await.unwrap();
+        assert!(second.success);
+        assert_eq!(second.usage.unwrap().hit_rate(), Some(75.0));
 
         let logged = std::fs::read_to_string(&log).unwrap();
         let calls: Vec<Vec<String>> = logged

@@ -15,7 +15,9 @@ use tokio::process::Command;
 
 use crate::agent::prompt::build_prompt;
 use crate::agent::session::SessionStore;
-use crate::agent::{Agent, AgentContext, AgentOutcome, AgentRequest, LiveOutput, conversation_key};
+use crate::agent::{
+    Agent, AgentContext, AgentOutcome, AgentRequest, LiveOutput, TokenUsage, conversation_key,
+};
 use crate::config::PromptDelivery;
 use crate::error::{BotError, Result};
 
@@ -126,6 +128,32 @@ fn parse_thread_id(stdout: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Sum codex `turn.completed` usage from a `--json` JSONL stream.
+///
+/// Codex reports `input_tokens` as the whole prompt and `cached_input_tokens`
+/// as the cached subset, so they map straight onto [`TokenUsage`]. A run may
+/// emit more than one completed turn (for example when it is resumed), hence
+/// the sum.
+fn parse_codex_usage(stdout: &str) -> Option<TokenUsage> {
+    let mut usage = TokenUsage::default();
+    let mut seen = false;
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if value["type"] != "turn.completed" {
+            continue;
+        }
+        let Some(turn) = value.get("usage") else {
+            continue;
+        };
+        usage.prompt_tokens += turn["input_tokens"].as_u64().unwrap_or(0);
+        usage.cached_tokens += turn["cached_input_tokens"].as_u64().unwrap_or(0);
+        seen = true;
+    }
+    seen.then_some(usage)
 }
 
 /// Read a model option supplied by the operator without adding or changing
@@ -473,6 +501,13 @@ impl Agent for CommandAgent {
                 *context.reported_model.lock().expect("model mutex poisoned") =
                     observed_model.clone();
 
+                // Codex is the only command adapter whose protocol reports
+                // prompt-cache accounting, and it does so in its `--json`
+                // stream.
+                let usage = (self.name == "codex")
+                    .then(|| parse_codex_usage(&stdout))
+                    .flatten();
+
                 if status.success() {
                     let summary = match &plan.reply_file {
                         Some(path) => {
@@ -490,6 +525,7 @@ impl Agent for CommandAgent {
                     self.record_session(&plan, &stdout);
                     let mut outcome = AgentOutcome::success(summary, started.elapsed());
                     outcome.model = observed_model;
+                    outcome.usage = usage;
                     Ok(outcome)
                 } else {
                     if let Some(path) = &plan.reply_file {
@@ -511,6 +547,7 @@ impl Agent for CommandAgent {
                     } else {
                         observed_model
                     };
+                    outcome.usage = usage;
                     *context.reported_model.lock().expect("model mutex poisoned") =
                         outcome.model.clone();
                     Ok(outcome)
@@ -558,6 +595,21 @@ mod tests {
         let out = summarize(&long, "");
         assert!(out.starts_with('…'));
         assert_eq!(out.chars().count(), OUTPUT_LIMIT + 1);
+    }
+
+    #[test]
+    fn parses_codex_turn_usage() {
+        let stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1000,\"cached_input_tokens\":900,\"output_tokens\":5}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":500,\"cached_input_tokens\":400,\"output_tokens\":1}}\n",
+        );
+        let usage = parse_codex_usage(stdout).unwrap();
+        assert_eq!(usage.prompt_tokens, 1_500);
+        assert_eq!(usage.cached_tokens, 1_300);
+        assert!((usage.hit_rate().unwrap() - 86.666).abs() < 0.01);
+        assert!(parse_codex_usage("not json").is_none());
+        assert!(parse_codex_usage("{\"type\":\"turn.started\"}").is_none());
     }
 
     #[test]

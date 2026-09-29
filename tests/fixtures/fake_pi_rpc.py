@@ -19,6 +19,23 @@ result_path = os.environ.get("FAKE_PI_RESULT")
 stream_text = os.environ.get("FAKE_PI_STREAM_TEXT")
 prompt_log = os.environ.get("FAKE_PI_PROMPT_LOG")
 
+
+def emit_usage():
+    """Report one assistant message's prompt-cache accounting."""
+    print(
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "usage": {"input": 100, "cacheRead": 900, "output": 10},
+                },
+            }
+        ),
+        flush=True,
+    )
+
+
 waiting = False
 for line in sys.stdin:
     line = line.strip()
@@ -44,6 +61,7 @@ for line in sys.stdin:
         if wait_for_steer:
             waiting = True
         else:
+            emit_usage()
             print(json.dumps({"type": "agent_settled"}), flush=True)
     elif kind in ("steer", "follow_up"):
         text = message.get("message", "")
@@ -59,6 +77,7 @@ for line in sys.stdin:
         )
         if waiting:
             waiting = False
+            emit_usage()
             print(json.dumps({"type": "agent_settled"}), flush=True)
     elif kind == "get_last_assistant_text":
         text = "fake-result"

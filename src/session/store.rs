@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::{AgentOutcome, LiveOutput};
+use crate::agent::{AgentOutcome, LiveOutput, TokenUsage};
 use crate::error::Result;
 use crate::forge::ForgeMessage;
 use crate::session::Job;
@@ -28,6 +28,9 @@ pub struct RunRecord {
     pub summary: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Provider prompt-cache accounting, when the adapter reported it.
+    #[serde(default)]
+    pub cache: Option<TokenUsage>,
 }
 
 impl RunRecord {
@@ -174,6 +177,7 @@ impl SessionStore {
             success: None,
             summary: None,
             model: None,
+            cache: None,
         });
 
         self.persist_locked(session)?;
@@ -204,6 +208,7 @@ impl SessionStore {
             run.success = Some(outcome.success);
             run.summary = Some(outcome.summary.clone());
             run.model = outcome.model.clone();
+            run.cache = outcome.usage;
         }
         session.agent = agent.to_owned();
         session.updated_at = Utc::now();
@@ -434,6 +439,10 @@ mod tests {
 
         let mut outcome = AgentOutcome::success("done", Duration::from_millis(5));
         outcome.model = Some("test/example".into());
+        outcome.usage = Some(TokenUsage {
+            prompt_tokens: 1_000,
+            cached_tokens: 750,
+        });
         store.finish(&key, job.id, "pi", &outcome).unwrap();
 
         let stored = store.get(&key).unwrap();
@@ -441,8 +450,10 @@ mod tests {
         assert_eq!(stored.runs[0].agent, "pi");
         assert_eq!(stored.runs[0].summary.as_deref(), Some("done"));
         assert_eq!(stored.runs[0].model.as_deref(), Some("test/example"));
+        assert_eq!(stored.runs[0].cache, outcome.usage);
         let reopened = SessionStore::open(dir.path()).unwrap();
         assert_eq!(reopened.get(&key).unwrap().runs[0].model, outcome.model);
+        assert_eq!(reopened.get(&key).unwrap().runs[0].cache, outcome.usage);
     }
 
     #[test]

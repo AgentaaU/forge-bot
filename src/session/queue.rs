@@ -862,6 +862,23 @@ impl Inner {
     }
 
     fn persist_outcome(&self, key: &str, job: &Job, agent: &str, outcome: &AgentOutcome) {
+        if let Some(usage) = outcome.usage {
+            match usage.hit_rate() {
+                Some(hit) => tracing::info!(
+                    job = %job.id,
+                    agent,
+                    prompt_tokens = usage.prompt_tokens,
+                    cached_tokens = usage.cached_tokens,
+                    hit_rate = hit,
+                    "agent prompt cache"
+                ),
+                None => tracing::info!(
+                    job = %job.id,
+                    agent,
+                    "agent prompt cache: no prompt tokens reported"
+                ),
+            }
+        }
         if let Err(error) = self.sessions.finish(key, job.id, agent, outcome) {
             tracing::warn!(%error, "failed to persist session result");
         }

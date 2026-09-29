@@ -138,15 +138,20 @@ Two things stand out:
    from other sessions; only the thread-specific part misses. The distribution
    is broad, though: 5 of 87 cold calls report 0 %, while 58 report 75 % or
    more.
-2. **Resuming is cheap but not free.** The first call of a resumed run averages
-   only 27 % and 6 of the 13 runs report 0 %. Re-rendering the conversation and
-   appending the new user turn shifts the prefix boundary, so the first call
-   often misses what the previous run cached. It recovers within the run, and
-   *later* calls average 95.8 %. It does not follow that resuming raises the
-   cache hit rate: on the eight threads that have more than one run, the
-   token-weighted rate is 96.7 % for the cold first run but 95.3 % for the
-   resumed runs, so the value of resuming is the model context it preserves,
-   not a larger cached prefix.
+2. **Resuming is cheap but not free — and the current sample is contaminated.**
+   The first call of a resumed run averages only 27 %, but 11 of the 13 resumed
+   runs used a *different model* than the run before them (`gpt-6-sol` →
+   `gpt-6-astra` → `gpt-6-luna`), and a provider cache is per model, so those
+   misses are expected rather than a rendering artefact. The two same-model
+   resumes were mid-turn restarts (the same `turn_id` continued after an
+   interruption), not a new comment, and both report 0 %. There is no clean
+   sample of a *new comment* resuming on the same model — the case that matters
+   now that the agent layer no longer selects a model (`9f6cb7a`). It recovers
+   within the run, and *later* calls average 95.8 %. It does not follow that
+   resuming raises the cache hit rate: on the eight threads with more than one
+   run, the token-weighted rate is 96.7 % for the cold first run but 95.3 % for
+   the resumed runs, so the value of resuming is the model context it
+   preserves, not a larger cached prefix.
 
 ### Pi
 
@@ -230,12 +235,16 @@ session per conversation.
    conversation fork when a run bounces between agents. If continuity across
    fallbacks matters, the gateway would have to carry a summary or the agents a
    shared transcript; that is a larger design change, not a cache-tuning one.
-4. **Optionally surface the metric.** The gateway could parse
-   `cached_input_tokens` / `cacheRead` from the CLI output and log a per-job hit
-   rate, making regressions visible without opening session files.
-5. **No prompt-layout change is warranted yet.** The resumed first-call dip is
-   caused by Codex/Pi's own conversation rendering, not by the gateway prompt,
-   and it recovers within the same run.
+4. **Surface the metric (implemented).** The gateway now parses
+   `cached_input_tokens` / `cacheRead` from the CLI output, logs a per-job hit
+   rate, stores it on the run record, and shows it on the status page, so
+   regressions are visible without opening session files. It is the way to
+   confirm whether a same-model resume stays warm now that model selection is
+   out of the agent layer.
+5. **No prompt-layout change is warranted yet.** Once the model-change
+   confound is removed, the remaining resumed first-call dip is Codex/Pi's own
+   conversation rendering, not the gateway prompt, and it recovers within the
+   same run.
 
 ## Reproduce
 

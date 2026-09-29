@@ -158,6 +158,32 @@ pub fn conversation_key(context: &AgentContext) -> String {
     }
 }
 
+/// Provider-reported prompt token usage for one agent run.
+///
+/// The two adapters report this differently: Codex counts
+/// `cached_input_tokens` as a subset of `input_tokens`, while Pi reports the
+/// cache miss (`input`) and the cache hit (`cacheRead`) separately. Both are
+/// normalised here to (total prompt, cached subset) so the hit rate is
+/// `cached / prompt` either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    /// Whole prompt billed for the run (cache hits plus fresh input).
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    /// Part of `prompt_tokens` the provider served from its prompt cache.
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Percentage of prompt tokens served from cache, or `None` when the
+    /// provider reported no prompt tokens at all.
+    pub fn hit_rate(&self) -> Option<f64> {
+        (self.prompt_tokens > 0)
+            .then(|| 100.0 * self.cached_tokens as f64 / self.prompt_tokens as f64)
+    }
+}
+
 /// What an agent reports back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentOutcome {
@@ -167,6 +193,9 @@ pub struct AgentOutcome {
     /// Model reported by the agent, when its protocol exposes one.
     #[serde(default)]
     pub model: Option<String>,
+    /// Provider prompt-cache accounting, when the adapter can read it.
+    #[serde(default)]
+    pub usage: Option<TokenUsage>,
 }
 impl AgentOutcome {
     pub fn success(summary: impl Into<String>, duration: Duration) -> Self {
@@ -175,6 +204,7 @@ impl AgentOutcome {
             summary: summary.into(),
             duration,
             model: None,
+            usage: None,
         }
     }
 
@@ -184,6 +214,7 @@ impl AgentOutcome {
             summary: summary.into(),
             duration,
             model: None,
+            usage: None,
         }
     }
 }
