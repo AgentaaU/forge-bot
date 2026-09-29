@@ -50,6 +50,12 @@ session:
   conversation to one process, and persists the conversation with a
   deterministic `--session-id` so an evicted or restarted process can resume it
   (`src/agent/pi_rpc.rs`).
+* A pull request is folded onto the issue it closes and each thread is pinned
+  to one agent, so comments on either side share one session instead of
+  scattering across agents (`src/forge/mod.rs`, `src/agent/pi_rpc.rs`).
+* A same-thread follow-up that arrives while a `pi-rpc` run is in flight is
+  steered into the live session rather than starting a second cold run
+  (`src/agent/prompt.rs`, `src/agent/pi_rpc.rs`).
 
 When the backend keeps the same conversation, the provider can serve the
 unchanged prefix (system prompt, repository instructions, prior turns) from its
@@ -135,10 +141,12 @@ Two things stand out:
 2. **Resuming is cheap but not free.** The first call of a resumed run averages
    only 27 % and 6 of the 13 runs report 0 %. Re-rendering the conversation and
    appending the new user turn shifts the prefix boundary, so the first call
-   often misses what the previous run cached. It recovers immediately: the run
-   as a whole still lands at 77–98 %, and *later* calls are the highest of all
-   at 95.8 %. Net effect over a multi-comment thread is still strongly in
-   favour of resuming.
+   often misses what the previous run cached. It recovers within the run, and
+   *later* calls average 95.8 %. It does not follow that resuming raises the
+   cache hit rate: on the eight threads that have more than one run, the
+   token-weighted rate is 96.7 % for the cold first run but 95.3 % for the
+   resumed runs, so the value of resuming is the model context it preserves,
+   not a larger cached prefix.
 
 ### Pi
 
@@ -207,8 +215,12 @@ session per conversation.
 
 ## Recommendations
 
-1. **Keep per-thread session reuse.** It is the mechanism that produces the
-   97 %/97 % figures; nothing else in the gateway affects caching.
+1. **Keep per-thread session reuse.** It preserves the model context across
+   comments and lets each resumed run recover to a high hit rate, but it does
+   not by itself raise the cache hit rate. The 97 % headline comes from long
+   runs, where *later* calls are 99.5 % of the tokens; the other gateway
+   changes described above (pinning/folding, `pi-rpc` persistence, follow-up
+   steering) are what keep those calls warm.
 2. **Keep one Pi backend.** `pi` and `pi-rpc` are the same CLI and provider, so
    a quota or rate limit that stops one stops the other. Since #46 only
    `pi-rpc` is enabled by default, which avoids doubling the fallback latency
