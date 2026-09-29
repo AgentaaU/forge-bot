@@ -75,6 +75,41 @@ forge comment), and calls after the first inside one run are *later*.
 
 ## Findings
 
+### Compared with #43
+
+The re-measurement raises the headline rate, but the rise is mostly the
+larger, longer-lived sample rather than a change in caching behaviour:
+
+| Metric | #43 (2026-09-25) | #126 (2026-09-29) | Δ |
+| --- | ---: | ---: | ---: |
+| Codex, all calls (token-weighted) | 96.2 % | 97.1 % | +0.9 pp |
+| Codex, cold first call | 82.1 % | 74.0 % | −8.1 pp |
+| Codex, resumed first call | 32.3 % | 27.3 % | −5.0 pp |
+| Codex, later calls | 94.8 % | 95.8 % | +1.0 pp |
+| Pi, whole session | 94.4 % | 97.0 % | +2.6 pp |
+
+The all-call figure is token-weighted while the phase figures are per-call
+averages, and later calls grow with each turn while a cold/resume first call is
+a single small prompt. Later calls are 99.5 % of the current prompt tokens
+(99.2 % in #43), so the headline is essentially the warm-call rate. Warm calls
+did rise (94.8 % → 95.8 % per call, 96.5 % → 97.2 % token-weighted), but the
+first calls did not: both cold and resume are *lower* than in the smaller #43
+sample, and 5 of the 87 cold starts now report 0 %. That is the expected effect
+of more distinct threads competing for the shared Codex system/developer
+prefix, not a gateway regression.
+
+The Pi delta is not a like-for-like comparison. The #43 sessions ran
+`deepseek/deepseek-flash`; every #126 session runs
+`opencode-go/deepseek-v4.1-flash`. The pre-switch sessions kept under
+`~/.pi/backups/sessions-deepseek-*` show that the old provider reaches 99.2 %
+overall with a ~26 % mean first turn, while the current provider reaches 97.0 %
+with a ~5 % mean first turn. The #43 figure simply captured two young sessions
+(49 turns) while their long tails were still unrecorded; the #126 figure is the
+completed picture, and the provider change *lowered* the first-turn hit rate.
+
+Net: per-thread reuse keeps the cache very warm and the mechanism is stable,
+but the data show no per-request improvement over #43.
+
 ### Codex
 
 * 87 threads, 4,941 API calls.
