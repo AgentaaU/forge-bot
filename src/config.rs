@@ -460,6 +460,11 @@ pub struct AgentConfig {
     pub args: Option<Vec<String>>,
     /// How the prompt is delivered: `stdin` (default) or `arg`.
     pub prompt: Option<PromptDelivery>,
+    /// How to read the CLI's result. `json` tells the adapter to parse one
+    /// JSON result object (reply + token usage) instead of plain text; the
+    /// operator must also pass the CLI's own machine-readable flag in `args`
+    /// unless the adapter already sets one.
+    pub output_format: Option<OutputFormat>,
     /// Wall-clock limit in seconds; `0` disables it so the agent runs to
     /// completion instead of being killed when a timer expires.
     pub timeout_secs: Option<u64>,
@@ -477,6 +482,20 @@ pub enum PromptDelivery {
     #[default]
     Stdin,
     Arg,
+}
+
+/// How an adapter reads the CLI's final result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum OutputFormat {
+    /// The CLI prints its reply as plain text (the default).
+    #[default]
+    Text,
+    /// The CLI prints one JSON result object carrying the reply and token
+    /// usage (for example `agy --output-format json` or
+    /// `claude --output-format json`).
+    Json,
 }
 
 /// Default cooldown before a capacity-limited agent is retried: five hours.
@@ -729,6 +748,15 @@ timeout_secs = 60
     fn parses_agent_enabled_flag() {
         let config: Config = toml::from_str("[agents.pi]\nenabled = true\n").unwrap();
         assert_eq!(config.agents.get("pi").unwrap().enabled, Some(true));
+    }
+
+    #[test]
+    fn parses_agent_output_format() {
+        let config: Config = toml::from_str("[agents.kimi]\noutput_format = \"json\"\n").unwrap();
+        assert_eq!(
+            config.agents.get("kimi").unwrap().output_format,
+            Some(OutputFormat::Json)
+        );
     }
 
     #[test]

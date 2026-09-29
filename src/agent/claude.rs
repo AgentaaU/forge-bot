@@ -26,6 +26,7 @@ pub fn build(config: &AgentConfig, sessions: Arc<SessionStore>) -> CommandAgent 
     let agent = default_agent()
         .apply_config(config)
         .dangerously_skip_permissions(auto)
+        .with_json_output()
         .session(
             SessionStyle {
                 create_args: vec!["--session-id".into(), "{session}".into()],
@@ -75,7 +76,7 @@ pub(crate) fn model_from_session(session_id: &str, config_dir: Option<&Path>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{Agent, AgentContext, AgentRequest};
+    use crate::agent::{Agent, AgentContext, AgentRequest, TokenUsage};
 
     fn store() -> Arc<SessionStore> {
         Arc::new(SessionStore::default())
@@ -123,12 +124,12 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn records_model_from_session_without_changing_reply() {
+    async fn records_model_from_session_and_usage_from_json_result() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fake-claude.sh");
-        std::fs::write(&script, "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --session-id ] || [ \"$1\" = --resume ]; then id=$2; break; fi\n  shift\ndone\nmkdir -p \"$CLAUDE_CONFIG_DIR/projects/test\"\nprintf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"model\":\"claude-test-model\"}}' > \"$CLAUDE_CONFIG_DIR/projects/test/$id.jsonl\"\nprintf 'CLAUDE-REPLY'\n").unwrap();
+        std::fs::write(&script, "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --session-id ] || [ \"$1\" = --resume ]; then id=$2; break; fi\n  shift\ndone\nmkdir -p \"$CLAUDE_CONFIG_DIR/projects/test\"\nprintf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"model\":\"claude-test-model\"}}' > \"$CLAUDE_CONFIG_DIR/projects/test/$id.jsonl\"\nprintf '{\"type\":\"result\",\"result\":\"CLAUDE-REPLY\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":800,\"cache_creation_input_tokens\":100}}'\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let agent = build(
             &AgentConfig {
@@ -152,5 +153,12 @@ mod tests {
         assert!(outcome.success);
         assert_eq!(outcome.summary, "CLAUDE-REPLY");
         assert_eq!(outcome.model.as_deref(), Some("claude-test-model"));
+        assert_eq!(
+            outcome.usage,
+            Some(TokenUsage {
+                prompt_tokens: 1_000,
+                cached_tokens: 800,
+            })
+        );
     }
 }

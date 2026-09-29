@@ -27,7 +27,9 @@ pub fn build(config: &AgentConfig) -> CommandAgent {
     let auto = config.dangerously_skip_permissions.unwrap_or(true);
     let agent = default_agent()
         .apply_config(config)
-        .dangerously_skip_permissions(auto);
+        .remove_arg("--print")
+        .dangerously_skip_permissions(auto)
+        .with_json_output();
     let agent = if auto {
         agent.arg("--dangerously-skip-permissions")
     } else {
@@ -60,7 +62,7 @@ pub(crate) fn configured_model(args: &[String], home: Option<&String>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{Agent, AgentContext, AgentRequest};
+    use crate::agent::{Agent, AgentContext, AgentRequest, TokenUsage};
 
     #[test]
     fn defaults_run_headless_with_permissions() {
@@ -71,7 +73,12 @@ mod tests {
         // as its value, so a flag after it would be taken as the prompt.
         assert_eq!(
             agent.arguments(),
-            ["--dangerously-skip-permissions", "--print"]
+            [
+                "--output-format",
+                "json",
+                "--dangerously-skip-permissions",
+                "--print"
+            ]
         );
     }
 
@@ -81,7 +88,39 @@ mod tests {
             dangerously_skip_permissions: Some(false),
             ..Default::default()
         });
-        assert_eq!(agent.arguments(), ["--print"]);
+        assert_eq!(agent.arguments(), ["--output-format", "json", "--print"]);
+    }
+
+    #[test]
+    fn configured_output_format_is_respected() {
+        let agent = build(&AgentConfig {
+            args: Some(vec![
+                "--output-format".into(),
+                "text".into(),
+                "--print".into(),
+            ]),
+            ..Default::default()
+        });
+        // The adapter must not add a second `--output-format`.
+        assert_eq!(
+            agent
+                .arguments()
+                .iter()
+                .filter(|arg| *arg == "--output-format")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn config_supplied_print_is_not_duplicated() {
+        let agent = build(&AgentConfig {
+            args: Some(vec!["--print".into()]),
+            ..Default::default()
+        });
+        let args = agent.arguments();
+        assert_eq!(args.iter().filter(|arg| *arg == "--print").count(), 1);
+        assert_eq!(args.last().map(String::as_str), Some("--print"));
     }
 
     #[test]
@@ -110,7 +149,7 @@ mod tests {
         let script = dir.path().join("fake-agy.sh");
         std::fs::write(
             &script,
-            "#!/bin/sh\n[ \"$1\" = --dangerously-skip-permissions ] || exit 1\n[ \"$2\" = --print ] || exit 2\ncase \"$3\" in *PING*) printf 'agy reply' ;; *) exit 3 ;; esac\n",
+            "#!/bin/sh\nprompt=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --print ]; then shift; prompt=\"$1\"; break; fi\n  shift\ndone\ncase \"$prompt\" in *PING*) printf '{\"response\":\"agy reply\",\"usage\":{\"input_tokens\":1000,\"cache_read_tokens\":750,\"total_tokens\":1750}}' ;; *) exit 3 ;; esac\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -131,5 +170,12 @@ mod tests {
         assert!(outcome.success);
         assert_eq!(outcome.summary, "agy reply");
         assert_eq!(outcome.model.as_deref(), Some("agy-test-model"));
+        assert_eq!(
+            outcome.usage,
+            Some(TokenUsage {
+                prompt_tokens: 1_000,
+                cached_tokens: 750,
+            })
+        );
     }
 }

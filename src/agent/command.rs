@@ -18,7 +18,7 @@ use crate::agent::session::SessionStore;
 use crate::agent::{
     Agent, AgentContext, AgentOutcome, AgentRequest, LiveOutput, TokenUsage, conversation_key,
 };
-use crate::config::PromptDelivery;
+use crate::config::{OutputFormat, PromptDelivery};
 use crate::error::{BotError, Result};
 
 /// Maximum number of characters of captured output kept in the summary.
@@ -54,6 +54,7 @@ pub struct CommandAgent {
     env: BTreeMap<String, String>,
     dangerously_skip_permissions: bool,
     session: Option<SessionContinuation>,
+    result_format: OutputFormat,
 }
 
 /// How a [`CommandAgent`] continues the conversation for one thread.
@@ -156,6 +157,82 @@ fn parse_codex_usage(stdout: &str) -> Option<TokenUsage> {
     seen.then_some(usage)
 }
 
+/// A machine-readable CLI result: the reply text and/or prompt usage.
+#[derive(Debug, Default)]
+struct JsonResult {
+    text: Option<String>,
+    usage: Option<TokenUsage>,
+}
+
+/// Parse the last JSON result object from a command's stdout.
+///
+/// Returns an object that carries a reply (`response` for agy, `result` for
+/// claude) or a usage object, so an adapter that streams events is handled by
+/// taking the final result.
+fn parse_result_json(stdout: &str) -> Option<JsonResult> {
+    let mut result = None;
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if !value.is_object() {
+            continue;
+        }
+        let text = value
+            .get("response")
+            .or_else(|| value.get("result"))
+            .and_then(|text| text.as_str())
+            .map(str::to_owned);
+        let usage = value.get("usage").and_then(normalize_usage);
+        if text.is_some() || usage.is_some() {
+            result = Some(JsonResult { text, usage });
+        }
+    }
+    result
+}
+
+/// Normalize the usage-object shapes the CLIs emit.
+///
+/// * Pi: `input` is the cache miss and `cacheRead` the hit.
+/// * Codex: `input_tokens` already includes `cached_input_tokens`.
+/// * Antigravity (`agy`): `input_tokens` is the prompt and `cache_read_tokens`
+///   the cached subset.
+/// * Claude Code: `input_tokens` excludes `cache_read_input_tokens` and
+///   `cache_creation_input_tokens`.
+fn normalize_usage(value: &serde_json::Value) -> Option<TokenUsage> {
+    if let (Some(input), Some(cache_read)) = (value["input"].as_u64(), value["cacheRead"].as_u64())
+    {
+        return Some(TokenUsage {
+            prompt_tokens: input + cache_read,
+            cached_tokens: cache_read,
+        });
+    }
+    let input = value["input_tokens"].as_u64()?;
+    if let Some(cached) = value["cached_input_tokens"].as_u64() {
+        return Some(TokenUsage {
+            prompt_tokens: input,
+            cached_tokens: cached,
+        });
+    }
+    if let Some(cache_read) = value["cache_read_tokens"].as_u64() {
+        return Some(TokenUsage {
+            prompt_tokens: input,
+            cached_tokens: cache_read,
+        });
+    }
+    let read = value["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    let created = value["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    if value.get("cache_read_input_tokens").is_some()
+        || value.get("cache_creation_input_tokens").is_some()
+    {
+        return Some(TokenUsage {
+            prompt_tokens: input + read + created,
+            cached_tokens: read,
+        });
+    }
+    None
+}
+
 /// Read a model option supplied by the operator without adding or changing
 /// any argument passed to the agent.
 pub(crate) fn model_arg(args: &[String], short: bool) -> Option<String> {
@@ -186,11 +263,20 @@ impl CommandAgent {
             env: BTreeMap::new(),
             dangerously_skip_permissions: false,
             session: None,
+            result_format: OutputFormat::Text,
         }
     }
 
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
+        self
+    }
+
+    /// Drop every occurrence of `arg`, so an adapter that must re-add a
+    /// position-sensitive flag (agy's `--print`) does not duplicate one the
+    /// operator supplied.
+    pub fn remove_arg(mut self, arg: &str) -> Self {
+        self.args.retain(|existing| existing != arg);
         self
     }
 
@@ -239,6 +325,25 @@ impl CommandAgent {
 
     pub fn dangerously_skip_permissions(mut self, yes: bool) -> Self {
         self.dangerously_skip_permissions = yes;
+        self
+    }
+
+    /// Ask the CLI for one JSON result object and parse the reply and token
+    /// usage from it.
+    ///
+    /// Adds `--output-format json` unless the operator already chose an
+    /// output format, so a configured `--output-format text` is respected and
+    /// the result is left as plain text.
+    pub fn with_json_output(mut self) -> Self {
+        let explicit = self
+            .args
+            .iter()
+            .any(|arg| arg == "--output-format" || arg.starts_with("--output-format="));
+        if !explicit {
+            self.args.push("--output-format".into());
+            self.args.push("json".into());
+            self.result_format = OutputFormat::Json;
+        }
         self
     }
 
@@ -322,6 +427,9 @@ impl CommandAgent {
         }
         if let Some(prompt) = config.prompt {
             self.prompt = prompt;
+        }
+        if let Some(format) = config.output_format {
+            self.result_format = format;
         }
         if let Some(timeout) = config.timeout_secs {
             // 0 disables the wall-clock limit entirely.
@@ -477,7 +585,15 @@ impl Agent for CommandAgent {
             Ok((status, stdout_bytes, stderr_bytes)) => {
                 let stdout = String::from_utf8_lossy(&stdout_bytes);
                 let stderr = String::from_utf8_lossy(&stderr_bytes);
-                let fallback = summarize(&stdout, &stderr);
+                // A JSON-result CLI prints the reply (and usage) as one object;
+                // prefer that text over the raw stream.
+                let json = (self.result_format == OutputFormat::Json)
+                    .then(|| parse_result_json(&stdout))
+                    .flatten();
+                let fallback = match json.as_ref().and_then(|result| result.text.as_deref()) {
+                    Some(text) if !text.trim().is_empty() => text.to_owned(),
+                    _ => summarize(&stdout, &stderr),
+                };
                 let observed_model = match self.name.as_str() {
                     "codex" => {
                         let id = parse_thread_id(&stdout).or_else(|| plan.session_id.clone());
@@ -501,12 +617,13 @@ impl Agent for CommandAgent {
                 *context.reported_model.lock().expect("model mutex poisoned") =
                     observed_model.clone();
 
-                // Codex is the only command adapter whose protocol reports
-                // prompt-cache accounting, and it does so in its `--json`
-                // stream.
-                let usage = (self.name == "codex")
-                    .then(|| parse_codex_usage(&stdout))
-                    .flatten();
+                // Codex reports usage in its own event stream; the JSON-result
+                // adapters (agy, claude, ...) carry it in the result object.
+                let usage = if self.name == "codex" {
+                    parse_codex_usage(&stdout)
+                } else {
+                    json.as_ref().and_then(|result| result.usage)
+                };
 
                 if status.success() {
                     let summary = match &plan.reply_file {
@@ -610,6 +727,36 @@ mod tests {
         assert!((usage.hit_rate().unwrap() - 86.666).abs() < 0.01);
         assert!(parse_codex_usage("not json").is_none());
         assert!(parse_codex_usage("{\"type\":\"turn.started\"}").is_none());
+    }
+
+    #[test]
+    fn parses_json_result_usage() {
+        // Antigravity: `input_tokens` is the prompt, `cache_read_tokens` the hit.
+        let agy = r#"{"response":"hi","usage":{"input_tokens":1000,"cache_read_tokens":900,"total_tokens":1100}}"#;
+        let result = parse_result_json(agy).unwrap();
+        assert_eq!(result.text.as_deref(), Some("hi"));
+        let usage = result.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 1_000);
+        assert_eq!(usage.cached_tokens, 900);
+        assert_eq!(usage.hit_rate(), Some(90.0));
+
+        // Claude Code: `input_tokens` excludes cache read/creation.
+        let claude = r#"{"type":"result","result":"done","usage":{"input_tokens":100,"cache_read_input_tokens":800,"cache_creation_input_tokens":100}}"#;
+        let result = parse_result_json(claude).unwrap();
+        assert_eq!(result.text.as_deref(), Some("done"));
+        let usage = result.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 1_000);
+        assert_eq!(usage.cached_tokens, 800);
+
+        // A Claude run with no cache hit still reports its prompt.
+        let cold = r#"{"result":"x","usage":{"input_tokens":500,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#;
+        let usage = parse_result_json(cold).unwrap().usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 500);
+        assert_eq!(usage.cached_tokens, 0);
+
+        // Nothing machine-readable is ignored.
+        assert!(parse_result_json("plain text").is_none());
+        assert!(parse_result_json(r#"{"type":"event"}"#).is_none());
     }
 
     #[test]

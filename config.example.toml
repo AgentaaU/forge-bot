@@ -116,6 +116,11 @@ retention_secs = 604800
 # sandbox; agy and claude get `--dangerously-skip-permissions`, and pi gets
 # `--approve` by default. Set `dangerously_skip_permissions = false` on
 # agy/claude/pi to opt out.
+#
+# `output_format = "json"` tells an adapter to parse one JSON result object
+# (reply + prompt-cache usage) instead of plain text. `agy` and `claude`
+# enable it themselves; set it for a custom adapter whose CLI emits a JSON
+# result, and add the CLI's own machine-readable flag to `args`.
 
 [agents.codex]
 timeout_secs = 0
@@ -138,6 +143,9 @@ timeout_secs = 0
 # [agents.kimi]
 # command = "kimi"
 # args = ["--print"]
+# A Kimi CLI that emits a JSON result can report prompt-cache usage:
+# args = ["--print", "--output-format", "json"]
+# output_format = "json"
 
 # A completely custom adapter:
 # [agents.my-agent]

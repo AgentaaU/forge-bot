@@ -235,12 +235,16 @@ session per conversation.
    conversation fork when a run bounces between agents. If continuity across
    fallbacks matters, the gateway would have to carry a summary or the agents a
    shared transcript; that is a larger design change, not a cache-tuning one.
-4. **Surface the metric (implemented).** The gateway now parses
-   `cached_input_tokens` / `cacheRead` from the CLI output, logs a per-job hit
-   rate, stores it on the run record, and shows it on the status page, so
-   regressions are visible without opening session files. It is the way to
-   confirm whether a same-model resume stays warm now that model selection is
-   out of the agent layer.
+4. **Surface the metric (implemented).** The gateway parses the provider
+   accounting from the CLI output, logs a per-job hit rate, stores it on the
+   run record, and shows it on the status page. Coverage follows what each CLI
+   reports: Codex (`turn.completed.usage`), `pi-rpc` (`message_end` usage),
+   Antigravity (`--output-format json`, `cache_read_tokens`), and Claude Code
+   (`--output-format json`, `cache_read_input_tokens`). The one-shot `pi` and
+   `kimi` adapters print plain text; set `output_format = "json"` plus the
+   CLI's own flag to opt a JSON-capable CLI in. This is the way to confirm
+   whether a same-model resume stays warm now that model selection is out of
+   the agent layer.
 5. **No prompt-layout change is warranted yet.** Once the model-change
    confound is removed, the remaining resumed first-call dip is Codex/Pi's own
    conversation rendering, not the gateway prompt, and it recovers within the
