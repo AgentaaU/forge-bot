@@ -1,7 +1,7 @@
 # Prompt / KV cache hit rate of forge-bot's agents
 
 Research for issue #43: *"check KVCache hit rate of codex/pi session invoked by
-forge-bot"*.
+forge-bot"*. Re-measured for issue #126 (same operation, larger sample).
 
 ## TL;DR
 
@@ -9,26 +9,30 @@ Both backends keep the provider prompt (KV) cache very warm:
 
 | Agent | Sessions | API calls / turns | Cache hit rate |
 | --- | ---: | ---: | ---: |
-| Codex | 16 threads | 935 calls | **96.2 %** |
-| Pi | 2 sessions | 49 turns | **94.4 %** |
+| Codex | 87 threads | 4,941 calls | **97.1 %** |
+| Pi | 72 sessions | 5,171 turns | **97.0 %** |
 
 The per-thread session reuse added in #31 is doing its job. A brand-new Codex
-thread already starts around 82 % because the shared system/developer prompt
-prefix is cached provider-side; within a run, later calls average 94.8 %. Pi's
-first turn is cold (12–29 %), then every later turn reads 90 %+ from cache.
+thread starts around 74 % on average because the shared system/developer prompt
+prefix is cached provider-side, but the spread is wide (0–96 %); within a run,
+later calls average 95.8 %. Pi's first turn is usually fully cold (0–33 %,
+mean ~5 %) because the provider does not share a cached prefix across sessions,
+then every later turn reads ~92 % from cache and the session as a whole lands
+at ~96 %.
 
-The numbers are a snapshot taken partway through the run for this issue, so the
-Pi totals are still growing. Re-run `contrib/analyze-kvcache.py` to reproduce
-them.
+This is a snapshot for #126 taken on 2026-09-29. The earlier #43 figures, taken
+2026-09-25 with 16 Codex threads and 2 Pi sessions, were 96.2 % and 94.4 %.
+Re-run `contrib/analyze-kvcache.py` to reproduce the current numbers.
 
 Two important qualifications, both raised in review:
 
 * The cache is **per agent and per provider**. The session store is keyed by
   `(agent, conversation)`, so falling back from Codex to Pi starts a brand-new
   Pi session — the Codex conversation and its KV cache are *not* reused.
-* `pi` and `pi-rpc` run the same `pi` CLI against the same provider/model, so
-  they share one quota. `pi-rpc` is not a capacity fallback for `pi`; the two
-  are instead being consolidated on `pi-rpc` (see below).
+* All Pi sessions in this sample ran the same CLI against the same
+  provider/model (`opencode-go/deepseek-v4.1-flash`), so every Pi adapter
+  shares one quota. Since #46 the default Pi backend is the pooled `pi-rpc`
+  adapter and the one-shot `pi` adapter is disabled by default (see below).
 
 ## How the cache is meant to be used
 
@@ -42,8 +46,10 @@ session:
   `codex exec resume <id>` (`src/agent/codex.rs`).
 * `pi --print` is handed a deterministic `--session-id`, which Pi creates on
   first use and resumes afterwards (`src/agent/pi.rs`).
-* The pooled `pi-rpc` adapter keeps `pi --mode rpc` processes alive and pins
-  each conversation to one process (`src/agent/pi_rpc.rs`).
+* The pooled `pi-rpc` adapter keeps `pi --mode rpc` processes alive, pins each
+  conversation to one process, and persists the conversation with a
+  deterministic `--session-id` so an evicted or restarted process can resume it
+  (`src/agent/pi_rpc.rs`).
 
 When the backend keeps the same conversation, the provider can serve the
 unchanged prefix (system prompt, repository instructions, prior turns) from its
@@ -71,132 +77,94 @@ forge comment), and calls after the first inside one run are *later*.
 
 ### Codex
 
-* 16 threads, 935 API calls.
-* **50,150,144 cached / 52,128,614 prompt tokens = 96.2 %**.
-* Per-thread hit rates range from 87.1 % to 98.4 %.
+* 87 threads, 4,941 API calls.
+* **316,781,952 cached / 326,256,982 prompt tokens = 97.1 %**.
+* Per-thread hit rates range from 86.7 % to 98.7 % (mean 95.2 %).
 
 Breakdown by call phase:
 
 | Phase | Meaning | Avg. hit rate | Samples |
 | --- | --- | ---: | ---: |
-| cold | first call of a brand-new thread | 82.1 % | 16 |
-| resume | first call of a new comment in an existing thread | 32.3 % | 11 |
-| later | any subsequent call within one run | 94.8 % | 908 |
+| cold | first call of a brand-new thread | 74.0 % | 87 |
+| resume | first call of a new comment in an existing thread | 27.3 % | 13 |
+| later | any subsequent call within one run | 95.8 % | 4,841 |
 
 Two things stand out:
 
-1. **A cold thread is not fully cold.** The first call consistently reports
-   ~11,776 cached of ~14,000 prompt tokens (~84 %). That prefix is the shared
-   Codex system/developer prompt, which the provider already has cached from
-   other sessions. Only the thread-specific part misses.
+1. **A cold thread is not fully cold, but the spread is wide.** The first call
+   averages ~10.8k cached of ~14.8k prompt tokens (~73 %). That prefix is the
+   shared Codex system/developer prompt, which the provider already has cached
+   from other sessions; only the thread-specific part misses. The distribution
+   is broad, though: 5 of 87 cold calls report 0 %, while 58 report 75 % or
+   more.
 2. **Resuming is cheap but not free.** The first call of a resumed run averages
-   only 32 % and in several runs reports 0 %. Re-rendering the conversation and
+   only 27 % and 6 of the 13 runs report 0 %. Re-rendering the conversation and
    appending the new user turn shifts the prefix boundary, so the first call
    often misses what the previous run cached. It recovers immediately: the run
-   as a whole still lands at 80–97 %, and *later* calls are the highest of all
-   at 94.8 %. Net effect over a multi-comment thread is still strongly in
+   as a whole still lands at 77–98 %, and *later* calls are the highest of all
+   at 95.8 %. Net effect over a multi-comment thread is still strongly in
    favour of resuming.
 
 ### Pi
 
-* 2 sessions, 49 turns.
-* **1,528,064 cached / 1,618,447 prompt tokens = 94.4 %**.
-* First turn is cold (12 % and 29 %), average turn is 84–92 %, and the
-  session-level rate is 93–96 %.
-* `cacheWrite` is always 0: DeepSeek reports prompt-cache hits and misses
+* 72 sessions, 5,171 turns, all on `opencode-go/deepseek-v4.1-flash`.
+* **492,855,156 cached / 508,141,498 prompt tokens = 97.0 %**.
+* Session-level rates range from 86.3 % to 99.1 % (mean 96.1 %).
+* The first turn is cold in most sessions: 43 of 72 report 0 %, the maximum is
+  33 %, and the mean is ~5 %. After that the average turn is ~92 %.
+* `cacheWrite` is always 0: the provider reports prompt-cache hits and misses
   directly rather than a separate write charge.
 
-Pi is only exercised as the first fallback when Codex is capacity-limited,
-which is why there are so few Pi sessions compared with Codex. The next section
-shows what that fallback costs.
+Pi handles the automatic fallback when Codex is capacity-limited, which is why
+there are fewer Pi sessions than Codex threads. The next section shows what
+that fallback costs.
 
-### Cross-agent fallback (Codex → Pi)
+### Cross-agent fallback (Codex → Pi → Codex)
 
 Because the session store is keyed by `(agent, conversation)`, a fallback is a
 full cold start for the model: a different provider/model cannot read the
 previous agent's KV cache, and the new agent does not receive the previous
-agent's conversation either. The clearest example in the data is conversation
-`forgejo:shylock/stock-analysis:452`:
+agent's conversation either. The clearest example in the current data is
+conversation `forgejo:shylock/stock-analysis:478`:
 
-| Phase | Agent | Session | Workspace | First-call hit | Run/session hit |
-| --- | --- | --- | --- | ---: | ---: |
-| 1 | Codex | `01a0d70a-…` | `…stock-analysis-452` | 43 % | 96.7 % (52 calls) |
-| 2 | Pi | `95052b21-…` | `…stock-analysis-453` | 12 % | 96.2 % (25 turns) |
+| Phase | Agent | Session | First-call hit | Run/session hit |
+| --- | --- | --- | ---: | ---: |
+| 1 | Codex | `01a0eac1-…` | 0 % | 98.7 % (148 calls) |
+| 2 | Pi | `7afed147-…` | 0 % | 92.7 % (27 turns) |
+| 3 | Codex | `01a0ead9-…` | 0 % | 97.9 % (90 calls) |
 
-Codex handled the thread first (workspace `452`). When it hit its capacity
-limit at 05:57:58Z the bot switched to Pi for the same conversation — the
-webhook was a PR whose workspace is `453`, but the conversation key folds it
-onto issue `452`. Pi then started a **new** session (`95052b21-…`, model
-`deepseek/deepseek-flash`). Its 12 % first-turn hit is the DeepSeek shared
-test-prefix baseline, not reuse of Codex's cache: the 52 Codex calls' worth of
-context was never visible to Pi.
+Codex handled the thread first. When it hit its capacity limit the bot switched
+to Pi for the same conversation; Pi started a **new** session (`7afed147-…`,
+model `opencode-go/deepseek-v4.1-flash`). Its 0 % first-turn hit is a genuine
+cold start, not reuse of Codex's cache: the 148 Codex calls' worth of context
+was never visible to Pi. When Codex recovered and took the next comment, it
+resumed its *old* thread (`01a0ead9-…`), which does not contain what Pi did.
 
 So each fallback pays a fresh conversation *and* a fresh cache. The agent can
-still re-read the forge thread to reconstruct some context, but the model's
-own history is gone. Switching back later (e.g. Codex recovers) resumes the
-old Codex session, which then does not contain what Pi did — the conversation
-forks per agent.
+still re-read the forge thread to reconstruct some context, but the model's own
+history is gone, and the conversation forks per agent.
 
-### Do we need both `pi` and `pi-rpc`?
+### One Pi backend now
 
-Short answer: **no — they are the same backend twice.** `pi` (67 lines) is an
-ordinary `CommandAgent`: it spawns `pi --print --session-id <id>` per comment
-and remembers the id in `agent-sessions.json`, so the next comment resumes the
-same on-disk session. `pi-rpc` (585 non-test lines, 983 with tests) is a
-bespoke pool that keeps `pi --mode rpc` processes alive, pins a conversation to
-one process, and evicts it after `idle_ttl_secs` (default 900 s).
-
-| Dimension | `pi` (one-shot) | `pi-rpc` (pool) |
-| --- | --- | --- |
-| Provider / quota | `deepseek/deepseek-flash` | same, shared |
-| Conversation state | session file on disk (`--session-id`) | in-memory, bound to a live process |
-| Survives restart / pool eviction | yes | **no** (`no_session = true`) |
-| Spawns a process per comment | yes | no, while the process stays warm |
-| Resumed first-call cache miss | yes | no, if the process was still warm |
-| Concurrency | always able to spawn | bounded by `max_agents`; waits when full |
-| Streaming | no | yes (unused by the gateway) |
-| Code | 67 lines, generic to every CLI | 983 lines, Pi-specific |
-| Automatic fallback | yes (2nd, after Codex) | no — explicit `@agent:pi-rpc` only |
-
-Because Codex is the first choice and `pi` comes before `pi-rpc` in
-`BUILTIN_AGENTS`, the automatic fallback reaches `pi-rpc` only after both Codex
-*and* `pi` have failed. In practice that is when the shared Pi provider is
-already rate-limited, so the extra attempt mostly just fails too. Otherwise
-`pi-rpc` is used only when a user asks for it by name. So the current shape is
-“a simple, persistent fallback plus an opt-in warm-process mode”. That is
-defensible, but it means maintaining two Pi adapters for the same provider and
-nearly identical prompts, and the opt-in one is the one that *loses*
-conversation state on restart/eviction.
-
-The pool was the original Pi backend (`404848e`) and is still being actively
-improved (`204e739`, the HEAD of `main`, reuses idle agents), so this is a
-deliberate design choice rather than an accident. The question is whether the
-warm-process benefit justifies the second adapter:
-
-* The one-shot `pi` already reaches **94 %** session-level cache hit, and its
-  only cache penalty is the first call of each comment. The pool removes that
-  penalty for comments spaced closer than `idle_ttl_secs`, which is a real but
-  modest win.
-* The pool does not provide capacity relief (same provider), and it is not in
-  the automatic path anyway, so it is effectively dormant in normal operation.
-
-**Decision (implemented in a follow-up PR):** keep `pi-rpc` as the default Pi backend and
-give it a deterministic `--session-id` so it persists across evictions; keep
-the one-shot `pi` adapter in the tree but disabled by default (`[agents.pi]
-enabled = true` re-enables it). That is the “unify on `pi-rpc`” direction
-above: one active Pi backend, one persistent session per conversation, with the
-older adapter available but off the default path. The reasoning that made this
-the right choice over dropping `pi-rpc` is that the pool is where the recent
-work went, it avoids a per-comment process start, and `--session-id` removes
-its only real regression (losing the conversation on eviction).
+At the time of the #43 research there were two Pi adapters (`pi` and `pi-rpc`)
+driving the same CLI and provider, and the fallback order tried both. This
+measurement confirms there is nothing to gain from keeping both in the
+automatic path: they share a quota, and `pi-rpc` now persists its session with
+a deterministic `--session-id`, so it no longer loses the conversation on
+eviction or restart. #46 therefore made `pi-rpc` the default Pi backend and
+disabled the one-shot `pi` adapter by default (`[agents.pi] enabled = true`
+re-enables it). The duplicate fallback attempt is gone, so the current agent
+sequence is `codex, agy, pi-rpc, claude`: one Pi backend, one persistent
+session per conversation.
 
 ## Caveats
 
 * Cache hit rate is provider-reported and provider-specific. Codex counts
-  `cached_input_tokens` as a subset of `input_tokens`; Pi/DeepSeek reports hit
-  and miss separately.
-* The report is a point-in-time snapshot. The session for issue #43 is still
-  running while this was written.
+  `cached_input_tokens` as a subset of `input_tokens`; the Pi provider reports
+  hit and miss separately.
+* The report is a point-in-time snapshot (2026-09-29). The session for the
+  issue that requested this run is still being appended while the numbers are
+  read.
 * No cost figure is included: the cached-input discount differs per provider
   and per plan, and the Pi `cost` field is only populated for some providers.
 * A high hit rate does not by itself prove the run was cheap — output tokens and
@@ -205,15 +173,11 @@ its only real regression (losing the conversation on eviction).
 ## Recommendations
 
 1. **Keep per-thread session reuse.** It is the mechanism that produces the
-   96 %/94 % figures; nothing else in the gateway affects caching.
-2. **Stop treating `pi-rpc` as a capacity fallback for `pi`.** Both adapters
-   drive the same `pi` CLI and both use Pi's own configured default, so here
-   both resolve to `deepseek/deepseek-flash`. A quota or rate limit that stops
-   `pi` therefore stops `pi-rpc` too. `AgentRegistry::names()` currently returns
-   `codex, pi, pi-rpc, claude, kimi`, so a Codex capacity hit tries `pi` and
-   then `pi-rpc` — two attempts for one provider, doubling the failure latency.
-   The longer-term consolidation is to keep only one Pi adapter at all (see
-   “Do we need both `pi` and `pi-rpc`?” above).
+   97 %/97 % figures; nothing else in the gateway affects caching.
+2. **Keep one Pi backend.** `pi` and `pi-rpc` are the same CLI and provider, so
+   a quota or rate limit that stops one stops the other. Since #46 only
+   `pi-rpc` is enabled by default, which avoids doubling the fallback latency
+   for a single provider.
 3. **Accept that fallback breaks cache and conversation continuity.** There is
    no cross-agent cache to preserve, and the per-agent session store makes the
    conversation fork when a run bounces between agents. If continuity across
