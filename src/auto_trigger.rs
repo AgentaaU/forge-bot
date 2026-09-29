@@ -16,6 +16,15 @@ use crate::session::Dispatcher;
 
 const MAX_SEEN: usize = 4096;
 
+/// Forgejo computes pull-request mergeability asynchronously. Right after a
+/// push it reports `mergeable: false` while the conflict check is still queued
+/// (or while it is running), so an event delivered during that window must not
+/// be mistaken for a real conflict. Re-check the candidates for a short,
+/// bounded window: a clean merge settles to `true`, a conflict stays `false`.
+/// The total wait stays well under Forgejo's default 5s webhook timeout.
+const CONFLICT_CHECK_ATTEMPTS: usize = 4;
+const CONFLICT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Synthetic author recorded on messages that a signed forge event starts
 /// without a user mention. The queue uses it to word its acknowledgement as an
 /// automatic trigger instead of implying a human mentioned the bot.
@@ -226,22 +235,43 @@ impl AutoTrigger {
                 .filter_map(|pr| pr.get("number").and_then(Value::as_u64))
                 .collect()
         };
-        let mut accepted = 0;
+        // Forgejo's mergeability check is asynchronous: an event that arrives
+        // right after a push sees `mergeable: false` even when the branch
+        // merges cleanly. Collect the candidates that currently look
+        // conflicting and give Forgejo a moment to finish before acting. A
+        // candidate whose head/base pair was already handled is skipped
+        // without waiting.
+        let mut pending: Vec<(u64, Value)> = Vec::new();
         for number in candidates {
             let pr = self.get_pr(base, token, repo, number).await?;
-            if pr.get("state").and_then(Value::as_str) != Some("open")
-                || pr.get("draft").and_then(Value::as_bool) == Some(true)
-                || pr.get("mergeable").and_then(Value::as_bool) != Some(false)
-            {
+            if !is_open_conflicting_candidate(&pr) {
                 continue;
             }
-            let (Some(head), Some(base_sha)) = (
-                pr.pointer("/head/sha").and_then(Value::as_str),
-                pr.pointer("/base/sha").and_then(Value::as_str),
-            ) else {
+            if conflict_key(repo, number, &pr).is_some_and(|key| self.is_seen(&key)) {
+                continue;
+            }
+            pending.push((number, pr));
+        }
+        for _ in 0..CONFLICT_CHECK_ATTEMPTS {
+            if pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(CONFLICT_CHECK_INTERVAL).await;
+            let mut next = Vec::with_capacity(pending.len());
+            for (number, _) in pending {
+                let pr = self.get_pr(base, token, repo, number).await?;
+                if is_open_conflicting_candidate(&pr) {
+                    next.push((number, pr));
+                }
+            }
+            pending = next;
+        }
+
+        let mut accepted = 0;
+        for (number, pr) in pending {
+            let Some(key) = conflict_key(repo, number, &pr) else {
                 continue;
             };
-            let key = format!("conflict:{repo}:{number}:{head}:{base_sha}");
             let instruction = "Resolve the merge conflict between this pull request and its base branch. Verify the result and update the pull request branch.".to_owned();
             let message = auto_message(base, repo, number, &pr, "merge_conflict", &instruction)?;
             accepted += self.submit(dispatcher, key, message, instruction).await?;
@@ -291,6 +321,14 @@ impl AutoTrigger {
         }
     }
 
+    fn is_seen(&self, key: &str) -> bool {
+        self.seen
+            .lock()
+            .expect("auto-trigger state poisoned")
+            .keys
+            .contains(key)
+    }
+
     async fn get_pr(&self, base: &str, token: &str, repo: &str, number: u64) -> Result<Value> {
         self.get_json(&format!("{base}/api/v1/repos/{repo}/pulls/{number}"), token)
             .await
@@ -321,6 +359,28 @@ impl AutoTrigger {
             .json()
             .await?)
     }
+}
+
+/// Whether the pull request is a candidate for automatic conflict
+/// resolution: still open, not a draft, and currently reporting
+/// `mergeable: false`.
+///
+/// `mergeable: false` is also returned while Forgejo's conflict check is in
+/// progress or has failed, so callers must let the value settle before
+/// treating it as a genuine conflict.
+fn is_open_conflicting_candidate(pr: &Value) -> bool {
+    pr.get("state").and_then(Value::as_str) == Some("open")
+        && pr.get("draft").and_then(Value::as_bool) != Some(true)
+        && pr.get("mergeable").and_then(Value::as_bool) == Some(false)
+}
+
+/// Stable dedupe key for a conflict trigger: the PR and the exact head/base
+/// commit pair that was checked. A later push to either branch produces a new
+/// key and is eligible again.
+fn conflict_key(repo: &str, number: u64, pr: &Value) -> Option<String> {
+    let head = pr.pointer("/head/sha").and_then(Value::as_str)?;
+    let base_sha = pr.pointer("/base/sha").and_then(Value::as_str)?;
+    Some(format!("conflict:{repo}:{number}:{head}:{base_sha}"))
 }
 
 fn auto_message(
@@ -404,5 +464,41 @@ mod tests {
             message.location.as_str(),
             "http://127.0.0.1:3000/o/r/pulls/7"
         );
+    }
+
+    #[test]
+    fn conflicting_candidate_requires_open_undrafted_false_mergeable() {
+        let base = json!({
+            "state": "open",
+            "draft": false,
+            "mergeable": false,
+            "head": {"sha": "h"},
+            "base": {"sha": "b"},
+        });
+        assert!(is_open_conflicting_candidate(&base));
+
+        for (key, value) in [
+            ("state", json!("closed")),
+            ("draft", json!(true)),
+            ("mergeable", json!(true)),
+            ("mergeable", Value::Null),
+        ] {
+            let mut pr = base.clone();
+            pr[key] = value;
+            assert!(
+                !is_open_conflicting_candidate(&pr),
+                "{key} = {pr} must not be a candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_key_tracks_the_checked_commit_pair() {
+        let pr = json!({"head": {"sha": "h1"}, "base": {"sha": "b1"}});
+        assert_eq!(
+            conflict_key("o/r", 7, &pr).as_deref(),
+            Some("conflict:o/r:7:h1:b1")
+        );
+        assert!(conflict_key("o/r", 7, &json!({"head": {"sha": "h1"}})).is_none());
     }
 }

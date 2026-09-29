@@ -219,11 +219,13 @@ normal mention authorization policy continues to apply to mentions.
 `action_run_failure` handles Forgejo Actions runs associated with a current
 open pull request. A run for an older PR head is ignored. `pull_request` events
 and pushes to a PR's base branch check the current PR API `mergeable` value and
-start an agent only when it is `false` and the PR is not a draft. Forgejo also
-reports `mergeable = false` while conflict checking is in progress or has
-failed, so an event arriving during that interval may start an agent. The bot
-remembers processed run IDs and head/base commit pairs in
-`auto-triggers.json` under the session directory, including across restarts.
+start an agent only when it is `false` and the PR is not a draft. Forgejo
+reports `mergeable = false` both for a real conflict and while its asynchronous
+conflict check is still running, so the bot re-checks a candidate for a short,
+bounded window before acting; a branch that merges cleanly settles to
+`mergeable = true` and is left alone. The bot remembers processed run IDs and
+head/base commit pairs in `auto-triggers.json` under the session directory,
+including across restarts.
 
 When updating an existing hook, add `action_run_failure` and `push` to its
 events. The registration script includes them in its default event list.

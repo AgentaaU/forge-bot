@@ -108,19 +108,40 @@ fn signed_request(event: &str, payload: &str) -> Request<Body> {
         .unwrap()
 }
 
-async fn mock_pr_api(mergeable: bool) -> (String, tokio::task::JoinHandle<()>) {
-    let pr = json!({
+fn pr_payload(mergeable: bool) -> Value {
+    json!({
         "number": 7, "state": "open", "title": "Fix it", "body": "",
         "mergeable": mergeable,
         "head": {"sha": "head123"},
         "base": {"sha": "base123", "ref": "main"}
-    });
-    let detail = pr.clone();
-    let list = pr.clone();
+    })
+}
+
+async fn mock_pr_api(mergeable: bool) -> (String, tokio::task::JoinHandle<()>) {
+    mock_pr_api_sequence(vec![mergeable]).await
+}
+
+/// Serve the PR detail endpoint with a sequence of `mergeable` values (the
+/// last one repeats) so tests can model Forgejo's asynchronous conflict check:
+/// the first response can still report `false` while the real value settles.
+async fn mock_pr_api_sequence(mergeables: Vec<bool>) -> (String, tokio::task::JoinHandle<()>) {
+    assert!(!mergeables.is_empty(), "need at least one mergeable value");
+    let list = pr_payload(mergeables[0]);
+    let detail_mergeables = mergeables;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let detail_calls = calls.clone();
     let app = Router::new()
         .route(
             "/api/v1/repos/shylock/forge-bot/pulls/7",
-            get(move || async move { Json(detail) }),
+            get(move || {
+                let mergeables = detail_mergeables.clone();
+                let calls = detail_calls.clone();
+                async move {
+                    let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mergeable = mergeables[index.min(mergeables.len() - 1)];
+                    Json(pr_payload(mergeable))
+                }
+            }),
         )
         .route(
             "/api/v1/repos/shylock/forge-bot/pulls",
@@ -243,6 +264,24 @@ async fn auto_conflict_ignores_mergeable_pr() {
         config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
     });
     let pr = json!({"action":"opened", "repository":{"full_name":"shylock/forge-bot"},
+        "pull_request":{"number":7,"body":""}})
+    .to_string();
+    assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn auto_conflict_ignores_pr_while_forgejo_is_still_checking() {
+    let dir = tempfile::tempdir().unwrap();
+    // Forgejo first reports `mergeable: false` while its conflict check is
+    // queued, then settles to mergeable. The bot must not start an agent just
+    // because the PR is behind the base branch.
+    let (url, server) = mock_pr_api_sequence(vec![false, true]).await;
+    let harness = harness_with(dir.path(), |config| {
+        config.forges.forgejo.as_mut().unwrap().base_url = url;
+        config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+    });
+    let pr = json!({"action":"synchronized", "repository":{"full_name":"shylock/forge-bot"},
         "pull_request":{"number":7,"body":""}})
     .to_string();
     assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 0);
