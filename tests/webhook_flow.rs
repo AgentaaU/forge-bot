@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::{Json, Router, routing::get};
+use axum::{
+    Json, Router,
+    routing::{get, post},
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -153,6 +156,33 @@ async fn mock_pr_api_sequence(mergeables: Vec<bool>) -> (String, tokio::task::Jo
     (url, task)
 }
 
+/// Like [`mock_pr_api_sequence`], but also answers Forgejo's branch-update
+/// endpoint with `update_status` so tests can model a clean or conflicting
+/// branch independently of the asynchronous `mergeable` flag.
+async fn mock_pr_api_with_update(
+    mergeable: bool,
+    update_status: StatusCode,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let list = pr_payload(mergeable);
+    let app = Router::new()
+        .route(
+            "/api/v1/repos/shylock/forge-bot/pulls/7",
+            get(move || async move { Json(pr_payload(mergeable)) }),
+        )
+        .route(
+            "/api/v1/repos/shylock/forge-bot/pulls",
+            get(move || async move { Json(vec![list]) }),
+        )
+        .route(
+            "/api/v1/repos/shylock/forge-bot/pulls/7/update",
+            post(move || async move { update_status }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, task)
+}
+
 async fn accepted(app: &Router, event: &str, payload: &str) -> usize {
     let response = app
         .clone()
@@ -285,6 +315,41 @@ async fn auto_conflict_ignores_pr_while_forgejo_is_still_checking() {
         "pull_request":{"number":7,"body":""}})
     .to_string();
     assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn auto_conflict_update_of_a_clean_branch_skips_the_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    // Forgejo keeps reporting `mergeable: false` (e.g. its check is slow) but
+    // the branch actually merges cleanly, so updating it succeeds. The bot
+    // must not start an agent for a branch that is not conflicting.
+    let (url, server) = mock_pr_api_with_update(false, StatusCode::OK).await;
+    let harness = harness_with(dir.path(), |config| {
+        config.forges.forgejo.as_mut().unwrap().base_url = url;
+        config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+    });
+    let pr = json!({"action":"synchronized", "repository":{"full_name":"shylock/forge-bot"},
+        "pull_request":{"number":7,"body":""}})
+    .to_string();
+    assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 0);
+    // The pair is remembered so a re-delivery does not re-check it.
+    assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn auto_conflict_update_of_a_conflicting_branch_starts_the_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = mock_pr_api_with_update(false, StatusCode::CONFLICT).await;
+    let harness = harness_with(dir.path(), |config| {
+        config.forges.forgejo.as_mut().unwrap().base_url = url;
+        config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+    });
+    let pr = json!({"action":"synchronized", "repository":{"full_name":"shylock/forge-bot"},
+        "pull_request":{"number":7,"body":""}})
+    .to_string();
+    assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 1);
     server.abort();
 }
 

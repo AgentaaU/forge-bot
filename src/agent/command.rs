@@ -529,10 +529,7 @@ impl Agent for CommandAgent {
         let live_output = context.live_output.clone();
 
         let run = async move {
-            let mut child = cmd.spawn().map_err(|e| BotError::Agent {
-                name: name.clone(),
-                reason: format!("failed to spawn `{program}`: {e}"),
-            })?;
+            let mut child = spawn_retrying_busy(&mut cmd, &name, &program).await?;
 
             if let Some(mut stdin) = child.stdin.take() {
                 if let Err(error) = stdin.write_all(prompt_for_spawn.as_bytes()).await {
@@ -693,6 +690,40 @@ fn summarize(stdout: &str, stderr: &str) -> String {
         .find(|&i| i >= start)
         .unwrap_or(source.len());
     format!("…{}", &source[start..])
+}
+
+/// Wait before retrying a spawn whose executable is still busy.
+const BUSY_SPAWN_ATTEMPTS: usize = 5;
+
+/// Spawn `cmd`, retrying while the kernel reports the program is still being
+/// written. Linux returns `ETXTBSY` (`ExecutableFileBusy`) when a just-written
+/// executable is still held open by a concurrent `fork`, which parallel tests
+/// that write a fake CLI hit by chance, and when an operator replaces the
+/// binary while a run starts. Retrying briefly resolves both.
+async fn spawn_retrying_busy(
+    cmd: &mut Command,
+    name: &str,
+    program: &str,
+) -> Result<tokio::process::Child> {
+    let mut attempt = 0;
+    loop {
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt < BUSY_SPAWN_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(10 * attempt as u64)).await;
+            }
+            Err(error) => {
+                return Err(BotError::Agent {
+                    name: name.to_owned(),
+                    reason: format!("failed to spawn `{program}`: {error}"),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

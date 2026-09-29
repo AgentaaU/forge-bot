@@ -272,11 +272,94 @@ impl AutoTrigger {
             let Some(key) = conflict_key(repo, number, &pr) else {
                 continue;
             };
+            // `mergeable: false` cannot distinguish a real conflict from a
+            // check that is still running or has failed, and the bounded
+            // settle window is not a guarantee. Ask Forgejo to update the
+            // branch: a branch that merges cleanly is updated (or is already
+            // current) without an agent, while a genuine conflict fails. Only
+            // start an agent when Forgejo confirms the conflict, so a clean
+            // branch never produces an agent run or a "no conflict" comment.
+            match self.update_branch(base, token, repo, number).await {
+                BranchUpdate::Clean => {
+                    self.remember(&key)?;
+                    continue;
+                }
+                BranchUpdate::Conflict => {}
+                // Without an authoritative answer, keep the previous
+                // behaviour and let the agent look.
+                BranchUpdate::Unavailable => {}
+            }
             let instruction = "Resolve the merge conflict between this pull request and its base branch. Verify the result and update the pull request branch.".to_owned();
             let message = auto_message(base, repo, number, &pr, "merge_conflict", &instruction)?;
             accepted += self.submit(dispatcher, key, message, instruction).await?;
         }
         Ok(accepted)
+    }
+
+    /// Ask Forgejo itself whether the branch still merges. Updating a clean
+    /// branch is the work the agent would otherwise do; a conflicted branch
+    /// returns `409` and is left to the agent.
+    async fn update_branch(
+        &self,
+        base: &str,
+        token: &str,
+        repo: &str,
+        number: u64,
+    ) -> BranchUpdate {
+        let url = format!("{base}/api/v1/repos/{repo}/pulls/{number}/update");
+        let response = match self
+            .client
+            .post(&url)
+            .header("Authorization", format!("token {token}"))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(%error, pr = number, "could not verify merge conflict");
+                return BranchUpdate::Unavailable;
+            }
+        };
+        match response.status() {
+            reqwest::StatusCode::OK => BranchUpdate::Clean,
+            reqwest::StatusCode::CONFLICT => BranchUpdate::Conflict,
+            status => {
+                tracing::warn!(%status, pr = number, "could not verify merge conflict");
+                BranchUpdate::Unavailable
+            }
+        }
+    }
+
+    /// Record `key` as handled and persist the seen set. Returns `false` when
+    /// the key was already handled.
+    fn remember(&self, key: &str) -> Result<bool> {
+        {
+            let mut seen = self.seen.lock().expect("auto-trigger state poisoned");
+            if !seen.insert(key.to_owned()) {
+                return Ok(false);
+            }
+        }
+        self.persist_seen()?;
+        Ok(true)
+    }
+
+    fn forget(&self, key: &str) {
+        self.seen
+            .lock()
+            .expect("auto-trigger state poisoned")
+            .remove(key);
+    }
+
+    fn persist_seen(&self) -> Result<()> {
+        let seen = self.seen.lock().expect("auto-trigger state poisoned");
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec(&seen.order)?;
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(tmp, &self.path)?;
+        Ok(())
     }
 
     async fn submit(
@@ -286,11 +369,8 @@ impl AutoTrigger {
         message: ForgeMessage,
         instruction: String,
     ) -> Result<usize> {
-        {
-            let mut seen = self.seen.lock().expect("auto-trigger state poisoned");
-            if !seen.insert(key.clone()) {
-                return Ok(0);
-            }
+        if !self.remember(&key)? {
+            return Ok(0);
         }
         let mention = Mention {
             agent: None,
@@ -300,22 +380,9 @@ impl AutoTrigger {
             .submit_auto(message, mention, dispatcher.default_agent_name())
             .await;
         match result {
-            Ok(_) => {
-                let seen = self.seen.lock().expect("auto-trigger state poisoned");
-                if let Some(parent) = self.path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let bytes = serde_json::to_vec(&seen.order)?;
-                let tmp = self.path.with_extension("json.tmp");
-                std::fs::write(&tmp, bytes)?;
-                std::fs::rename(tmp, &self.path)?;
-                Ok(1)
-            }
+            Ok(_) => Ok(1),
             Err(error) => {
-                self.seen
-                    .lock()
-                    .expect("auto-trigger state poisoned")
-                    .remove(&key);
+                self.forget(&key);
                 Err(error)
             }
         }
@@ -359,6 +426,19 @@ impl AutoTrigger {
             .json()
             .await?)
     }
+}
+
+/// Outcome of asking Forgejo to merge the base branch into the head branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchUpdate {
+    /// The branch merges cleanly: Forgejo updated it or it was already
+    /// current. There is no conflict to resolve.
+    Clean,
+    /// Forgejo reports a real conflict while updating the branch.
+    Conflict,
+    /// The conflict could not be confirmed (permission error, transient
+    /// failure, or an older Forgejo without the endpoint).
+    Unavailable,
 }
 
 /// Whether the pull request is a candidate for automatic conflict

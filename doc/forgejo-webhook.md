@@ -227,6 +227,13 @@ bounded window before acting; a branch that merges cleanly settles to
 head/base commit pairs in `auto-triggers.json` under the session directory,
 including across restarts.
 
+When a candidate still reports `mergeable = false` after that window, the bot
+asks Forgejo to merge the base branch into the head branch before starting an
+agent. A branch that actually merges cleanly is updated (or is already current)
+and no agent is started, so a PR that merely looked conflicting while Forgejo
+was still checking never gets an agent run or a "no conflict" comment. Only a
+`409` from the update, which means a real conflict, starts the agent.
+
 When updating an existing hook, add `action_run_failure` and `push` to its
 events. The registration script includes them in its default event list.
 
