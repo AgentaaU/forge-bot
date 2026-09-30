@@ -110,11 +110,14 @@ impl AutoTrigger {
         let Some(forgejo) = config.forges.forgejo.as_ref() else {
             return Ok(0);
         };
-        // Mentionless execution requires an authenticated delivery.
+        // Mentionless execution requires an authenticated delivery, and the
+        // default user owns automatic CI/conflict work.
         if forgejo.webhook_secret.is_none() {
             return Ok(0);
         }
-        let Some(token) = forgejo.token.as_deref() else {
+        let global_token = forgejo.token.as_deref();
+        let default_user = dispatcher.identities().default_user();
+        let Some(token) = default_user.effective_token(global_token) else {
             return Err(BotError::Config(
                 "automatic Forgejo triggers require a Forgejo API token".into(),
             ));

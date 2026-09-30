@@ -20,6 +20,7 @@ use crate::agent::{
 };
 use crate::config::{OutputFormat, PromptDelivery};
 use crate::error::{BotError, Result};
+use crate::executor::ExecSpec;
 
 /// Maximum number of characters of captured output kept in the summary.
 const OUTPUT_LIMIT: usize = 4000;
@@ -55,6 +56,10 @@ pub struct CommandAgent {
     dangerously_skip_permissions: bool,
     session: Option<SessionContinuation>,
     result_format: OutputFormat,
+    /// Index at which a per-user `--model <id>` is inserted. `None` appends it
+    /// before the prompt; adapters whose prompt-consuming flag must stay last
+    /// (agy `--print`) pin it to that flag's index.
+    model_at: Option<usize>,
 }
 
 /// How a [`CommandAgent`] continues the conversation for one thread.
@@ -162,6 +167,7 @@ fn parse_codex_usage(stdout: &str) -> Option<TokenUsage> {
 struct JsonResult {
     text: Option<String>,
     usage: Option<TokenUsage>,
+    is_error: bool,
 }
 
 /// Parse the last JSON result object from a command's stdout.
@@ -185,7 +191,11 @@ fn parse_result_json(stdout: &str) -> Option<JsonResult> {
             .map(str::to_owned);
         let usage = value.get("usage").and_then(normalize_usage);
         if text.is_some() || usage.is_some() {
-            result = Some(JsonResult { text, usage });
+            result = Some(JsonResult {
+                text,
+                usage,
+                is_error: value["is_error"].as_bool().unwrap_or(false),
+            });
         }
     }
     result
@@ -252,6 +262,19 @@ pub(crate) fn model_arg(args: &[String], short: bool) -> Option<String> {
         .next_back()
 }
 
+/// Insert the addressed user's `--model <id>` unless the operator already
+/// configured one. `at` pins the insertion before a prompt-consuming flag
+/// (agy `--print`); `None` appends it just before the prompt.
+fn apply_model(args: &mut Vec<String>, model: Option<&str>, at: Option<usize>) {
+    if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty())
+        && model_arg(args, false).is_none()
+    {
+        let at = at.unwrap_or(args.len()).min(args.len());
+        args.insert(at, model.to_owned());
+        args.insert(at, "--model".to_owned());
+    }
+}
+
 impl CommandAgent {
     pub fn new(name: impl Into<String>, program: impl Into<String>) -> Self {
         Self {
@@ -264,6 +287,7 @@ impl CommandAgent {
             dangerously_skip_permissions: false,
             session: None,
             result_format: OutputFormat::Text,
+            model_at: None,
         }
     }
 
@@ -328,6 +352,13 @@ impl CommandAgent {
         self
     }
 
+    /// Insert a per-user model argument at `at` instead of appending it. Used
+    /// by adapters that require a prompt-consuming flag to remain last.
+    pub fn model_at(mut self, at: usize) -> Self {
+        self.model_at = Some(at);
+        self
+    }
+
     /// Ask the CLI for one JSON result object and parse the reply and token
     /// usage from it.
     ///
@@ -384,7 +415,12 @@ impl CommandAgent {
                 let id = if style.capture_id {
                     String::new()
                 } else {
-                    continuation.store.deterministic_id(&self.name, &key)
+                    // A CLI may create its session before failing (or before
+                    // the gateway is interrupted). With no saved successful
+                    // mapping, reusing a deterministic ID would collide with
+                    // that orphaned session. New attempts need fresh IDs;
+                    // successful IDs are still persisted and resumed above.
+                    uuid::Uuid::new_v4().to_string()
                 };
                 plan.args = interpolate(&style.create_args, &id, reply.as_deref());
                 plan.at = None;
@@ -462,7 +498,10 @@ impl Agent for CommandAgent {
     async fn run(&self, request: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
         let workspace: PathBuf = context.workspace.clone();
         if !workspace.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(&workspace).await?;
+            context
+                .executor
+                .create_dir_all(&workspace, context.host_user.as_deref())
+                .await?;
         }
 
         let prompt = build_prompt(request, context);
@@ -483,6 +522,11 @@ impl Agent for CommandAgent {
             None => args.extend(plan.args.iter().cloned()),
         }
 
+        // Apply the addressed user's model before reading the effective model
+        // for reporting. An explicit `--model` already in the configured args
+        // wins, so operator intent is never overridden.
+        apply_model(&mut args, context.model.as_deref(), self.model_at);
+
         let configured_model = match self.name.as_str() {
             "agy" => crate::agent::agy::configured_model(&args, self.env.get("HOME")),
             "kimi" => crate::agent::kimi::configured_model(
@@ -495,27 +539,41 @@ impl Agent for CommandAgent {
         };
         *context.reported_model.lock().expect("model mutex poisoned") = configured_model.clone();
 
-        let mut cmd = Command::new(&self.program);
-        cmd.args(&args)
-            .envs(self.env.clone())
-            .envs(context.environment(request))
-            .stdin(if self.prompt == PromptDelivery::Stdin {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        if !workspace.as_os_str().is_empty() {
-            cmd.current_dir(&workspace);
-        }
-
+        let mut call_args = args;
         if self.prompt == PromptDelivery::Arg {
-            cmd.arg(&prompt);
+            call_args.push(prompt.clone());
         }
-
+        let mut env: Vec<(String, String)> = self
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        env.extend(context.environment(request));
+        let spec = ExecSpec {
+            program: self.program.clone(),
+            args: call_args,
+            env,
+            cwd: (!workspace.as_os_str().is_empty()).then(|| workspace.clone()),
+            host_user: context.host_user.clone(),
+        };
+        let crate::executor::Prepared {
+            command: mut cmd,
+            cgroup,
+        } = context
+            .executor
+            .command(&spec)
+            .map_err(|error| BotError::Agent {
+                name: self.name.clone(),
+                reason: error.to_string(),
+            })?;
+        cmd.stdin(if self.prompt == PromptDelivery::Stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
         tracing::info!(
             agent = %self.name,
             program = %self.program,
@@ -529,6 +587,9 @@ impl Agent for CommandAgent {
         let live_output = context.live_output.clone();
 
         let run = async move {
+            // Hold the run's cgroup guard for the whole run so cancellation
+            // stops the unit's descendants.
+            let _keep_cgroup = cgroup;
             let mut child = spawn_retrying_busy(&mut cmd, &name, &program).await?;
 
             if let Some(mut stdin) = child.stdin.take() {
@@ -622,11 +683,21 @@ impl Agent for CommandAgent {
                     json.as_ref().and_then(|result| result.usage)
                 };
 
-                if status.success() {
+                if status.success() && !json.as_ref().is_some_and(|result| result.is_error) {
                     let summary = match &plan.reply_file {
                         Some(path) => {
-                            let text = std::fs::read_to_string(path).unwrap_or_default();
+                            let reply = context
+                                .executor
+                                .read_reply_file(path, context.host_user.as_deref());
                             let _ = std::fs::remove_file(path);
+                            let text = match reply {
+                                Ok(text) => text,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                                Err(_) => return Err(BotError::Agent {
+                                    name: self.name.clone(),
+                                    reason: "reply file rejected: expected a bounded regular file owned by the agent".into(),
+                                }),
+                            };
                             let text = text.trim();
                             if text.is_empty() {
                                 fallback
@@ -652,7 +723,11 @@ impl Agent for CommandAgent {
                                 .code()
                                 .map(|c| c.to_string())
                                 .unwrap_or_else(|| "signal".into()),
-                            summarize(&format!("{stdout}\n{stderr}"), "")
+                            json.as_ref()
+                                .and_then(|result| result.text.as_deref())
+                                .filter(|text| !text.trim().is_empty())
+                                .map(|text| summarize(text, ""))
+                                .unwrap_or_else(|| summarize(&format!("{stdout}\n{stderr}"), ""))
                         ),
                         started.elapsed(),
                     );
@@ -809,6 +884,44 @@ mod tests {
     }
 
     #[test]
+    fn apply_model_appends_before_the_prompt_and_respects_an_explicit_choice() {
+        let mut args = vec!["exec".to_owned()];
+        apply_model(&mut args, Some("gpt-fast"), None);
+        assert_eq!(args, ["exec", "--model", "gpt-fast"]);
+
+        // An operator-configured model is never overridden.
+        let mut args = vec![
+            "exec".to_owned(),
+            "--model".to_owned(),
+            "operator".to_owned(),
+        ];
+        apply_model(&mut args, Some("gpt-fast"), None);
+        assert_eq!(args, ["exec", "--model", "operator"]);
+
+        // A pinned index keeps a prompt-consuming flag last (agy --print).
+        let mut args = vec![
+            "--dangerously-skip-permissions".to_owned(),
+            "--print".to_owned(),
+        ];
+        apply_model(&mut args, Some("gpt-fast"), Some(1));
+        assert_eq!(
+            args,
+            [
+                "--dangerously-skip-permissions",
+                "--model",
+                "gpt-fast",
+                "--print"
+            ]
+        );
+
+        // Nothing to apply is a no-op.
+        let mut args = vec!["exec".to_owned()];
+        apply_model(&mut args, None, None);
+        apply_model(&mut args, Some("  "), None);
+        assert_eq!(args, ["exec"]);
+    }
+
+    #[test]
     fn prompt_points_review_mentions_at_their_thread() {
         let request = AgentRequest {
             location: url::Url::parse("https://forge.example.com/o/r/pulls/22#issuecomment-9039")
@@ -952,6 +1065,67 @@ mod tests {
             issue_number: Some(1),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn json_failure_reports_the_cli_error_without_dumping_metadata() {
+        let request = AgentRequest {
+            location: "https://forge.invalid/o/r/issues/2".parse().unwrap(),
+            message: "go".into(),
+        };
+        for exit in [0, 1] {
+            let agent = CommandAgent::new("fake", "sh")
+                .args(["-c".to_owned(), format!("printf '%s' '{{\"type\":\"result\",\"is_error\":true,\"result\":\"Not logged in · Please run /login\",\"modelUsage\":{{}},\"session_id\":\"unused\"}}'; exit {exit}")])
+                .with_json_output();
+            let outcome = agent.run(&request, &AgentContext::default()).await.unwrap();
+            assert!(
+                !outcome.success,
+                "a CLI error result must fail even with exit zero"
+            );
+            assert!(outcome.summary.contains("Not logged in"));
+            assert!(!outcome.summary.contains("modelUsage"));
+            assert!(!outcome.summary.contains("session_id"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_cannot_return_a_symlink_as_its_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("synthetic-gateway-secret");
+        std::fs::write(&secret, "SYNTHETIC_GATEWAY_SECRET").unwrap();
+        let agent = CommandAgent::new("fake", "/bin/sh")
+            .args([
+                "-c",
+                "cat >/dev/null; ln -s \"$PROBE_SECRET\" \"$1\"",
+                "probe",
+            ])
+            .env("PROBE_SECRET", secret.display().to_string())
+            .session(
+                SessionStyle {
+                    create_args: vec!["{reply_file}".into()],
+                    resume_args: vec![],
+                    resume_at: None,
+                    reply_from_file: true,
+                    capture_id: false,
+                    replace_on_resume: false,
+                },
+                Arc::new(SessionStore::default()),
+            );
+        let request = AgentRequest {
+            location: "https://forge.invalid/o/r/issues/1".parse().unwrap(),
+            message: "probe".into(),
+        };
+        let error = agent
+            .run(&request, &context_for(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reply file rejected"));
+        assert!(!error.to_string().contains("SYNTHETIC_GATEWAY_SECRET"));
+        assert_eq!(
+            std::fs::read_to_string(secret).unwrap(),
+            "SYNTHETIC_GATEWAY_SECRET"
+        );
     }
 
     #[cfg(unix)]

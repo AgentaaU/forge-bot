@@ -193,9 +193,14 @@ fn from_session(session: Session, waiting: Vec<Job>) -> ThreadStatus {
 }
 
 /// Recover the issue/PR number and kind from a session key, which is the only
-/// place the persisted session keeps them. Falls back to a plain issue when
-/// the key is not in the expected `forge:repository:kind:number` shape.
+/// place the persisted session keeps them. A per-user key is prefixed with
+/// `user:<id>:`, which is stripped first. Falls back to a plain issue when the
+/// key is not in the expected `forge:repository:kind:number` shape.
 fn key_parts(key: &str) -> (Option<u64>, String) {
+    let key = key
+        .strip_prefix("user:")
+        .and_then(|rest| rest.split_once(':').map(|(_, rest)| rest))
+        .unwrap_or(key);
     let parts: Vec<&str> = key.splitn(4, ':').collect();
     match parts.as_slice() {
         [_, _, kind, number] => (number.parse().ok(), thread_type(*kind == "pr").to_owned()),
@@ -671,6 +676,7 @@ mod tests {
                 message: "go".into(),
             },
             agent: agent.into(),
+            user_id: None,
             created_at: Utc::now(),
             status_comment: None,
             waiting: false,

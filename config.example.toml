@@ -1,11 +1,9 @@
 # Example configuration for forge-bot.
 #
-# This single example covers both install styles:
-#
-#   * per-user install (`contrib/install-user.sh`), where `~` expands to the
-#     service account's home and state stays inside it; and
-#   * a system-wide install, which uses absolute paths such as
-#     `/var/lib/forge-bot` and may bind to a routable address.
+# forge-bot runs as a root-controlled system service (see
+# `contrib/install-system.sh`) and executes every agent as the `[users.*]`
+# account it is addressed as. Absolute paths such as `/var/lib/forge-bot` keep
+# checkouts and state persistent.
 #
 # Copy to `forge-bot.toml` and adjust. Secrets can be supplied through the
 # environment instead of this file:
@@ -35,6 +33,52 @@ base_url = "http://forgejo.example.com:3000"
 # token = "change-me"
 bot_username = "forge-bot"
 
+# --- explicit multi-user mode (optional) ------------------------------------
+#
+# Every run belongs to a configured `[users.*]` account; at least one table is
+# required. Each user is a real Forgejo account addressed by its own login
+# (`@user_id` for a non-default user; the default user logs in as
+# `forgejo.bot_username`) and runs as a separate, non-root Linux account.
+#
+# Exactly one user must have `role = "default"`. A user may pin an adapter
+# with `agent` and a model with `agent_model`; the model is passed to the
+# spawned agent (`--model <id>`) unless the adapter's configured args already
+# set one.
+#
+# Each user should set its own `token`. The default user falls back to the
+# global `[forgejo] token`; a non-default user without a token gets none, so a
+# `@reviewer` run never replies as the default bot. Workspaces, sessions and
+# backend conversations are namespaced by `user_id`, so users never share a
+# checkout or a conversation.
+#
+# [users.forge-bot]
+# role = "default"
+# host_user = "agent"
+# token = "change-me-default"
+#
+# [users.forge-reviewer]
+# role = "reviewer"
+# host_user = "forge-reviewer"
+# token = "change-me-reviewer"
+# agent = "codex"
+# agent_model = "gpt-fast"
+
+# --- process execution / account isolation -----------------------------------
+#
+# Every run is forked natively, moved into a per-run cgroup v2 and dropped to
+# its `[users.*].host_user` before `exec`, so agent and repository work never
+# runs as the gateway. No external `systemd-run` or `systemctl` executable is
+# involved.
+#
+# Secrets are passed in the child's environment (never on a command line).
+# Cancelling a run writes `cgroup.kill`, stopping the whole run cgroup.
+#
+# [executor]
+# Root of the cgroup v2 hierarchy the gateway creates per user/run. The
+# gateway must be able to create directories here.
+# cgroup_root = "/sys/fs/cgroup/forge-bot"
+# passwd_file = "/etc/passwd"
+
 [policy]
 # `allow_all = true` disables authorization entirely. Use only for local
 # testing.
@@ -48,8 +92,9 @@ allowed_repos = ["org/repo"]
 [workspace]
 # Clone the repository before invoking an agent.
 enabled = true
-# `~` expands to the service account's home. Use an absolute path such as
-# `/var/lib/forge-bot/workspaces` for a system-wide install.
+# `~` expands to the service account's home for a run without a `host_user`.
+# Explicit `[users.*]` runs ignore this and check out directly in the
+# `host_user`'s home, which that account already owns.
 root = "~/.local/state/forge-bot/workspaces"
 reuse = true
 git_author_name = "forge-bot"

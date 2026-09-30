@@ -1,0 +1,44 @@
+[Unit]
+Description=forge-bot — forge @mention bridge (system multi-user service)
+Documentation=https://forgejo.shylockhg.me/shylock/forge-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/forge-bot
+EnvironmentFile=-/etc/forge-bot/forge-bot.env
+# The gateway runs as root because it forks each agent natively and drops to the
+# target account, and it writes to the cgroup v2 hierarchy. Agent and git work
+# always runs as the configured user, never as root.
+ExecStart=/usr/local/bin/forge-bot --config /etc/forge-bot/forge-bot.toml serve
+# Persistent gateway state. Checkouts do not live here: each explicit
+# `[users.*]` run checks out into its own `host_user`'s home, so state stays
+# root-only while the account owns its workspace.
+Environment=FORGE_BOT_SESSION_DIR=/var/lib/forge-bot/state
+Restart=on-failure
+RestartSec=5s
+
+# systemd opens append: files before any StateDirectory= is created, so
+# install-system.sh creates the parent directory first.
+StandardOutput=append:/var/log/forge-bot/forge-bot.log
+StandardError=append:/var/log/forge-bot/forge-bot.log
+
+# Defense in depth. The gateway must be able to create per-user/per-run
+# cgroups under /sys/fs/cgroup, so ProtectControlGroups is deliberately not set
+# (ProtectKernelTunables only remounts /sys, not the separate cgroup2 mount).
+# ProtectHome is likewise not set: each account's checkout lives in its own
+# home, and workspace directories are created by a child after dropping to
+# the account. PrivateTmp is not set either, so the agent and the gateway share
+# /tmp for the workspace and the codex `-o` reply file.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -20,7 +20,6 @@ use crate::config::Config;
 use crate::error::{BotError, Result};
 use crate::forge::ForgeMessage;
 use crate::location::ForgeKind;
-use crate::mention::extract_mention;
 use crate::session::Dispatcher;
 
 /// High-water mark for one repository.
@@ -103,7 +102,13 @@ impl Poller {
             .ok_or_else(|| BotError::Config("poller requires a [forgejo] section".into()))?;
 
         let base = forgejo.base_url.trim_end_matches('/').to_owned();
-        let token = forgejo.token.clone();
+        // Poll as the default user, which is the account automatic work runs
+        // under. A user with its own token never falls back to the legacy one.
+        let global_token = forgejo.token.as_deref();
+        let default_user = self.dispatcher.identities().default_user();
+        let token = default_user
+            .effective_token(global_token)
+            .map(str::to_owned);
 
         for repo in self.repositories(&base, token.as_deref()).await? {
             if let Err(error) = self.poll_repo(&base, token.as_deref(), &repo).await {
@@ -257,15 +262,18 @@ impl Poller {
             if self.dispatcher.policy().is_ignored(&message.author) {
                 continue;
             }
-            let Some(mention) = extract_mention(&message.body, self.config.trigger()) else {
-                continue;
+            let (mention, agent_name) = match self.dispatcher.route(&message) {
+                Ok(Some(routed)) => routed,
+                Ok(None) => continue,
+                Err(BotError::Unauthorized(reason)) => {
+                    tracing::info!(%reason, repo, "ignored unroutable polled trigger");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, repo, "failed to route polled trigger");
+                    continue;
+                }
             };
-
-            let agent_name = mention
-                .agent
-                .clone()
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| self.dispatcher.default_agent_name().to_owned());
 
             match self.dispatcher.submit(message, mention, &agent_name).await {
                 Ok(job_id) => tracing::info!(%job_id, repo, "accepted polled trigger"),
@@ -410,7 +418,7 @@ mod tests {
     fn converts_comment_to_message() {
         let comment = json!({
             "id": 77,
-            "body": "@agent do it",
+            "body": "@shylock-bot do it",
             "html_url": "http://forge.local:3000/o/r/issues/3#issuecomment-77",
             "issue_url": "http://forge.local:3000/o/r/issues/3",
             "pull_request_url": "",
@@ -440,7 +448,7 @@ mod tests {
     fn detects_pull_request_comments() {
         let comment = json!({
             "id": 1,
-            "body": "@agent x",
+            "body": "@shylock-bot x",
             "html_url": "http://forge.local:3000/o/r/pulls/5#issuecomment-1",
             "issue_url": "http://forge.local:3000/o/r/issues/5",
             "pull_request_url": "http://forge.local:3000/o/r/pulls/5",
@@ -598,6 +606,29 @@ mod tests {
             bot_username: Some("shylock-bot".into()),
             ..Default::default()
         });
+        // Every run belongs to a configured user; tests spawn directly because
+        // the cgroup backend needs root.
+        let passwd = dir.join("passwd");
+        std::fs::write(
+            &passwd,
+            format!(
+                "agent:x:1000:1000::{}:/bin/bash\n",
+                dir.join("home/agent").display()
+            ),
+        )
+        .unwrap();
+        config.executor.passwd_file = passwd;
+        config.executor.set_direct_for_tests();
+        config.users.insert(
+            "default".into(),
+            crate::config::UserConfig {
+                role: crate::config::UserRole::Default,
+                host_user: "agent".into(),
+                agent: None,
+                agent_model: None,
+                token: None,
+            },
+        );
         config.agents.overrides.insert(
             "custom".into(),
             AgentConfig {
@@ -640,7 +671,7 @@ mod tests {
         let state = Arc::new(MockState::default());
         state.comments.lock().unwrap().insert(
             "o/r".into(),
-            MockReply::Json(json!([comment(1, "@agent go", "alice")])),
+            MockReply::Json(json!([comment(1, "@shylock-bot go", "alice")])),
         );
         let base = start_mock(state.clone()).await;
 
@@ -868,10 +899,10 @@ mod tests {
         state.comments.lock().unwrap().insert(
             "o/r".into(),
             MockReply::Json(json!([
-                comment(1, "@agent --agent=custom go", "shylock-bot"),
+                comment(1, "@shylock-bot --agent=custom go", "shylock-bot"),
                 comment(2, "just chatting", "alice"),
-                comment(3, "@agent --agent=missing go", "alice"),
-                comment(4, "@agent --agent=custom go", "alice")
+                comment(3, "@shylock-bot --agent=missing go", "alice"),
+                comment(4, "@shylock-bot --agent=custom go", "alice")
             ])),
         );
         let base = start_mock(state).await;
@@ -889,7 +920,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let key = "forgejo:o/r:issue:3";
+        let key = "user:default:forgejo:o/r:issue:3";
         let session = sessions
             .get(key)
             .expect("the valid mention creates a session");
@@ -902,7 +933,11 @@ mod tests {
         let state = Arc::new(MockState::default());
         state.comments.lock().unwrap().insert(
             "o/r".into(),
-            MockReply::Json(json!([comment(1, "@agent --agent=custom go", "alice")])),
+            MockReply::Json(json!([comment(
+                1,
+                "@shylock-bot --agent=custom go",
+                "alice"
+            )])),
         );
         let base = start_mock(state).await;
 
@@ -913,7 +948,7 @@ mod tests {
 
         poller.tick().await.unwrap();
         assert!(sessions.pending_jobs().unwrap().is_empty());
-        assert!(sessions.get("forgejo:o/r:issue:3").is_none());
+        assert!(sessions.get("user:default:forgejo:o/r:issue:3").is_none());
     }
 
     #[tokio::test]

@@ -467,6 +467,7 @@ dependencies = [
  "clap",
  "hex",
  "hmac",
+ "libc",
  "once_cell",
  "reqwest",
  "serde",

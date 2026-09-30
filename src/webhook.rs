@@ -20,7 +20,6 @@ use crate::auto_trigger::AutoTrigger;
 use crate::config::Config;
 use crate::error::BotError;
 use crate::forge::ForgeAdapter;
-use crate::mention::extract_mention;
 use crate::session::Dispatcher;
 use crate::session::status;
 
@@ -273,8 +272,19 @@ async fn receive(
             continue;
         }
 
-        let Some(mention) = extract_mention(&message.body, state.config.trigger()) else {
-            continue;
+        // Explicit mode addresses a configured login; legacy mode uses the
+        // global trigger. An ambiguous mention is ignored before any ack.
+        let (mention, agent_name) = match state.dispatcher.route(&message) {
+            Ok(Some(routed)) => routed,
+            Ok(None) => continue,
+            Err(BotError::Unauthorized(reason)) => {
+                tracing::info!(%reason, "ignored unroutable trigger");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to route trigger");
+                continue;
+            }
         };
 
         let dedupe_key = delivery_key(&message);
@@ -282,12 +292,6 @@ async fn receive(
             tracing::debug!(%dedupe_key, "ignoring duplicate webhook delivery");
             continue;
         }
-
-        let agent_name = mention
-            .agent
-            .clone()
-            .filter(|a| !a.is_empty())
-            .unwrap_or_else(|| state.agents.default_name().to_owned());
 
         match state.dispatcher.submit(message, mention, &agent_name).await {
             Ok(job_id) => {

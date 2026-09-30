@@ -123,8 +123,11 @@ impl SessionStore {
     }
 
     /// Stable key for the conversation a message belongs to.
-    pub fn key(message: &ForgeMessage) -> String {
-        format!(
+    ///
+    /// `user_id` namespaces the key so two accounts never share a session or
+    /// job queue. `None` is only reachable from tests.
+    pub fn key(message: &ForgeMessage, user_id: Option<&str>) -> String {
+        let base = format!(
             "{}:{}:{}:{}",
             message.forge,
             message.repository,
@@ -134,7 +137,11 @@ impl SessionStore {
                 "issue"
             },
             message.number.unwrap_or_default()
-        )
+        );
+        match user_id {
+            Some(user) => format!("user:{user}:{base}"),
+            None => base,
+        }
     }
 
     /// Start (or continue) a session for a job.
@@ -420,10 +427,23 @@ mod tests {
                 message: "x".into(),
             },
             agent: "codex".into(),
+            user_id: None,
             created_at: Utc::now(),
             status_comment: None,
             waiting: false,
         }
+    }
+
+    #[test]
+    fn keys_are_namespaced_per_user() {
+        let message = job().message;
+        let legacy = SessionStore::key(&message, None);
+        let user = SessionStore::key(&message, Some("reviewer"));
+        assert!(!legacy.starts_with("user:"));
+        assert!(user.starts_with("user:reviewer:"));
+        assert_ne!(legacy, user);
+        // A different user is a different namespace again.
+        assert_ne!(user, SessionStore::key(&message, Some("other")));
     }
 
     #[test]
@@ -507,7 +527,11 @@ mod tests {
             store.begin(&job()).unwrap();
         }
         let store = SessionStore::open(dir.path()).unwrap();
-        assert!(store.get(&SessionStore::key(&job().message)).is_some());
+        assert!(
+            store
+                .get(&SessionStore::key(&job().message, None))
+                .is_some()
+        );
         assert_eq!(store.list().len(), 1);
     }
 
@@ -521,6 +545,28 @@ mod tests {
         assert_eq!(pending.len(), 1);
         store.remove_job(job.id).unwrap();
         assert!(store.pending_jobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn persists_the_user_id_for_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut scoped = job();
+        scoped.user_id = Some("reviewer".into());
+        store.save_job(&scoped).unwrap();
+        let pending = store.pending_jobs().unwrap();
+        assert_eq!(pending[0].user_id.as_deref(), Some("reviewer"));
+        assert!(pending[0].session_key().starts_with("user:reviewer:"));
+
+        // A legacy job round-trips as the legacy target.
+        let legacy = job();
+        store.save_job(&legacy).unwrap();
+        let pending = store.pending_jobs().unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|job| job.id == legacy.id && job.user_id.is_none())
+        );
     }
 
     /// Age a stored session so the eviction test does not have to wait.

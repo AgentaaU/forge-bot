@@ -4,7 +4,8 @@
 //! checks by default (issue #33); `dangerously_skip_permissions = false` opts
 //! out. The first comment in a thread creates the session with `--session-id`,
 //! later comments resume it with `--resume`, so the model keeps the conversation
-//! context.
+//! context. New attempts use fresh session IDs: a failed CLI can leave a local
+//! session behind even though the gateway has no successful mapping to resume.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -80,6 +81,79 @@ mod tests {
 
     fn store() -> Arc<SessionStore> {
         Arc::new(SessionStore::default())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_creation_does_not_collide_on_retry_and_success_resumes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-claude.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --session-id|--resume) mode=$1; id=$2; break ;;
+    esac
+    shift
+done
+printf '%s %s\n' "$mode" "$id" >> "$FAKE_STATE/args.log"
+if [ "$mode" = --session-id ]; then
+    if [ -e "$FAKE_STATE/session-$id" ]; then
+        echo "Error: Session ID $id is already in use." >&2
+        exit 1
+    fi
+    touch "$FAKE_STATE/session-$id"
+    if [ ! -e "$FAKE_STATE/failed-once" ]; then
+        touch "$FAKE_STATE/failed-once"
+        echo 'Not logged in · Please run /login' >&2
+        exit 1
+    fi
+elif [ ! -e "$FAKE_STATE/session-$id" ]; then
+    echo 'No session to resume' >&2
+    exit 1
+fi
+echo '{"type":"result","result":"ok"}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = AgentConfig {
+            command: Some(script.display().to_string()),
+            env: [("FAKE_STATE".into(), dir.path().display().to_string())].into(),
+            ..Default::default()
+        };
+        let request = AgentRequest {
+            location: "https://forge.invalid/o/r/issues/2".parse().unwrap(),
+            message: "research".into(),
+        };
+        let context = AgentContext {
+            workspace: dir.path().to_owned(),
+            repository: "o/r".into(),
+            issue_number: Some(2),
+            user_id: Some("reviewer".into()),
+            ..Default::default()
+        };
+        let agent = build(&config, Arc::new(SessionStore::load(dir.path())));
+        let failed = agent.run(&request, &context).await.unwrap();
+        assert!(!failed.success);
+        assert!(failed.summary.contains("Not logged in"));
+        // Simulate restarting the gateway after the failed creation: the CLI
+        // has retained its session, but the gateway has no successful mapping.
+        let agent = build(&config, Arc::new(SessionStore::load(dir.path())));
+        let retry = agent.run(&request, &context).await.unwrap();
+        assert!(retry.success, "{}", retry.summary);
+        // Successful sessions still survive gateway restarts and resume.
+        let agent = build(&config, Arc::new(SessionStore::load(dir.path())));
+        assert!(agent.run(&request, &context).await.unwrap().success);
+        let log = std::fs::read_to_string(dir.path().join("args.log")).unwrap();
+        let lines: Vec<_> = log.lines().collect();
+        assert_eq!(lines.len(), 3);
+        let first = lines[0].strip_prefix("--session-id ").unwrap();
+        let retry = lines[1].strip_prefix("--session-id ").unwrap();
+        assert_ne!(first, retry);
+        assert_eq!(lines[2], format!("--resume {retry}"));
     }
 
     #[test]

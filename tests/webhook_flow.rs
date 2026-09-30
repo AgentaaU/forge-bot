@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use forge_bot::agent::AgentRegistry;
-use forge_bot::config::{AgentConfig, Config};
+use forge_bot::config::{AgentConfig, Config, UserConfig, UserRole};
 use forge_bot::forge::hmac_sha256_hex;
 use forge_bot::forge_api::NoopForgeApi;
 use forge_bot::session::{Dispatcher, SessionStore};
@@ -31,7 +31,7 @@ const PAYLOAD: &str = r#"{
     },
     "comment": {
         "id": 77,
-        "body": "@agent --agent=custom please do the thing",
+        "body": "@shylock-bot --agent=custom please do the thing",
         "html_url": "http://forge.local:3000/shylock/forge-bot/issues/1#issuecomment-77",
         "user": {"login": "shylock"}
     },
@@ -60,6 +60,20 @@ fn harness_with(dir: &std::path::Path, configure: impl FnOnce(&mut Config)) -> H
     config.session.dir = dir.to_path_buf();
     config.session.workers = 1;
     config.agent_sequence = vec!["custom".into()];
+    // The executor resolves explicit host_users at startup; give every test a
+    // passwd fixture with the accounts the explicit-user test configures.
+    let passwd = dir.join("passwd");
+    std::fs::write(
+        &passwd,
+        format!(
+            "agent:x:1000:1000::{}:/bin/bash\nreviewer:x:1001:1001::{}:/bin/bash\n",
+            dir.join("home/agent").display(),
+            dir.join("home/reviewer").display()
+        ),
+    )
+    .unwrap();
+    config.executor.passwd_file = passwd;
+    config.executor.set_direct_for_tests();
     config.forges.forgejo = Some(forge_bot::config::ForgejoConfig {
         base_url: "http://forge.local:3000".into(),
         webhook_secret: Some(SECRET.into()),
@@ -67,6 +81,17 @@ fn harness_with(dir: &std::path::Path, configure: impl FnOnce(&mut Config)) -> H
         bot_username: Some("shylock-bot".into()),
         ..Default::default()
     });
+    // Every run belongs to a configured user.
+    config.users.insert(
+        "default".into(),
+        UserConfig {
+            role: UserRole::Default,
+            host_user: "agent".into(),
+            agent: None,
+            agent_model: None,
+            token: None,
+        },
+    );
     // `cat` echoes the prompt, standing in for a real CLI agent.
     config.agents.overrides.insert(
         "custom".into(),
@@ -373,7 +398,7 @@ async fn accepts_signed_mention_and_runs_agent() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    let key = "forgejo:shylock/forge-bot:issue:1";
+    let key = "user:default:forgejo:shylock/forge-bot:issue:1";
     let session = harness.sessions.get(key).expect("session should exist");
     assert_eq!(session.runs.len(), 1);
     assert_eq!(session.runs[0].success, Some(true));
@@ -387,10 +412,84 @@ async fn accepts_signed_mention_and_runs_agent() {
 }
 
 #[tokio::test]
+async fn explicit_users_route_by_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), |config| {
+        config.users.clear();
+        let user = |role, host: &str, agent: Option<&str>| UserConfig {
+            role,
+            host_user: host.into(),
+            agent: agent.map(str::to_owned),
+            agent_model: None,
+            token: None,
+        };
+        config.users.insert(
+            "shylock-bot".into(),
+            user(UserRole::Default, "agent", Some("custom")),
+        );
+        config.users.insert(
+            "shylock-reviewer".into(),
+            user(UserRole::Reviewer, "reviewer", None),
+        );
+    });
+
+    // Each delivery needs its own comment id or dedupe drops it.
+    let payload = |id: i64, body: &str| {
+        PAYLOAD
+            .replace("\"id\": 77", &format!("\"id\": {id}"))
+            .replace("@shylock-bot --agent=custom please do the thing", body)
+    };
+
+    // A reviewer mention is accepted and runs the registry default adapter.
+    assert_eq!(
+        accepted(
+            &harness.app,
+            "issue_comment",
+            &payload(101, "@shylock-reviewer please review")
+        )
+        .await,
+        1
+    );
+
+    // The default user is addressed by the configured bot username.
+    assert_eq!(
+        accepted(
+            &harness.app,
+            "issue_comment",
+            &payload(102, "@shylock-bot --agent=custom do it")
+        )
+        .await,
+        1
+    );
+
+    // A comment addressing two users is rejected before acknowledgement.
+    assert_eq!(
+        accepted(
+            &harness.app,
+            "issue_comment",
+            &payload(103, "@shylock-bot and @shylock-reviewer")
+        )
+        .await,
+        0
+    );
+
+    // A mention of an unconfigured login does nothing.
+    assert_eq!(
+        accepted(
+            &harness.app,
+            "issue_comment",
+            &payload(104, "@someone-else hi")
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
 async fn unqualified_mention_uses_first_agent_in_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(dir.path());
-    let payload = PAYLOAD.replace("@agent --agent=custom", "@agent");
+    let payload = PAYLOAD.replace("@shylock-bot --agent=custom", "@shylock-bot");
 
     let response = harness
         .app
@@ -409,7 +508,7 @@ async fn unqualified_mention_uses_first_agent_in_sequence() {
 
     let session = harness
         .sessions
-        .get("forgejo:shylock/forge-bot:issue:1")
+        .get("user:default:forgejo:shylock/forge-bot:issue:1")
         .expect("session should exist");
     assert_eq!(session.runs.len(), 1);
     assert_eq!(session.runs[0].agent, "custom");
@@ -425,7 +524,7 @@ const REVIEW_PAYLOAD: &str = r#"{
         "body": "This closes #5.",
         "html_url": "http://forge.local:3000/shylock/forge-bot/pulls/16"
     },
-    "review": {"type": "pull_request_review_comment", "content": "@agent --agent=custom review this please"},
+    "review": {"type": "pull_request_review_comment", "content": "@shylock-bot --agent=custom review this please"},
     "repository": {"full_name": "shylock/forge-bot"},
     "sender": {"login": "shylock"}
 }"#;
@@ -452,7 +551,7 @@ async fn handles_pull_request_review_events() {
 
     let session = harness
         .sessions
-        .get("forgejo:shylock/forge-bot:pr:16")
+        .get("user:default:forgejo:shylock/forge-bot:pr:16")
         .expect("review session should exist");
     assert_eq!(session.runs.len(), 1);
     assert_eq!(session.runs[0].success, Some(true));
@@ -488,7 +587,7 @@ async fn ignores_comment_without_mention() {
     let harness = harness(dir.path());
 
     let payload = PAYLOAD.replace(
-        "@agent --agent=custom please do the thing",
+        "@shylock-bot --agent=custom please do the thing",
         "just a normal comment",
     );
     let response = harness
@@ -580,7 +679,7 @@ async fn duplicate_deliveries_are_ignored() {
     }
     let session = harness
         .sessions
-        .get("forgejo:shylock/forge-bot:issue:1")
+        .get("user:default:forgejo:shylock/forge-bot:issue:1")
         .expect("session should exist");
     assert_eq!(session.runs.len(), 1, "the duplicate must be dropped");
 }
@@ -603,7 +702,10 @@ async fn malformed_payload_is_rejected() {
 async fn unknown_agent_is_not_fatal() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(dir.path());
-    let payload = PAYLOAD.replace("@agent --agent=custom", "@agent --agent=missing");
+    let payload = PAYLOAD.replace(
+        "@shylock-bot --agent=custom",
+        "@shylock-bot --agent=missing",
+    );
 
     let response = harness
         .app
@@ -701,7 +803,7 @@ async fn details_show_output_while_the_agent_is_running() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 
-    let key = "forgejo:shylock/forge-bot:issue:1";
+    let key = "user:default:forgejo:shylock/forge-bot:issue:1";
     let mut live = None;
     for _ in 0..100 {
         if let Some(session) = harness.sessions.get(key)
@@ -725,7 +827,7 @@ async fn details_show_output_while_the_agent_is_running() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/status/details?key=forgejo%3Ashylock%2Fforge-bot%3Aissue%3A1")
+                .uri("/status/details?key=user%3Adefault%3Aforgejo%3Ashylock%2Fforge-bot%3Aissue%3A1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -915,7 +1017,7 @@ async fn status_routes_do_not_change_state() {
     for uri in [
         "/status",
         "/status.json",
-        "/status/details?key=forgejo%3Ashylock%2Fforge-bot%3Aissue%3A1",
+        "/status/details?key=user%3Adefault%3Aforgejo%3Ashylock%2Fforge-bot%3Aissue%3A1",
         "/status?q=https%3A%2F%2Fforge.local%3A3000%2Fshylock%2Fforge-bot%2Fissues%2F1%23issuecomment-77",
         "/status.json?q=https%3A%2F%2Fforge.local%3A3000%2Fshylock%2Fforge-bot%2Fissues%2F1%23issuecomment-77",
     ] {

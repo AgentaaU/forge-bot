@@ -28,6 +28,9 @@ pub struct Config {
     pub forges: Forges,
     pub policy: PolicyConfig,
     pub workspace: WorkspaceConfig,
+    /// How agent and workspace processes are launched. Every run is forked
+    /// into a per-run cgroup and dropped to its `host_user` before `exec`.
+    pub executor: ExecutorConfig,
     pub reply: ReplyConfig,
     pub session: SessionConfig,
     pub agents: AgentConfigs,
@@ -39,6 +42,11 @@ pub struct Config {
     pub pi_rpc: PiRpcConfig,
     /// Forge polling ingester, used when webhooks cannot be configured.
     pub poller: PollerConfig,
+    /// Explicit agent users, keyed by a stable `user_id`.
+    ///
+    /// At least one entry is required; the bot no longer runs a single
+    /// implicit account. Exactly one entry must be the default.
+    pub users: BTreeMap<String, UserConfig>,
 }
 
 impl Default for Config {
@@ -50,12 +58,14 @@ impl Default for Config {
             forges: Forges::default(),
             policy: PolicyConfig::default(),
             workspace: WorkspaceConfig::default(),
+            executor: ExecutorConfig::default(),
             reply: ReplyConfig::default(),
             session: SessionConfig::default(),
             agents: AgentConfigs::default(),
             capacity: CapacityConfig::default(),
             pi_rpc: PiRpcConfig::default(),
             poller: PollerConfig::default(),
+            users: BTreeMap::new(),
         }
     }
 }
@@ -95,6 +105,7 @@ impl Config {
         }
         self.policy.ensure_defaults();
         self.workspace.ensure_defaults();
+        self.executor.ensure_defaults();
         self.session.ensure_defaults();
         self.capacity.ensure_defaults();
         if self.pi_rpc.command.is_empty() {
@@ -151,10 +162,48 @@ impl Config {
         self.mention.trim()
     }
 
+    /// Effective forge login for a configured user.
+    ///
+    /// A non-default user's login is its table key. The default user logs in
+    /// as the configured `forgejo.bot_username`, falling back to its table key
+    /// when that is unset or blank.
+    pub fn effective_login(&self, user_id: &str, role: UserRole) -> String {
+        match role {
+            UserRole::Default => self
+                .forges
+                .forgejo
+                .as_ref()
+                .and_then(|forgejo| forgejo.bot_username.as_deref())
+                .map(str::trim)
+                .filter(|login| !login.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| user_id.to_owned()),
+            UserRole::Reviewer => user_id.to_owned(),
+        }
+    }
+
+    /// Every effective bot login for the configured explicit users.
+    ///
+    /// Used to extend the policy's ignore set so no agent user reacts to
+    /// another one's comments.
+    pub fn effective_logins(&self) -> Vec<String> {
+        self.users
+            .iter()
+            .map(|(id, user)| self.effective_login(id, user.role))
+            .collect()
+    }
+
     /// Credentials exposed to agents for the given forge. A generic
     /// `FORGE_URL` / `FORGE_TOKEN` pair is always included so agents can be
     /// forge agnostic.
-    pub fn credentials_for(&self, forge: crate::location::ForgeKind) -> Vec<(String, String)> {
+    ///
+    /// `token` is the already resolved Forgejo/Gitea credential for this user.
+    /// `None` means no credential; inheritance is resolved by `UserRuntime`.
+    pub fn credentials_for(
+        &self,
+        forge: crate::location::ForgeKind,
+        token: Option<&str>,
+    ) -> Vec<(String, String)> {
         use crate::location::ForgeKind;
 
         let mut creds: Vec<(String, String)> = Vec::new();
@@ -162,9 +211,9 @@ impl Config {
             ForgeKind::Forgejo | ForgeKind::Gitea => {
                 if let Some(cfg) = &self.forges.forgejo {
                     creds.push(("FORGEJO_URL".into(), cfg.base_url.clone()));
-                    if let Some(token) = &cfg.token {
-                        creds.push(("FORGEJO_TOKEN".into(), token.clone()));
-                        creds.push(("GITEA_TOKEN".into(), token.clone()));
+                    if let Some(token) = token {
+                        creds.push(("FORGEJO_TOKEN".into(), token.to_owned()));
+                        creds.push(("GITEA_TOKEN".into(), token.to_owned()));
                     }
                 }
             }
@@ -188,7 +237,7 @@ impl Config {
             ForgeKind::Unknown => {}
         }
 
-        if let Some((url, token)) = self.generic_credentials(forge) {
+        if let Some((url, token)) = self.generic_credentials(forge, token) {
             creds.push(("FORGE_URL".into(), url));
             creds.push(("FORGE_TOKEN".into(), token));
         }
@@ -196,14 +245,18 @@ impl Config {
         creds
     }
 
-    fn generic_credentials(&self, forge: crate::location::ForgeKind) -> Option<(String, String)> {
+    fn generic_credentials(
+        &self,
+        forge: crate::location::ForgeKind,
+        token: Option<&str>,
+    ) -> Option<(String, String)> {
         use crate::location::ForgeKind;
         match forge {
             ForgeKind::Forgejo | ForgeKind::Gitea => self
                 .forges
                 .forgejo
                 .as_ref()
-                .and_then(|c| c.token.clone().map(|t| (c.base_url.clone(), t))),
+                .and_then(|c| token.map(|t| (c.base_url.clone(), t.to_owned()))),
             ForgeKind::GitHub => self
                 .forges
                 .github
@@ -217,6 +270,108 @@ impl Config {
             ForgeKind::Unknown => None,
         }
     }
+}
+
+/// Per-user identity configuration for explicit multi-user mode.
+///
+/// The table key is the stable persisted `user_id`; it also derives the
+/// Forgejo login of a non-default user. The real Linux account an agent runs
+/// as is a separate, required field ([`Self::host_user`]) so the logical
+/// identity never doubles as a privileged account name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserConfig {
+    /// Role of the user. Exactly one configured user must be the default.
+    pub role: UserRole,
+    /// Real, non-root Linux account the agent runs as.
+    pub host_user: String,
+    /// Optional registered adapter. When omitted the existing selection and
+    /// fallback rules apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Forge token used for this user's agent environment, gateway replies,
+    /// polling and workspace access. The default user falls back to the global
+    /// `[forgejo].token`; every other user must set its own so a `@reviewer`
+    /// run acts as that account instead of the default bot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Optional model ID for this user, applied to the spawned agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+}
+
+/// The role an explicit agent user plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserRole {
+    /// The one primary account. Automatic CI / conflict work targets it.
+    Default,
+    /// Additional accounts that can be addressed by their own login.
+    Reviewer,
+}
+
+impl UserConfig {
+    /// Check the naming and account rules that do not need the rest of the
+    /// configuration. `user_id` is the table key.
+    pub fn validate_name_and_account(&self, user_id: &str) -> Result<()> {
+        if !is_valid_user_identifier(user_id) {
+            return Err(BotError::Config(format!(
+                "user id `{user_id}` is invalid: expected ASCII [A-Za-z0-9][A-Za-z0-9_-]*"
+            )));
+        }
+        let account = self.host_user.trim();
+        if account.is_empty() {
+            return Err(BotError::Config(format!(
+                "user `{user_id}` has an empty host_user"
+            )));
+        }
+        if account == "root" || account == "0" {
+            return Err(BotError::Config(format!(
+                "user `{user_id}` must not run as root"
+            )));
+        }
+        if !is_valid_user_identifier(account) {
+            return Err(BotError::Config(format!(
+                "user `{user_id}` has an invalid host_user `{account}`"
+            )));
+        }
+        if let Some(agent) = &self.agent
+            && (agent.trim().is_empty() || !is_valid_user_identifier(agent))
+        {
+            return Err(BotError::Config(format!(
+                "user `{user_id}` has an invalid agent `{agent}`"
+            )));
+        }
+        if let Some(model) = &self.agent_model
+            && model.trim().is_empty()
+        {
+            return Err(BotError::Config(format!(
+                "user `{user_id}` has a blank agent_model"
+            )));
+        }
+        if let Some(token) = &self.token
+            && token.trim().is_empty()
+        {
+            return Err(BotError::Config(format!(
+                "user `{user_id}` has a blank token"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Whether `value` is a supported explicit identifier: an ASCII letter or
+/// digit followed by ASCII letters, digits, `_` or `-`.
+///
+/// This is a deliberately narrower subset than Forgejo's full naming grammar.
+/// Supporting only identifiers that are also safe path components keeps
+/// workspace and state namespaces unambiguous.
+pub fn is_valid_user_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Per-forge adapter configuration.
@@ -318,6 +473,9 @@ impl PolicyConfig {
 pub struct WorkspaceConfig {
     /// Clone the repository before invoking an agent.
     pub enabled: bool,
+    /// Checkout root for a run without a `host_user`; an explicit
+    /// `[users.*]` run ignores it and checks out directly in its `host_user`'s
+    /// home.
     pub root: PathBuf,
     /// Reuse a workspace for the same repository number across turns.
     pub reuse: bool,
@@ -349,6 +507,60 @@ impl WorkspaceConfig {
         if self.git_author_email.is_empty() {
             self.git_author_email = "forge-bot@localhost".to_owned();
         }
+    }
+}
+
+/// Process execution / account isolation.
+///
+/// The executor is the single choke point through which agent CLIs, the
+/// persistent `pi-rpc` pool, and workspace `git` commands are started. Every
+/// run belongs to a configured `[users.*].host_user`: the child is forked
+/// natively, moved into a per-run cgroup and dropped to that Linux account
+/// before `exec`, with no external helper. There is no single-account mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExecutorConfig {
+    /// cgroup v2 root under which per-user and per-run cgroups are created.
+    /// The gateway must be able to create directories here (root, or a
+    /// delegated subtree). Defaults to `/sys/fs/cgroup/forge-bot`.
+    pub cgroup_root: PathBuf,
+    /// `passwd` file used to resolve and validate `[users.*].host_user`.
+    /// Overridable so tests (and unusual host layouts) can supply a fixture.
+    pub passwd_file: PathBuf,
+    /// Internal test hook: run directly without cgroup isolation or a
+    /// privilege drop. It is never read from configuration; unit tests that
+    /// spawn fake CLIs without root set it. Production executors always have
+    /// a `host_user` and never set this.
+    #[serde(skip)]
+    pub(crate) direct: bool,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self {
+            cgroup_root: PathBuf::from("/sys/fs/cgroup/forge-bot"),
+            passwd_file: PathBuf::from("/etc/passwd"),
+            direct: false,
+        }
+    }
+}
+
+impl ExecutorConfig {
+    fn ensure_defaults(&mut self) {
+        if self.cgroup_root.as_os_str().is_empty() {
+            self.cgroup_root = PathBuf::from("/sys/fs/cgroup/forge-bot");
+        }
+        if self.passwd_file.as_os_str().is_empty() {
+            self.passwd_file = PathBuf::from("/etc/passwd");
+        }
+    }
+
+    /// Internal test hook: make the executor spawn directly without cgroup
+    /// isolation or a privilege drop, so integration tests can run fake CLIs
+    /// without root. Not for production use.
+    #[doc(hidden)]
+    pub fn set_direct_for_tests(&mut self) {
+        self.direct = true;
     }
 }
 
@@ -694,6 +906,64 @@ mod tests {
     }
 
     #[test]
+    fn parses_executor_section() {
+        let raw = r#"
+[executor]
+cgroup_root = "/sys/fs/cgroup/forge-bot"
+passwd_file = "/etc/passwd"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(
+            config.executor.cgroup_root,
+            PathBuf::from("/sys/fs/cgroup/forge-bot")
+        );
+        assert_eq!(config.executor.passwd_file, PathBuf::from("/etc/passwd"));
+
+        // The defaults point at the cgroup v2 root and `/etc/passwd`.
+        let default = Config::default().executor;
+        assert_eq!(
+            default.cgroup_root,
+            PathBuf::from("/sys/fs/cgroup/forge-bot")
+        );
+        assert_eq!(default.passwd_file, PathBuf::from("/etc/passwd"));
+    }
+
+    #[test]
+    fn parses_explicit_user_model() {
+        let raw = r#"
+[users.reviewer]
+role = "reviewer"
+host_user = "reviewer"
+agent_model = "gpt-fast"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(
+            config.users.get("reviewer").unwrap().agent_model.as_deref(),
+            Some("gpt-fast")
+        );
+    }
+
+    #[test]
+    fn effective_logins_follow_the_derivation_rules() {
+        let raw = r#"
+[forgejo]
+bot_username = "legacy-bot"
+
+[users.primary]
+role = "default"
+host_user = "agent"
+
+[users.reviewer]
+role = "reviewer"
+host_user = "reviewer"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        let mut logins = config.effective_logins();
+        logins.sort();
+        assert_eq!(logins, vec!["legacy-bot".to_owned(), "reviewer".to_owned()]);
+    }
+
+    #[test]
     fn session_retention_is_configurable() {
         let config: Config = toml::from_str("[session]\nretention_secs = 120\n").unwrap();
         assert_eq!(config.session.retention_secs, 120);
@@ -874,7 +1144,7 @@ markers = ["overloaded"]
             token: Some("ft".into()),
             ..Default::default()
         });
-        let creds = config.credentials_for(crate::location::ForgeKind::Forgejo);
+        let creds = config.credentials_for(crate::location::ForgeKind::Forgejo, Some("ft"));
         assert!(creds.contains(&("FORGEJO_URL".into(), "http://forge.example.com".into())));
         assert!(creds.contains(&("FORGEJO_TOKEN".into(), "ft".into())));
         assert!(creds.contains(&("GITEA_TOKEN".into(), "ft".into())));
@@ -886,7 +1156,7 @@ markers = ["overloaded"]
             token: Some("gt".into()),
             ..Default::default()
         });
-        let creds = config.credentials_for(crate::location::ForgeKind::GitHub);
+        let creds = config.credentials_for(crate::location::ForgeKind::GitHub, None);
         assert!(creds.contains(&("GITHUB_URL".into(), "http://gh.example.com".into())));
         assert!(creds.contains(&("GITHUB_TOKEN".into(), "gt".into())));
         assert!(creds.contains(&("GH_TOKEN".into(), "gt".into())));
@@ -897,7 +1167,7 @@ markers = ["overloaded"]
             token: Some("lt".into()),
             ..Default::default()
         });
-        let creds = config.credentials_for(crate::location::ForgeKind::GitLab);
+        let creds = config.credentials_for(crate::location::ForgeKind::GitLab, None);
         assert!(creds.contains(&("GITLAB_URL".into(), "http://gl.example.com".into())));
         assert!(creds.contains(&("GITLAB_TOKEN".into(), "lt".into())));
         assert!(creds.contains(&("FORGE_TOKEN".into(), "lt".into())));
@@ -905,9 +1175,36 @@ markers = ["overloaded"]
         // An unknown forge exposes no credentials at all.
         assert!(
             config
-                .credentials_for(crate::location::ForgeKind::Unknown)
+                .credentials_for(crate::location::ForgeKind::Unknown, None)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn per_user_token_overrides_the_global_forgejo_token() {
+        let mut config = Config::default();
+        config.forges.forgejo = Some(ForgejoConfig {
+            base_url: "http://forge.example.com".into(),
+            token: Some("global".into()),
+            ..Default::default()
+        });
+        // A tokenless reviewer must not inherit global credentials.
+        let none = config.credentials_for(crate::location::ForgeKind::Forgejo, None);
+        assert!(
+            !none
+                .iter()
+                .any(|(key, value)| key.ends_with("TOKEN") || value == "global")
+        );
+        // Default inheritance must be resolved by the caller.
+        let global = config.credentials_for(crate::location::ForgeKind::Forgejo, Some("global"));
+        assert!(global.contains(&("FORGEJO_TOKEN".into(), "global".into())));
+        // A user token wins and the global value never leaks in.
+        let reviewer =
+            config.credentials_for(crate::location::ForgeKind::Forgejo, Some("reviewer-token"));
+        assert!(reviewer.contains(&("FORGEJO_TOKEN".into(), "reviewer-token".into())));
+        assert!(reviewer.contains(&("GITEA_TOKEN".into(), "reviewer-token".into())));
+        assert!(!reviewer.iter().any(|(_, value)| value == "global"));
+        assert!(reviewer.contains(&("FORGE_TOKEN".into(), "reviewer-token".into())));
     }
 
     #[test]
@@ -918,7 +1215,7 @@ markers = ["overloaded"]
             token: None,
             ..Default::default()
         });
-        let creds = config.credentials_for(crate::location::ForgeKind::Gitea);
+        let creds = config.credentials_for(crate::location::ForgeKind::Gitea, None);
         assert!(creds.contains(&("FORGEJO_URL".into(), "http://forge.example.com".into())));
         assert!(!creds.iter().any(|(key, _)| key == "FORGE_TOKEN"));
     }

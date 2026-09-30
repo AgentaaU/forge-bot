@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::process::{Child, ChildStdout};
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
@@ -33,6 +33,7 @@ use crate::agent::{
 };
 use crate::config::PiRpcConfig;
 use crate::error::{BotError, Result};
+use crate::executor::{ExecSpec, Prepared};
 
 /// Environment variables from the caller (an AaaU session, an interactive
 /// shell, ...) that must not leak into a managed agent.
@@ -49,7 +50,11 @@ const SCRUBBED_ENV: &[&str] = &[
 /// `session_id` is only used when sessions are persisted (`no_session =
 /// false`), so an evicted process resumes its conversation from disk. With
 /// `no_session = true` the process is explicitly ephemeral.
-fn rpc_arguments(config: &PiRpcConfig, session_id: Option<&str>) -> Vec<String> {
+fn rpc_arguments(
+    config: &PiRpcConfig,
+    session_id: Option<&str>,
+    model: Option<&str>,
+) -> Vec<String> {
     let mut args = vec!["--mode".to_owned(), "rpc".to_owned()];
     if config.approve {
         args.push("--approve".to_owned());
@@ -61,6 +66,13 @@ fn rpc_arguments(config: &PiRpcConfig, session_id: Option<&str>) -> Vec<String> 
         args.push(session_id.to_owned());
     }
     args.extend(config.args.iter().cloned());
+    // A per-user model is appended unless the operator already set one.
+    if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty())
+        && crate::agent::command::model_arg(&args, false).is_none()
+    {
+        args.push("--model".to_owned());
+        args.push(model.to_owned());
+    }
     args
 }
 
@@ -71,6 +83,9 @@ pub struct PiRpcClient {
     lines: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     workspace: PathBuf,
+    /// Guard that kills the run's cgroup when this client is dropped or
+    /// killed. `None` for the test-only direct executor.
+    _cgroup: Option<crate::executor::CgroupGuard>,
 }
 
 /// A cloneable handle for injecting commands into a live `pi --mode rpc`
@@ -124,17 +139,32 @@ impl PiRpcClient {
         workspace: &Path,
         credentials: &[(String, String)],
         session_id: Option<&str>,
+        executor: &crate::executor::Executor,
+        host_user: Option<&str>,
+        model: Option<&str>,
     ) -> Result<Self> {
-        let mut cmd = Command::new(&config.command);
-        cmd.args(rpc_arguments(config, session_id));
-        cmd.envs(config.env.clone());
-        cmd.envs(credentials.iter().cloned());
+        let mut env: Vec<(String, String)> = config
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        env.extend(credentials.iter().cloned());
+        let spec = ExecSpec {
+            program: config.command.clone(),
+            args: rpc_arguments(config, session_id, model),
+            env,
+            cwd: (!workspace.as_os_str().is_empty()).then(|| workspace.to_path_buf()),
+            host_user: host_user.map(str::to_owned),
+        };
+        let Prepared {
+            command: mut cmd,
+            cgroup,
+        } = executor.command(&spec).map_err(|error| BotError::Agent {
+            name: "pi-rpc".into(),
+            reason: error.to_string(),
+        })?;
         for key in SCRUBBED_ENV {
             cmd.env_remove(key);
-        }
-
-        if !workspace.as_os_str().is_empty() {
-            cmd.current_dir(workspace);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -180,6 +210,7 @@ impl PiRpcClient {
             lines: BufReader::new(stdout).lines(),
             next_id: 1,
             workspace: workspace.to_path_buf(),
+            _cgroup: cgroup,
         })
     }
 
@@ -400,6 +431,12 @@ struct PoolEntry {
     key: String,
     pid: Option<u32>,
     workspace: PathBuf,
+    /// Linux account this process runs as, so a process spawned for one user
+    /// is never reused for another.
+    host_user: Option<String>,
+    /// Model this process was started with, so a differently configured
+    /// process is never reused.
+    model: Option<String>,
     client: Option<PiRpcClient>,
     /// Writer for the live process. Kept on the entry while `client` is
     /// checked out by a run in flight, so a follow-up can be injected without
@@ -476,6 +513,9 @@ impl PoolInner {
         key: &str,
         workspace: &Path,
         credentials: &[(String, String)],
+        executor: &crate::executor::Executor,
+        host_user: Option<&str>,
+        model: Option<&str>,
     ) -> Result<PoolGuard> {
         let deadline = (self.config.timeout_secs != 0)
             .then(|| Instant::now() + Duration::from_secs(self.config.timeout_secs));
@@ -497,6 +537,8 @@ impl PoolInner {
                     .position(|entry| {
                         Some(entry.id) == preferred
                             && entry.workspace == workspace
+                            && entry.host_user.as_deref() == host_user
+                            && entry.model.as_deref() == model
                             && !entry.busy
                             && entry.client.is_some()
                     })
@@ -508,7 +550,11 @@ impl PoolInner {
                             return None;
                         }
                         state.agents.iter().position(|entry| {
-                            entry.workspace == workspace && !entry.busy && entry.client.is_some()
+                            entry.workspace == workspace
+                                && entry.host_user.as_deref() == host_user
+                                && entry.model.as_deref() == model
+                                && !entry.busy
+                                && entry.client.is_some()
                         })
                     });
                 if let Some(index) = idle {
@@ -549,6 +595,9 @@ impl PoolInner {
                         workspace,
                         credentials,
                         session_id.as_deref(),
+                        executor,
+                        host_user,
+                        model,
                     )?;
                     let pid = client.pid();
                     let writer = Some(client.writer());
@@ -557,6 +606,8 @@ impl PoolInner {
                         key: key.to_owned(),
                         pid,
                         workspace: workspace.to_path_buf(),
+                        host_user: host_user.map(str::to_owned),
+                        model: model.map(str::to_owned),
                         client: None,
                         writer,
                         busy: true,
@@ -707,7 +758,14 @@ impl Agent for PiPoolAgent {
 
         let mut guard = self
             .inner
-            .acquire(&key, &context.workspace, &context.credentials)
+            .acquire(
+                &key,
+                &context.workspace,
+                &context.credentials,
+                context.executor.as_ref(),
+                context.host_user.as_deref(),
+                context.model.as_deref(),
+            )
             .await?;
         let prompt = build_prompt(request, context);
         let timeout = (self.inner.config.timeout_secs != 0)
@@ -798,7 +856,7 @@ mod tests {
             no_session: false,
             ..Default::default()
         };
-        let args = rpc_arguments(&config, Some("session-123"));
+        let args = rpc_arguments(&config, Some("session-123"), None);
         assert_eq!(&args[..2], ["--mode", "rpc"]);
         assert!(args.contains(&"--approve".to_owned()));
         assert!(args.contains(&"--session-id".to_owned()));
@@ -807,12 +865,28 @@ mod tests {
     }
 
     #[test]
+    fn rpc_arguments_apply_a_per_user_model() {
+        let config = PiRpcConfig::default();
+        let args = rpc_arguments(&config, None, Some("gpt-fast"));
+        assert!(args.windows(2).any(|w| w == ["--model", "gpt-fast"]));
+
+        // An operator-configured model wins.
+        let config = PiRpcConfig {
+            args: vec!["--model".into(), "operator".into()],
+            ..Default::default()
+        };
+        let args = rpc_arguments(&config, None, Some("gpt-fast"));
+        assert!(!args.contains(&"gpt-fast".to_owned()));
+        assert!(args.contains(&"operator".to_owned()));
+    }
+
+    #[test]
     fn rpc_arguments_are_ephemeral_when_sessions_are_disabled() {
         let config = PiRpcConfig {
             no_session: true,
             ..Default::default()
         };
-        let args = rpc_arguments(&config, Some("session-123"));
+        let args = rpc_arguments(&config, Some("session-123"), None);
         assert!(args.contains(&"--no-session".to_owned()));
         assert!(!args.iter().any(|arg| arg == "--session-id"));
     }
@@ -864,6 +938,8 @@ mod tests {
             key: "dead".into(),
             pid: None,
             workspace: PathBuf::from("/tmp"),
+            host_user: None,
+            model: None,
             client: None,
             writer: None,
             busy: false,
@@ -874,6 +950,8 @@ mod tests {
             key: "busy".into(),
             pid: None,
             workspace: PathBuf::from("/tmp"),
+            host_user: None,
+            model: None,
             client: None,
             writer: None,
             busy: true,
@@ -894,6 +972,8 @@ mod tests {
             key: "live".into(),
             pid: None,
             workspace: PathBuf::from("/tmp"),
+            host_user: None,
+            model: None,
             client: None,
             writer: None,
             busy: true,
@@ -1004,7 +1084,18 @@ mod tests {
         config.env.insert("FAKE_PI_DELAY".into(), "1".into());
         let agent = Arc::new(PiPoolAgent::new(&config, store(), 1));
         let workspace = dir.path();
-        let first = agent.inner.acquire("first", workspace, &[]).await.unwrap();
+        let first = agent
+            .inner
+            .acquire(
+                "first",
+                workspace,
+                &[],
+                &crate::executor::Executor::direct(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let first_id = first.id;
 
         let waiting_agent = Arc::clone(&agent);
@@ -1012,7 +1103,14 @@ mod tests {
         let waiter = tokio::spawn(async move {
             waiting_agent
                 .inner
-                .acquire("second", &waiting_workspace, &[])
+                .acquire(
+                    "second",
+                    &waiting_workspace,
+                    &[],
+                    &crate::executor::Executor::direct(),
+                    None,
+                    None,
+                )
                 .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1044,12 +1142,45 @@ mod tests {
         };
         let agent = PiPoolAgent::new(&config, store(), 3);
         let workspace = dir.path();
-        let bound = agent.inner.acquire("thread", workspace, &[]).await.unwrap();
-        let other = agent.inner.acquire("other", workspace, &[]).await.unwrap();
+        let bound = agent
+            .inner
+            .acquire(
+                "thread",
+                workspace,
+                &[],
+                &crate::executor::Executor::direct(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let other = agent
+            .inner
+            .acquire(
+                "other",
+                workspace,
+                &[],
+                &crate::executor::Executor::direct(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let other_id = other.id;
         drop(other);
 
-        let reused = agent.inner.acquire("thread", workspace, &[]).await.unwrap();
+        let reused = agent
+            .inner
+            .acquire(
+                "thread",
+                workspace,
+                &[],
+                &crate::executor::Executor::direct(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(reused.id, other_id);
         assert_eq!(agent.live_agents(), 2);
         assert_eq!(agent.conversation_binding("thread"), Some(other_id));
@@ -1068,13 +1199,35 @@ mod tests {
         let agent = PiPoolAgent::new(&config, store(), 3);
         let workspace = dir.path();
 
-        let first = agent.inner.acquire("first", workspace, &[]).await.unwrap();
+        let first = agent
+            .inner
+            .acquire(
+                "first",
+                workspace,
+                &[],
+                &crate::executor::Executor::direct(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let first_id = first.id;
         drop(first);
 
         // The process bound to `first` is idle, but a different conversation
         // must not inherit its session: a new process is spawned instead.
-        let second = agent.inner.acquire("second", workspace, &[]).await.unwrap();
+        let second = agent
+            .inner
+            .acquire(
+                "second",
+                workspace,
+                &[],
+                &crate::executor::Executor::direct(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         assert_ne!(second.id, first_id);
         assert_eq!(agent.live_agents(), 2);
         assert_eq!(agent.conversation_binding("first"), Some(first_id));
@@ -1092,13 +1245,35 @@ mod tests {
         let agent = PiPoolAgent::new(&config, store(), 3);
         let workspace = dir.path();
 
-        let first = agent.inner.acquire("thread", workspace, &[]).await.unwrap();
+        let first = agent
+            .inner
+            .acquire(
+                "thread",
+                workspace,
+                &[],
+                &crate::executor::Executor::direct(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let first_id = first.id;
         drop(first);
 
         // The same conversation always comes back to its own process, so its
         // session stays warm.
-        let again = agent.inner.acquire("thread", workspace, &[]).await.unwrap();
+        let again = agent
+            .inner
+            .acquire(
+                "thread",
+                workspace,
+                &[],
+                &crate::executor::Executor::direct(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(again.id, first_id);
         assert_eq!(agent.live_agents(), 1);
     }
@@ -1117,7 +1292,14 @@ mod tests {
         std::fs::create_dir(&second_workspace).unwrap();
         let first = agent
             .inner
-            .acquire("first", first_workspace, &[])
+            .acquire(
+                "first",
+                first_workspace,
+                &[],
+                &crate::executor::Executor::direct(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let first_id = first.id;
@@ -1125,7 +1307,14 @@ mod tests {
 
         let second = agent
             .inner
-            .acquire("second", &second_workspace, &[])
+            .acquire(
+                "second",
+                &second_workspace,
+                &[],
+                &crate::executor::Executor::direct(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_ne!(second.id, first_id);

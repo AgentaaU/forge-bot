@@ -57,15 +57,30 @@ pub trait ForgeApi: Send + Sync {
 pub struct HttpForgeApi {
     client: reqwest::Client,
     config: Config,
+    /// Effective Forgejo/Gitea token for this client. It is set from the
+    /// addressed user's own token, so one user never replies with another's
+    /// credential.
+    forgejo_token: Option<String>,
 }
 
 impl HttpForgeApi {
     pub fn new(config: Config) -> Result<Self> {
+        let token = config.forges.forgejo.as_ref().and_then(|c| c.token.clone());
+        Self::with_forgejo_token(config, token)
+    }
+
+    /// Build a client that uses `token` for Forgejo/Gitea requests instead of
+    /// the global token.
+    pub fn with_forgejo_token(config: Config, token: Option<String>) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(concat!("forge-bot/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            forgejo_token: token,
+        })
     }
 
     /// Replace the body of a Forgejo issue comment.
@@ -92,7 +107,7 @@ impl HttpForgeApi {
             .client
             .patch(&url)
             .json(&serde_json::json!({ "body": body }));
-        if let Some(token) = &cfg.token {
+        if let Some(token) = &self.forgejo_token {
             req = req.header("Authorization", format!("token {token}"));
         }
         send(req).await
@@ -120,7 +135,7 @@ impl HttpForgeApi {
             .client
             .post(&url)
             .json(&serde_json::json!({ "body": body }));
-        if let Some(token) = &cfg.token {
+        if let Some(token) = &self.forgejo_token {
             req = req.header("Authorization", format!("token {token}"));
         }
         let response = req.send().await?;
@@ -157,7 +172,7 @@ impl HttpForgeApi {
             .client
             .post(&url)
             .json(&serde_json::json!({ "body": body }));
-        if let Some(token) = &cfg.token {
+        if let Some(token) = &self.forgejo_token {
             req = req.header("Authorization", format!("token {token}"));
         }
         send(req).await
@@ -220,7 +235,7 @@ impl HttpForgeApi {
             "old_position": old_position,
             "extra_lines_count": target.extra_lines_count,
         }));
-        if let Some(token) = &cfg.token {
+        if let Some(token) = &self.forgejo_token {
             req = req.header("Authorization", format!("token {token}"));
         }
         let response = req.send().await?;

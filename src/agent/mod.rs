@@ -64,6 +64,16 @@ pub struct AgentContext {
     pub live_output: Option<LiveOutput>,
     /// Shared with the status page while this run is active.
     pub reported_model: Arc<Mutex<Option<String>>>,
+    /// Launches this run's child process (cgroup executor).
+    pub executor: Arc<crate::executor::Executor>,
+    /// Linux account the agent runs as. Always set in production; only a
+    /// test-only direct executor leaves it empty.
+    pub host_user: Option<String>,
+    /// Stable user id this run belongs to. It namespaces workspaces, sessions
+    /// and replies.
+    pub user_id: Option<String>,
+    /// Model ID to pass to the agent, from the addressed user's `agent_model`.
+    pub model: Option<String>,
 }
 
 /// Bounded output buffer for a run in progress. It is never persisted.
@@ -131,30 +141,36 @@ impl AgentContext {
 /// references one, so both threads share a routing key and backend session. This
 /// is internal routing data and is deliberately never rendered into a prompt.
 pub fn conversation_key(context: &AgentContext) -> String {
-    if context.repository.is_empty() {
-        return context.workspace.to_string_lossy().into_owned();
-    }
-    // A pull request folds onto the issue it closes. When that issue is in
-    // another repository, use its owner/repo so the two threads share a key.
-    let (repository, number) = if context.is_pull_request {
-        match &context.linked_issue {
-            Some(linked) => (
-                linked.repository.as_deref().unwrap_or(&context.repository),
-                Some(linked.number),
-            ),
-            None => (context.repository.as_str(), context.issue_number),
-        }
+    let base = if context.repository.is_empty() {
+        context.workspace.to_string_lossy().into_owned()
     } else {
-        (context.repository.as_str(), context.issue_number)
+        // A pull request folds onto the issue it closes. When that issue is in
+        // another repository, use its owner/repo so the two threads share a key.
+        let (repository, number) = if context.is_pull_request {
+            match &context.linked_issue {
+                Some(linked) => (
+                    linked.repository.as_deref().unwrap_or(&context.repository),
+                    Some(linked.number),
+                ),
+                None => (context.repository.as_str(), context.issue_number),
+            }
+        } else {
+            (context.repository.as_str(), context.issue_number)
+        };
+        match context.forge {
+            Some(forge) => format!(
+                "{}:{}:{}",
+                forge.as_str(),
+                repository,
+                number.unwrap_or_default()
+            ),
+            None => format!("{repository}:{}", number.unwrap_or_default()),
+        }
     };
-    match context.forge {
-        Some(forge) => format!(
-            "{}:{}:{}",
-            forge.as_str(),
-            repository,
-            number.unwrap_or_default()
-        ),
-        None => format!("{repository}:{}", number.unwrap_or_default()),
+    // Every user gets its own key so two accounts never share a session.
+    match &context.user_id {
+        Some(user) => format!("user:{user}:{base}"),
+        None => base,
     }
 }
 
@@ -286,6 +302,10 @@ mod tests {
             credentials: vec![("FORGEJO_TOKEN".into(), "secret".into())],
             live_output: None,
             reported_model: Default::default(),
+            executor: Default::default(),
+            host_user: None,
+            user_id: None,
+            model: None,
         };
         let env = ctx.environment(&request);
         assert!(

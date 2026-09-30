@@ -22,9 +22,11 @@ use crate::agent::{
 use crate::auto_trigger::AUTO_TRIGGER_AUTHOR;
 use crate::config::Config;
 use crate::error::{BotError, Result};
+use crate::executor::Executor;
 use crate::forge::ForgeMessage;
-use crate::forge_api::ForgeApi;
-use crate::mention::Mention;
+use crate::forge_api::{ForgeApi, HttpForgeApi};
+use crate::identity::Identities;
+use crate::mention::{Mention, extract_mention};
 use crate::policy::Policy;
 use crate::session::status::{self, ThreadStatus};
 use crate::session::{Job, SessionStore};
@@ -42,6 +44,13 @@ struct Inner {
     api: Arc<dyn ForgeApi>,
     workspaces: WorkspaceManager,
     policy: Policy,
+    /// Resolved user identities. At least one `[users.*]` table is required.
+    identities: Arc<Identities>,
+    /// Launches agents, the Pi pool, and workspace git under the right account.
+    executor: Arc<Executor>,
+    /// Per-user Forgejo API clients, keyed by user id, so a reply uses the
+    /// addressed account's token.
+    user_apis: HashMap<String, Arc<dyn ForgeApi>>,
     tx: mpsc::Sender<Job>,
     /// Conversation key -> agent currently running for it, so a follow-up can
     /// be delivered into the live run instead of queueing a second one.
@@ -97,13 +106,48 @@ impl Dispatcher {
         let capacity = config.session.queue_capacity.max(1);
         let (tx, rx) = mpsc::channel(capacity);
 
+        // Resolve identities before the pool starts so an invalid `[users.*]`
+        // configuration fails fast instead of accepting webhooks it cannot
+        // route.
+        let identities = Arc::new(Identities::resolve(&config, &agents.names())?);
+
+        // Build the executor and validate every host account before serving.
+        // A systemd deployment with an unknown/root host_user is rejected here
+        // rather than at the first mention.
+        let executor = Arc::new(Executor::from_config(&config.executor)?);
+        executor.validate_users(&identities)?;
+
+        // One API client per configured user so gateway replies use that
+        // user's own token. A user without a token (only the default may
+        // inherit the global token) gets an unauthenticated client. A direct
+        // (test) executor keeps the injected `api` for every user so tests can
+        // record replies.
+        let mut user_apis: HashMap<String, Arc<dyn ForgeApi>> = HashMap::new();
+        if !config.executor.direct {
+            let global_token = config
+                .forges
+                .forgejo
+                .as_ref()
+                .and_then(|forgejo| forgejo.token.clone());
+            for user in identities.users() {
+                let token = user
+                    .effective_token(global_token.as_deref())
+                    .map(str::to_owned);
+                let api = HttpForgeApi::with_forgejo_token((*config).clone(), token)?;
+                user_apis.insert(user.id.clone(), Arc::new(api));
+            }
+        }
+
         let inner = Arc::new(Inner {
-            workspaces: WorkspaceManager::new(&config.workspace),
+            workspaces: WorkspaceManager::new(&config.workspace, executor.clone()),
             config: config.clone(),
             agents,
             sessions,
             api,
             policy,
+            identities,
+            executor,
+            user_apis,
             tx,
             running: Mutex::new(HashMap::new()),
         });
@@ -174,22 +218,25 @@ impl Dispatcher {
         // A typo in `--agent=` is a caller error, not something to swallow, so
         // report it in the thread with the registered names.
         let resolved = self.inner.agents.get(agent_name);
+        let user = self.inner.recipient_for(&message);
+        let user_id = Some(user.id.clone());
         if let Err(BotError::UnknownAgent(name)) = &resolved {
             let body = unknown_agent_message(name, &self.inner.agents.names());
-            self.inner.reply(&message, &body).await;
+            self.inner.reply(&message, &body, user_id.as_deref()).await;
         }
         resolved?;
 
         // A mention that lands while its conversation is busy will wait for the
         // run already in flight instead of starting, so say that rather than
         // claiming the agent is running.
-        let key = SessionStore::key(&message);
+        let key = SessionStore::key(&message, user_id.as_deref());
         let waiting = self.inner.thread_is_busy(&key);
         let mut job = Job {
             id: Uuid::new_v4(),
             message,
             mention,
             agent: agent_name.to_owned(),
+            user_id,
             created_at: Utc::now(),
             status_comment: None,
             waiting,
@@ -208,7 +255,10 @@ impl Dispatcher {
             } else {
                 running_headline(&job.message, &job.agent)
             };
-            job.status_comment = self.inner.reply_tracked(&job.message, &ack).await;
+            job.status_comment = self
+                .inner
+                .reply_tracked(&job.message, &ack, job.user_id.as_deref())
+                .await;
         }
 
         self.inner.sessions.save_job(&job)?;
@@ -225,6 +275,43 @@ impl Dispatcher {
     /// Access to the policy (used by tests and the HTTP layer).
     pub fn policy(&self) -> &Policy {
         &self.inner.policy
+    }
+
+    /// The resolved user identities.
+    pub fn identities(&self) -> &Identities {
+        &self.inner.identities
+    }
+    /// Resolve the mention and adapter for a message.
+    ///
+    /// A configured user is addressed by its derived login; the adapter
+    /// precedence is `--agent` → user `agent` → registry default.
+    ///
+    /// Returns `Ok(None)` when the message does not address a configured user.
+    /// A comment that addresses more than one configured user is rejected
+    /// rather than routed arbitrarily.
+    pub fn route(&self, message: &ForgeMessage) -> Result<Option<(Mention, String)>> {
+        let matches = self.inner.identities.matching_users(&message.body);
+        let recipient = match matches.as_slice() {
+            [] => return Ok(None),
+            [only] => *only,
+            many => {
+                let logins: Vec<&str> = many.iter().map(|user| user.login.as_str()).collect();
+                return Err(BotError::Unauthorized(format!(
+                    "comment addresses multiple agent users: {}",
+                    logins.join(", ")
+                )));
+            }
+        };
+        let Some(mention) = extract_mention(&message.body, &recipient.trigger()) else {
+            return Ok(None);
+        };
+        let agent = mention
+            .agent
+            .clone()
+            .filter(|name| !name.is_empty())
+            .or_else(|| recipient.agent.clone())
+            .unwrap_or_else(|| self.inner.agents.default_name().to_owned());
+        Ok(Some((mention, agent)))
     }
 
     /// The agent selected for mentions without an explicit adapter name.
@@ -411,6 +498,39 @@ impl Drop for DoneGuard {
 }
 
 impl Inner {
+    /// API client for `user_id`. Callers that must not fall back resolve the
+    /// user first; `user_apis` is populated for every configured user.
+    fn api_for(&self, user_id: Option<&str>) -> &Arc<dyn ForgeApi> {
+        user_id
+            .and_then(|id| self.user_apis.get(id))
+            .unwrap_or(&self.api)
+    }
+
+    /// User a message is addressed to, or the default user for an automatic
+    /// trigger without a mention.
+    fn recipient_for(&self, message: &ForgeMessage) -> Arc<crate::identity::UserRuntime> {
+        self.identities
+            .recipient(&message.body)
+            .ok()
+            .cloned()
+            .unwrap_or_else(|| self.identities.default_user().clone())
+    }
+
+    /// Resolve a persisted job's user, refusing to substitute another account
+    /// when the configuration changed or the job predates per-user identity.
+    fn user_for(&self, user_id: Option<&str>) -> Result<Arc<crate::identity::UserRuntime>> {
+        let id = user_id.ok_or_else(|| {
+            BotError::Config(
+                "job has no user id; forge-bot no longer supports a single implicit account".into(),
+            )
+        })?;
+        self.identities.get(id).cloned().ok_or_else(|| {
+            BotError::Config(format!(
+                "job references unknown user `{id}`; refusing to run it as another account"
+            ))
+        })
+    }
+
     /// Whether `key` already has a run in flight or a mention waiting in the
     /// queue. `submit` uses this to acknowledge a queued mention honestly
     /// instead of claiming the agent is already running.
@@ -497,16 +617,41 @@ impl Inner {
         match &job.status_comment {
             Some(id) => {
                 let body = format!("forge-bot: {notice}");
-                if let Err(error) = self.api.update_reply(&job.message, id, &body).await {
+                if let Err(error) = self
+                    .api_for(job.user_id.as_deref())
+                    .update_reply(&job.message, id, &body)
+                    .await
+                {
                     tracing::warn!(%error, "failed to update the merged follow-up status");
                 }
             }
-            None => self.reply(&job.message, &notice).await,
+            None => {
+                self.reply(&job.message, &notice, job.user_id.as_deref())
+                    .await
+            }
         }
     }
 
     async fn handle(&self, job: Job) {
         let key = job.session_key();
+        let user_id = job.user_id.clone();
+
+        // Resolve the persisted identity before doing any work. A job whose
+        // user disappeared from the configuration must not silently run as
+        // another account.
+        let user = match self.user_for(user_id.as_deref()) {
+            Ok(user) => user,
+            Err(error) => {
+                self.finish(
+                    &key,
+                    &job,
+                    &job.agent,
+                    &AgentOutcome::failure(error.to_string(), Default::default()),
+                )
+                .await;
+                return;
+            }
+        };
 
         // The acknowledgement and every fallback notice share one status
         // comment. When `submit` tracked the acknowledgement we edit it in
@@ -523,21 +668,61 @@ impl Inner {
             && self.config.reply.ack
             && let Some(id) = &job.status_comment
         {
-            self.sync_status(&job.message, id, &running_agent, &notices)
-                .await;
+            self.sync_status(
+                &job.message,
+                id,
+                &running_agent,
+                &notices,
+                user_id.as_deref(),
+            )
+            .await;
         }
 
         if let Err(error) = self.sessions.begin(&job) {
             tracing::warn!(%error, "failed to persist session start");
         }
 
-        let credentials = self.config.credentials_for(job.message.forge);
-        let workspace = match self.workspaces.prepare(&job.message, &credentials).await {
+        // The addressed user's own token, with the default user inheriting the
+        // global token. A non-default user never falls back to the global
+        // token, so a `@reviewer` run replies as the reviewer.
+        let global_token = self
+            .config
+            .forges
+            .forgejo
+            .as_ref()
+            .and_then(|forgejo| forgejo.token.as_deref());
+        let token = user.effective_token(global_token).map(str::to_owned);
+        let credentials = self
+            .config
+            .credentials_for(job.message.forge, token.as_deref());
+        let host_user = (!user.host_user.is_empty()).then(|| user.host_user.clone());
+        // A user's model belongs to its configured adapter (or the registry
+        // default when omitted). Provider-specific IDs must not be injected
+        // into explicit alternate adapters or automatic fallbacks.
+        let model_agent = user
+            .agent
+            .as_deref()
+            .unwrap_or_else(|| self.agents.default_name());
+        let workspace = match self
+            .workspaces
+            .prepare(
+                &job.message,
+                &credentials,
+                host_user.as_deref(),
+                user_id.as_deref(),
+            )
+            .await
+        {
             Ok(workspace) => workspace,
             Err(error) => {
                 if job.status_comment.is_none() {
-                    self.flush_status(&job.message, &running_agent, &mut notices)
-                        .await;
+                    self.flush_status(
+                        &job.message,
+                        &running_agent,
+                        &mut notices,
+                        user_id.as_deref(),
+                    )
+                    .await;
                 }
                 self.finish(
                     &key,
@@ -553,8 +738,13 @@ impl Inner {
         // Resolve eagerly so an unknown agent fails before we run anything.
         if let Err(error) = self.agents.get(&job.agent) {
             if job.status_comment.is_none() {
-                self.flush_status(&job.message, &running_agent, &mut notices)
-                    .await;
+                self.flush_status(
+                    &job.message,
+                    &running_agent,
+                    &mut notices,
+                    user_id.as_deref(),
+                )
+                .await;
             }
             self.finish(
                 &key,
@@ -570,7 +760,7 @@ impl Inner {
             location: job.message.location.clone(),
             message: job.mention.message_or_default().to_owned(),
         };
-        let context = AgentContext {
+        let mut context = AgentContext {
             workspace,
             forge: Some(job.message.forge),
             repository: job.message.repository.clone(),
@@ -583,6 +773,10 @@ impl Inner {
             credentials,
             live_output: self.sessions.live_output(job.id),
             reported_model: Default::default(),
+            executor: self.executor.clone(),
+            host_user,
+            user_id: user_id.clone(),
+            model: None,
         };
 
         // The requested agent first, then every other available agent. The
@@ -601,6 +795,9 @@ impl Inner {
         let mut previous_reason: Option<UnavailableReason> = None;
 
         for (index, name) in candidates.iter().enumerate() {
+            context.model = (name == model_agent)
+                .then(|| user.agent_model.clone())
+                .flatten();
             used_agent = name.clone();
             running_agent = name.clone();
             *context.reported_model.lock().expect("model mutex poisoned") = None;
@@ -630,8 +827,14 @@ impl Inner {
                 // instead of posting another one. `running_agent` is the
                 // candidate about to run, so the headline names it.
                 if let Some(id) = &job.status_comment {
-                    self.sync_status(&job.message, id, &running_agent, &notices)
-                        .await;
+                    self.sync_status(
+                        &job.message,
+                        id,
+                        &running_agent,
+                        &notices,
+                        job.user_id.as_deref(),
+                    )
+                    .await;
                 }
             }
 
@@ -717,8 +920,13 @@ impl Inner {
         // Post the buffered acknowledgement and fallback notices together when
         // the forge could not track the comment for in-place edits.
         if job.status_comment.is_none() {
-            self.flush_status(&job.message, &running_agent, &mut notices)
-                .await;
+            self.flush_status(
+                &job.message,
+                &running_agent,
+                &mut notices,
+                job.user_id.as_deref(),
+            )
+            .await;
         }
 
         let Some(outcome) = last_outcome else {
@@ -801,9 +1009,14 @@ impl Inner {
         comment_id: &str,
         agent: &str,
         notices: &[String],
+        user_id: Option<&str>,
     ) {
         let body = format!("forge-bot: {}", status_body(message, agent, notices));
-        if let Err(error) = self.api.update_reply(message, comment_id, &body).await {
+        if let Err(error) = self
+            .api_for(user_id)
+            .update_reply(message, comment_id, &body)
+            .await
+        {
             tracing::warn!(
                 location = %message.location,
                 %error,
@@ -819,13 +1032,19 @@ impl Inner {
     /// in `notices` are joined so a fallback is one comment instead of one per
     /// step (issue #77). The buffer is cleared so later callers (for example
     /// the result reply) do not repeat it.
-    async fn flush_status(&self, message: &ForgeMessage, agent: &str, notices: &mut Vec<String>) {
+    async fn flush_status(
+        &self,
+        message: &ForgeMessage,
+        agent: &str,
+        notices: &mut Vec<String>,
+        user_id: Option<&str>,
+    ) {
         if !self.config.reply.ack && notices.is_empty() {
             return;
         }
         let body = status_body(message, agent, notices);
         notices.clear();
-        self.reply(message, &body).await;
+        self.reply(message, &body, user_id).await;
     }
 
     async fn finish(&self, key: &str, job: &Job, agent: &str, outcome: &AgentOutcome) {
@@ -854,7 +1073,8 @@ impl Inner {
                 outcome.duration, summary
             )
         };
-        self.reply(&job.message, &body).await;
+        self.reply(&job.message, &body, job.user_id.as_deref())
+            .await;
     }
 
     /// Report that no agent can take the job. This is a terminal, actionable
@@ -865,7 +1085,8 @@ impl Inner {
         let message = no_available_agent_message(&self.agents.unavailable_agents());
         let outcome = AgentOutcome::failure(&message, Default::default());
         self.persist_outcome(key, job, &job.agent, &outcome);
-        self.reply(&job.message, &message).await;
+        self.reply(&job.message, &message, job.user_id.as_deref())
+            .await;
     }
 
     fn persist_outcome(&self, key: &str, job: &Job, agent: &str, outcome: &AgentOutcome) {
@@ -894,9 +1115,9 @@ impl Inner {
         }
     }
 
-    async fn reply(&self, message: &ForgeMessage, body: &str) {
+    async fn reply(&self, message: &ForgeMessage, body: &str, user_id: Option<&str>) {
         let reply = format!("forge-bot: {body}");
-        match self.api.reply(message, &reply).await {
+        match self.api_for(user_id).reply(message, &reply).await {
             Ok(()) => {}
             Err(error) if error.is_permission_denied() => {
                 tracing::warn!(
@@ -912,9 +1133,14 @@ impl Inner {
     }
 
     /// Post `body` and return the new comment id when the forge can edit it.
-    async fn reply_tracked(&self, message: &ForgeMessage, body: &str) -> Option<String> {
+    async fn reply_tracked(
+        &self,
+        message: &ForgeMessage,
+        body: &str,
+        user_id: Option<&str>,
+    ) -> Option<String> {
         let reply = format!("forge-bot: {body}");
-        match self.api.reply_tracked(message, &reply).await {
+        match self.api_for(user_id).reply_tracked(message, &reply).await {
             Ok(id) => id,
             Err(error) if error.is_permission_denied() => {
                 tracing::warn!(
@@ -1128,6 +1354,33 @@ mod tests {
         config.workspace.enabled = false;
         config.reply.ack = false;
         config.reply.result = false;
+        // Every run belongs to a configured user now. Tests spawn fake CLIs
+        // directly because the cgroup backend needs root.
+        config.forges.forgejo = Some(crate::config::ForgejoConfig {
+            bot_username: Some("agent".into()),
+            ..Default::default()
+        });
+        let passwd = dir.join("passwd");
+        std::fs::write(
+            &passwd,
+            format!(
+                "agent:x:1000:1000::{}:/bin/bash\n",
+                dir.join("home/agent").display()
+            ),
+        )
+        .unwrap();
+        config.executor.passwd_file = passwd;
+        config.executor.direct = true;
+        config.users.insert(
+            "default".into(),
+            crate::config::UserConfig {
+                role: crate::config::UserRole::Default,
+                host_user: "agent".into(),
+                agent: None,
+                agent_model: None,
+                token: None,
+            },
+        );
         config
     }
 
@@ -1146,6 +1399,161 @@ mod tests {
             title: None,
             reply_target: Default::default(),
         }
+    }
+
+    /// Build a dispatcher without touching the network. The scheduler loop is
+    /// started but stays idle because no job is submitted.
+    fn dispatcher_for(config: Config, dir: &std::path::Path) -> Arc<Dispatcher> {
+        let config = Arc::new(config);
+        let sessions = Arc::new(SessionStore::open(dir).unwrap());
+        Dispatcher::new(
+            config.clone(),
+            Arc::new(AgentRegistry::from_config(&config)),
+            sessions,
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap()
+    }
+
+    fn explicit_config(dir: &std::path::Path) -> Config {
+        let mut config = test_config(dir);
+        config.users.clear();
+        config.forges.forgejo = Some(crate::config::ForgejoConfig {
+            bot_username: Some("shylock-bot".into()),
+            ..Default::default()
+        });
+        // The executor resolves every explicit host_user at startup, so give
+        // the test a passwd fixture with the accounts it configures.
+        let passwd = dir.join("passwd");
+        std::fs::write(
+            &passwd,
+            format!(
+                "agent:x:1000:1000::{}:/bin/bash\nreviewer:x:1001:1001::{}:/bin/bash\n",
+                dir.join("home/agent").display(),
+                dir.join("home/reviewer").display()
+            ),
+        )
+        .unwrap();
+        config.executor.passwd_file = passwd;
+        config.agents.overrides.insert(
+            "custom".into(),
+            crate::config::AgentConfig {
+                command: Some("cat".into()),
+                ..Default::default()
+            },
+        );
+        let user = |role, host: &str, agent: Option<&str>| crate::config::UserConfig {
+            role,
+            host_user: host.into(),
+            agent: agent.map(str::to_owned),
+            agent_model: None,
+            token: None,
+        };
+        config.users.insert(
+            "shylock-bot".into(),
+            user(crate::config::UserRole::Default, "agent", Some("custom")),
+        );
+        config.users.insert(
+            "shylock-reviewer".into(),
+            user(crate::config::UserRole::Reviewer, "reviewer", None),
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn route_uses_the_default_user_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let dispatcher = dispatcher_for(config, dir.path());
+
+        let msg = message("o/r");
+        let (mention, agent) = dispatcher.route(&msg).unwrap().unwrap();
+        assert_eq!(mention.agent.as_deref(), Some("custom"));
+        assert_eq!(agent, "custom");
+
+        let mut ignored = message("o/r");
+        ignored.body = "no mention".into();
+        assert!(dispatcher.route(&ignored).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn route_selects_the_addressed_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = explicit_config(dir.path());
+        let dispatcher = dispatcher_for(config, dir.path());
+
+        // The default user's configured adapter wins over the registry default.
+        let mut to_default = message("o/r");
+        to_default.body = "@shylock-bot do it".into();
+        let (mention, agent) = dispatcher.route(&to_default).unwrap().unwrap();
+        assert_eq!(mention.message, "do it");
+        assert_eq!(agent, "custom");
+
+        // An explicit `--agent` still takes precedence.
+        to_default.body = "@shylock-bot --agent=codex do it".into();
+        let (_, agent) = dispatcher.route(&to_default).unwrap().unwrap();
+        assert_eq!(agent, "codex");
+
+        // A reviewer with no adapter uses the registry default.
+        let mut to_reviewer = message("o/r");
+        to_reviewer.body = "@shylock-reviewer please review".into();
+        let (mention, agent) = dispatcher.route(&to_reviewer).unwrap().unwrap();
+        assert_eq!(mention.message, "please review");
+        assert_eq!(agent, dispatcher.default_agent_name());
+
+        // A body that addresses no configured user is ignored.
+        let mut none = message("o/r");
+        none.body = "@someone-else hi".into();
+        assert!(dispatcher.route(&none).unwrap().is_none());
+
+        // Addressing two users is rejected instead of routed arbitrarily.
+        let mut both = message("o/r");
+        both.body = "@shylock-bot and @shylock-reviewer".into();
+        assert!(dispatcher.route(&both).is_err());
+    }
+
+    #[tokio::test]
+    async fn host_user_follows_the_addressed_explicit_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = explicit_config(dir.path());
+        let dispatcher = dispatcher_for(config, dir.path());
+
+        let mut to_default = message("o/r");
+        to_default.body = "@shylock-bot do it".into();
+        let user = dispatcher.inner.recipient_for(&to_default);
+        assert_eq!(user.id, "shylock-bot");
+        assert_eq!(user.host_user, "agent");
+
+        let mut to_reviewer = message("o/r");
+        to_reviewer.body = "@shylock-reviewer review".into();
+        let user = dispatcher.inner.recipient_for(&to_reviewer);
+        assert_eq!(user.id, "shylock-reviewer");
+        assert_eq!(user.host_user, "reviewer");
+
+        // An automatic trigger without a mention targets the default user.
+        let mut auto = message("o/r");
+        auto.body = "no mention here".into();
+        assert_eq!(dispatcher.inner.recipient_for(&auto).id, "shylock-bot");
+
+        // A persisted id resolves to the same user, and an unknown one is
+        // rejected rather than substituted.
+        assert_eq!(
+            dispatcher
+                .inner
+                .user_for(Some("shylock-reviewer"))
+                .unwrap()
+                .id,
+            "shylock-reviewer"
+        );
+        assert!(dispatcher.inner.user_for(Some("ghost")).is_err());
+    }
+
+    #[tokio::test]
+    async fn user_for_requires_a_user_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = dispatcher_for(test_config(dir.path()), dir.path());
+        assert!(dispatcher.inner.user_for(None).is_err());
     }
 
     #[tokio::test]
@@ -1379,7 +1787,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(sessions.pending_jobs().unwrap().is_empty());
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(session.runs[0].success, Some(true));
     }
 
@@ -1424,7 +1834,11 @@ mod tests {
         assert!(body.contains("Available agents:"), "body: {body}");
         assert!(body.contains("pi-rpc"), "body: {body}");
         assert!(sessions.pending_jobs().unwrap().is_empty());
-        assert!(sessions.get(&SessionStore::key(&message("o/r"))).is_none());
+        assert!(
+            sessions
+                .get(&SessionStore::key(&message("o/r"), Some("default")))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1453,6 +1867,7 @@ mod tests {
                 message: "x".into(),
             },
             agent: "pi-rpc".into(),
+            user_id: None,
             created_at: Utc::now(),
             status_comment: None,
             waiting: false,
@@ -1791,6 +2206,7 @@ mod tests {
                 message: "x".into(),
             },
             agent: "codex".into(),
+            user_id: None,
             created_at: Utc::now(),
             status_comment: None,
             waiting: false,
@@ -1850,6 +2266,7 @@ mod tests {
                 message: "second".into(),
             },
             agent: "plain".into(),
+            user_id: None,
             created_at: Utc::now(),
             status_comment: None,
             waiting: false,
@@ -1985,7 +2402,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(
             session.runs[0].success,
             Some(true),
@@ -2116,7 +2535,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(
             session.runs[0].success,
             Some(true),
@@ -2166,7 +2587,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(session.runs[0].success, Some(true));
         assert_eq!(session.runs[0].agent, "good-agent");
         assert!(!registry.is_available("missing-agent"));
@@ -2204,7 +2627,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(
             session.runs[0].success,
             Some(true),
@@ -2223,6 +2648,92 @@ mod tests {
             }),
             "the failure hand-off should be announced: {comments:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn configured_user_model_does_not_leak_into_other_adapters() {
+        for configured_agent in [Some("primary"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(dir.path());
+            config.policy.allow_all = true;
+            config.agent_sequence = vec!["primary".into(), "secondary".into()];
+            let user = config.users.get_mut("default").unwrap();
+            user.agent = configured_agent.map(str::to_owned);
+            user.agent_model = Some("primary-provider-model".into());
+            for (name, exit) in [("primary", 1), ("secondary", 0)] {
+                config.agents.overrides.insert(
+                    name.into(),
+                    crate::config::AgentConfig {
+                        command: Some("sh".into()),
+                        args: Some(vec![
+                            "-c".into(),
+                            format!("printf '%s\\n' \"$*\" > \"$ARGS_LOG\"; exit {exit}"),
+                            "probe".into(),
+                        ]),
+                        env: [(
+                            "ARGS_LOG".into(),
+                            dir.path().join(name).display().to_string(),
+                        )]
+                        .into(),
+                        ..Default::default()
+                    },
+                );
+            }
+            let config = Arc::new(config);
+            let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+            let dispatcher = Dispatcher::new(
+                config.clone(),
+                isolated_registry(&config, &["primary", "secondary"]),
+                sessions.clone(),
+                Arc::new(NoopForgeApi),
+                Policy::new(&config.policy),
+            )
+            .unwrap();
+            dispatcher
+                .submit(
+                    message("o/r"),
+                    Mention {
+                        agent: Some("primary".into()),
+                        message: "go".into(),
+                    },
+                    "primary",
+                )
+                .await
+                .unwrap();
+            wait_for_drain(&sessions).await;
+            assert!(
+                std::fs::read_to_string(dir.path().join("primary"))
+                    .unwrap()
+                    .contains("--model primary-provider-model")
+            );
+            assert!(
+                std::fs::read_to_string(dir.path().join("secondary"))
+                    .unwrap()
+                    .trim()
+                    .is_empty(),
+                "automatic fallback must use its own model defaults"
+            );
+            // An explicit adapter override must also keep the other provider's
+            // model out of its command line.
+            dispatcher
+                .submit(
+                    message("o/r"),
+                    Mention {
+                        agent: Some("secondary".into()),
+                        message: "go".into(),
+                    },
+                    "secondary",
+                )
+                .await
+                .unwrap();
+            wait_for_drain(&sessions).await;
+            assert!(
+                std::fs::read_to_string(dir.path().join("secondary"))
+                    .unwrap()
+                    .trim()
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]
@@ -2259,7 +2770,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(session.runs[0].success, Some(false));
 
         let comments = api.comments();
@@ -2303,7 +2816,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(session.runs[0].success, Some(false));
         assert!(
             session.runs[0]
@@ -2372,7 +2887,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         // The capacity error itself is surfaced; `good-agent` was never asked.
         assert_eq!(session.runs[0].success, Some(false));
         assert_eq!(session.runs[0].agent, "capacity-agent");
@@ -2425,7 +2942,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(session.runs[0].success, Some(true));
         assert_eq!(
             session.runs[0].agent, "good-agent",
@@ -2474,7 +2993,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(session.runs[0].success, Some(true));
         assert_eq!(session.runs[0].agent, "good-agent");
 
@@ -2532,7 +3053,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(session.runs[0].agent, "good-agent");
 
         let comments = api.comments();
@@ -2583,7 +3106,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(session.runs[0].agent, "good-agent");
 
         let comments = api.comments();
@@ -2699,7 +3224,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(session.runs[0].agent, "good-agent");
 
         let status = api.comments().join("\n");
@@ -2743,7 +3270,9 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
-        let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
+        let session = sessions
+            .get(&SessionStore::key(&message("o/r"), Some("default")))
+            .unwrap();
         assert_eq!(session.runs[0].agent, "good-agent");
 
         let comments = api.comments();
@@ -3270,7 +3799,7 @@ echo "end:$token" >> "$AGENT_LOG"
         assert!(
             dispatcher
                 .inner
-                .thread_is_busy(&SessionStore::key(&message_at("o/r", 2))),
+                .thread_is_busy(&SessionStore::key(&message_at("o/r", 2), Some("default"))),
             "a pending job must mark its conversation busy"
         );
 
@@ -3460,6 +3989,7 @@ echo "end:$token" >> "$AGENT_LOG"
                     message: token.into(),
                 },
                 agent: "gate".into(),
+                user_id: Some("default".into()),
                 created_at: Utc::now() + chrono::Duration::seconds(index as i64),
                 status_comment: None,
                 waiting: false,

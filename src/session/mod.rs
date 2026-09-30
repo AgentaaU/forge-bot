@@ -31,6 +31,10 @@ pub struct Job {
     pub mention: Mention,
     /// Resolved agent name.
     pub agent: String,
+    /// User id this job belongs to. Persisted so recovery runs under the
+    /// same account instead of re-deriving it from the message.
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub created_at: DateTime<Utc>,
     /// Forge comment id of the status comment, when the forge supports editing
     /// it. `submit` posts the acknowledgement and records the id so the worker
@@ -48,6 +52,6 @@ pub struct Job {
 impl Job {
     /// Stable key identifying the conversation, used for session persistence.
     pub fn session_key(&self) -> String {
-        SessionStore::key(&self.message)
+        SessionStore::key(&self.message, self.user_id.as_deref())
     }
 }

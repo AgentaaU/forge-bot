@@ -16,8 +16,10 @@ pub mod agent;
 mod auto_trigger;
 pub mod config;
 pub mod error;
+pub mod executor;
 pub mod forge;
 pub mod forge_api;
+pub mod identity;
 pub mod location;
 pub mod mention;
 pub mod policy;
@@ -91,6 +93,13 @@ pub fn build_policy(config: &Config) -> Policy {
     {
         policy.ignore_user(user);
     }
+    // Every explicit agent user is ignored too, so one configured user never
+    // reacts to another's comments.
+    for login in config.effective_logins() {
+        if !login.is_empty() {
+            policy.ignore_user(&login);
+        }
+    }
     policy
 }
 
@@ -149,7 +158,7 @@ pub async fn poll(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ForgejoConfig, GithubConfig, GitlabConfig};
+    use crate::config::{Config, ForgejoConfig, GithubConfig, GitlabConfig, UserConfig, UserRole};
 
     fn config_with_all_forges(dir: &std::path::Path) -> Config {
         let mut config = Config::default();
@@ -172,6 +181,29 @@ mod tests {
             bot_username: Some("gitlab-bot".into()),
             ..Default::default()
         });
+        // Every run belongs to a configured user now; tests spawn directly
+        // because the cgroup backend needs root.
+        let passwd = dir.join("passwd");
+        std::fs::write(
+            &passwd,
+            format!(
+                "agent:x:1000:1000::{}:/bin/bash\n",
+                dir.join("home/agent").display()
+            ),
+        )
+        .unwrap();
+        config.executor.passwd_file = passwd;
+        config.executor.direct = true;
+        config.users.insert(
+            "primary".into(),
+            UserConfig {
+                role: UserRole::Default,
+                host_user: "agent".into(),
+                agent: None,
+                agent_model: None,
+                token: None,
+            },
+        );
         config
     }
 
@@ -202,6 +234,29 @@ mod tests {
         assert!(policy.is_ignored("forgejo-bot"));
         assert!(policy.is_ignored("github-bot"));
         assert!(policy.is_ignored("gitlab-bot"));
+    }
+
+    #[test]
+    fn policy_ignores_every_explicit_agent_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_all_forges(dir.path());
+        let user = |role, host: &str| UserConfig {
+            role,
+            host_user: host.into(),
+            agent: None,
+            agent_model: None,
+            token: None,
+        };
+        config
+            .users
+            .insert("forgejo-bot".into(), user(UserRole::Default, "agent"));
+        config.users.insert(
+            "forgejo-reviewer".into(),
+            user(UserRole::Reviewer, "reviewer"),
+        );
+        let policy = build_policy(&config);
+        assert!(policy.is_ignored("forgejo-bot"));
+        assert!(policy.is_ignored("forgejo-reviewer"));
     }
 
     #[tokio::test]

@@ -158,12 +158,12 @@ cargo run -- poll
 
 For a full deployment walkthrough — registering the Forgejo webhook, running
 as a service, secrets, verification and troubleshooting — see
-[`deploy.md`](deploy.md). The recommended way to run it is the per-user
-systemd service, which needs no root and cannot touch other accounts:
+[`deploy.md`](deploy.md). forge-bot always runs as the root-controlled system
+service and executes every agent as a configured `[users.*].host_user`:
 
 ```bash
 cargo build --release
-./contrib/install-user.sh      # systemctl --user status forge-bot
+sudo ./contrib/install-system.sh   # systemctl status forge-bot
 ```
 
 Secrets can be supplied through the environment instead of the file:
@@ -191,10 +191,108 @@ most important options:
 | `[session]` | Queue/state directory, worker count (the global cap on concurrent agent runs), recovery, and how long an idle thread keeps its status (`retention_secs`, `0` disables eviction). |
 | `[capacity]` | Capacity/quota detection: `fallback`, `cooldown_secs` (default 5 h), extra `markers` (`[quota]` is an alias). |
 | `[agents.<name>]` | Per-agent `command`, `args`, `prompt`, `timeout_secs`, `env`. |
+| `[users.<id>]` | Required agent users: `role` (`default` or `reviewer`), `host_user`, `token`, `agent`, `agent_model`. At least one table is required. |
+| `[executor]` | cgroup executor settings: `cgroup_root`, `passwd_file`. |
 
 Configuration is loaded from `FORGE_BOT_CONFIG` (or `--config`), falling back to
 `forge-bot.toml`, falling back to defaults. Environment variables override file
 values.
+
+### Agent users
+
+Every run belongs to a configured `[users.<id>]` account. At least one table is
+required; there is no single implicit account. Exactly one user must have
+`role = "default"`:
+
+```toml
+[forgejo]
+bot_username = "forge-bot"
+
+[users.forge-bot]
+role = "default"      # exactly one user must be the default
+host_user = "agent"   # real, non-root Linux account
+token = "..."         # falls back to [forgejo].token when omitted
+
+[users.forge-reviewer]
+role = "reviewer"
+host_user = "forge-reviewer"
+token = "..."         # required for a non-default user to act as itself
+agent = "codex"        # optional adapter override
+agent_model = "gpt-fast"   # optional model passed to the agent
+```
+
+Each user is addressed by its own login (`@forge-reviewer`). The default user
+logs in as `forgejo.bot_username`, or its table key when that is unset; a
+non-default user logs in as its table key. An `--agent=` in the mention still
+takes precedence, then the user's `agent`, then the registry default. A
+comment that addresses more than one configured user is ignored rather than
+routed arbitrarily, and every configured login is added to the ignore set so
+agent users never react to one another.
+
+Every operation for a run uses the addressed user's identity:
+
+* **Token**: the gateway's replies, the credentials exported to the agent, and
+  polling use that user's `token`. A non-default user never falls back to the
+  legacy `[forgejo].token`, so `@forge-reviewer` replies as the reviewer.
+* **Workspace**: the checkout lives directly in the `host_user`'s home
+  (`<home>/<owner__repo-number>`), so users never share a working tree and the
+  dropped-privilege process creates and owns the directories it writes. The
+  gateway never creates or changes ownership of workspace paths as root.
+* **Session**: job, thread and backend-session keys are prefixed with the
+  `user_id`, and the `pi-rpc` pool only reuses a process for the same user and
+  model. Two users in the same thread get independent conversations.
+* **Model**: `agent_model` is passed as `--model <id>` unless the adapter's
+  configured `args` already set one. It applies to the user's configured
+  `agent` (or the registry default when `agent` is omitted). Alternate
+  adapters and automatic fallbacks keep their own model defaults.
+* **Recovery**: `user_id` is persisted with the job, so a restarted bot resumes
+  the job under the same account and refuses an id that no longer exists.
+
+### Process isolation (the cgroup executor)
+
+forge-bot runs as the root-controlled system service. Every run is forked
+natively, moved into a per-run cgroup v2 and dropped to its `host_user` before
+`exec`; there is no single-account fallback and no external
+`systemd-run`/`systemctl` process.
+
+```toml
+[executor]
+# Root of the cgroup v2 hierarchy (optional).
+cgroup_root = "/sys/fs/cgroup/forge-bot"
+```
+
+The host must mount cgroup v2 at `/sys/fs/cgroup`; whole-cgroup cancellation
+needs `cgroup.kill` (Linux 5.14+), otherwise only the direct child is killed.
+`forge-bot check` verifies that the cgroup root is a real cgroup v2 directory.
+Every spawn also requires successful attachment to its run cgroup; an open,
+write, or incomplete PID-write failure aborts execution.
+
+* The target account, UID and GID are resolved from `passwd_file` at startup;
+  an unknown account, UID 0, or two users sharing a UID is rejected before the
+  bot serves.
+* Children start from a controlled environment (`HOME`, `USER`, `LOGNAME`,
+  `PATH`, and `XDG_RUNTIME_DIR` when `/run/user/<uid>` exists) plus the
+  adapter's `env` and that run's forge credentials. The caller's environment is
+  not inherited. The agent is a normal process for the account and can exec
+  external commands (`git`, build tools, tests, ...) with that user's
+  permissions. Session-scoped tools (`systemctl --user`, D-Bus) need
+  `loginctl enable-linger <host_user>`, which creates `/run/user/<uid>`.
+* Secrets are passed in the child's environment (`execve`'s envp), never on a
+  command line, so they do not appear in `ps`.
+* CLI reply files must be regular files owned by the target account, with a
+  single link and at most 1 MiB of UTF-8 text. The gateway rejects symlinks,
+  hard links, FIFOs, devices, and files belonging to another account.
+* A checked-out `pi-rpc` process is only reused for the same user and model,
+  so one identity never inherits another's live session.
+* Each run gets `<cgroup_root>/<user>/run-<uuid>/`, so all of one account's
+  work shares a parent cgroup that an operator can inspect or stop.
+* Cancelling a run (timeout, shutdown, dropped future) writes `cgroup.kill`,
+  which stops the run's whole cgroup, not just the direct child.
+
+Still follow-ups from the [#135](https://forgejo.shylockhg.me/shylock/forge-bot/issues/135)
+plan: per-target polling cursors (the poller currently polls as the default
+user), ownership/cleanup of the workspace tree, and a D-Bus helper so secrets
+are never materialised as a file at all.
 
 ## Wiring a Forgejo webhook
 
@@ -287,8 +385,9 @@ The mention is matched case-insensitively and only at a word boundary, so
 - Agents receive a scoped forge token plus `FORGEJO_URL`/`FORGE_TOKEN` in their
   environment. They are *not* given an administrator token; grant only the
   scopes needed to comment and push.
-- Workspaces are cloned with an authenticated URL and the credential is
-  stripped from `origin` afterwards.
+- Workspace Git commands use an environment-backed credential helper. Tokens
+  never enter clone arguments or remote URLs; configured credential-store
+  helpers are disabled for these commands, and errors redact token values.
 - `workspace.enabled = false` runs agents in an empty directory and lets them
   access the forge themselves.
 - The status pages have no authentication: they list thread URLs and show

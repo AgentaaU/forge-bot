@@ -2,10 +2,15 @@
 
 ## Agent model selection
 
-**Never change the model of an agent when creating it.** An agent — whether a
-new adapter or a spawned process — must run with its own default model.
-forge-bot does not select, override, inject, or report models.
+By default, every adapter and spawned process uses its own model defaults.
+forge-bot must not silently select, override, inject, or report models.
 
-The only exception is an explicit model requirement from the user's AT. The AT
-is the `agent…` part of an `@agent… do something` mention, i.e. the text that
-selects the agent. In that case use exactly the required model and document why.
+After the explicit-user refactor, `[users.*].agent_model` may select a model
+for that configured agent user only. This permission does not apply to
+legacy configurations without user tables.
+
+An explicit model requirement in the user's AT—the `agent…` part of an
+`@agent… do something` mention—takes precedence for that invocation.
+Use exactly the required model and document why.
+
+Neither exception permits model reporting or storage in forge-bot status.

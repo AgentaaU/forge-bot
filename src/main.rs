@@ -42,13 +42,13 @@ async fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => forge_bot::serve(config).await?,
         Command::Poll => forge_bot::poll(config).await?,
-        Command::Check => print_summary(&config),
+        Command::Check => print_summary(&config)?,
     }
 
     Ok(())
 }
 
-fn print_summary(config: &Config) {
+fn print_summary(config: &Config) -> anyhow::Result<()> {
     println!("bind:          {}", config.bind);
     println!("mention:       {}", config.mention);
     let agents = AgentRegistry::from_config(config);
@@ -76,4 +76,36 @@ fn print_summary(config: &Config) {
     {
         eprintln!("warning: forgejo webhook secret is not set; signatures will not be verified");
     }
+
+    // Resolve the explicit users and validate their Linux accounts, so a typo
+    // is reported by `check` instead of at the first mention.
+    let identities = forge_bot::identity::Identities::resolve(config, &agents.names())?;
+    let executor = forge_bot::executor::Executor::from_config(&config.executor)?;
+    executor.validate_users(&identities)?;
+    // The cgroup executor forks natively and needs a writable cgroup v2
+    // hierarchy; fail fast when it is missing instead of letting every
+    // mention fail at spawn time.
+    executor.ensure_cgroup_root()?;
+    let global_token = config
+        .forges
+        .forgejo
+        .as_ref()
+        .and_then(|forgejo| forgejo.token.as_deref());
+    for user in identities.users() {
+        if user.role == forge_bot::config::UserRole::Reviewer
+            && user.effective_token(global_token).is_none()
+        {
+            eprintln!(
+                "warning: user `{}` has no token; it cannot reply or use the API",
+                user.id
+            );
+        }
+    }
+    let users: Vec<String> = identities
+        .users()
+        .iter()
+        .map(|user| format!("{}={}", user.id, user.host_user))
+        .collect();
+    println!("users:         {}", users.join(", "));
+    Ok(())
 }

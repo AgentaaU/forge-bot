@@ -15,10 +15,9 @@ supporting files live in [`contrib/`](contrib/):
 | --- | --- |
 | `config.example.toml` (repo root) | Annotated config, per-user by default |
 | [`doc/forgejo-webhook.md`](doc/forgejo-webhook.md) | Hook scopes, events and API examples |
-| `contrib/forge-bot.user.service` | systemd **user** unit (recommended) |
-| `contrib/install-user.sh` | Install binary + config + user unit, no root needed |
+| `contrib/forge-bot.system.service` | systemd **system** unit |
+| `contrib/install-system.sh` | Install the root-owned system service and per-user executor |
 | `contrib/forge-bot.env.example` | Environment/secret template |
-| `contrib/run.sh` | Rootless launcher (`setsid` + `nohup`) |
 | `contrib/detect-repo.sh` | Print `owner/repo` for the current git remote |
 | `contrib/register-webhook.sh` | Create the Forgejo webhook via the API |
 | `contrib/test-webhook.sh` | Send a signed test delivery |
@@ -106,32 +105,57 @@ poller in that case.
 
 ## 4. Start
 
-Prefer the **per-user service**: it runs as your account, cannot reach other
-users' processes or system state, and needs no root.
+forge-bot runs as a root-controlled system service and executes every agent as
+the `[users.*].host_user` it is addressed as. The gateway forks natively, moves
+the child into a per-run cgroup v2 and drops to that account before `exec`;
+there is no external `systemd-run` or `systemctl` process.
 
 ```bash
-# as the user that owns the checkout / pi auth
-cargo build --release
-./contrib/install-user.sh
-systemctl --user status forge-bot
-journalctl --user -u forge-bot -f        # or: tail -f ~/.local/state/forge-bot/forge-bot.log
+sudo cargo build --release
+sudo ./contrib/install-system.sh
+$EDITOR /etc/forge-bot/forge-bot.toml    # configure the [users.*] accounts
+sudo systemctl restart forge-bot
 ```
 
-The installer copies `config.example.toml` when you have no
-`forge-bot.toml` yet; state and workspaces then live under
-`~/.local/state/forge-bot/`. To keep the service running while logged out, run
-the installer with `ENABLE_LINGER=1` (it calls
-`loginctl enable-linger "$USER"`).
+The installer creates `/etc/forge-bot`, `/var/lib/forge-bot/state`
+(mode `0700`, root-only), and `/var/log/forge-bot`, installs the unit as
+`/etc/systemd/system/forge-bot.service`, and leaves the config/env files for the
+operator to edit. The unit points `FORGE_BOT_SESSION_DIR` at the state path so
+state survives a restart. Checkouts are not kept under `/var/lib`: each explicit
+`[users.*]` run checks out directly in its `host_user`'s home. Before starting,
+create the non-root accounts named in
+`host_user` and add at least one `[users.*]` table. The executor rejects unknown
+accounts, root, and duplicate UIDs at startup, and passes secrets in the child's
+environment rather than on a command line. The host must mount cgroup v2 at
+`/sys/fs/cgroup` (`forge-bot check` verifies the cgroup root; whole-cgroup
+cancellation needs `cgroup.kill`, Linux 5.14+). Agents are normal processes for
+their account and can run external commands with that user's permissions; run
+`loginctl enable-linger <host_user>` if an agent also needs a user D-Bus or
+`systemctl --user` session.
 
-**Rootless launcher (no systemd):**
+Authenticate each agent CLI as its configured `host_user`. Signing in as root
+or as the gateway operator does not authenticate another Linux account, and
+the gateway does not inherit provider credentials from the operator's shell.
+For Claude, an administrator can run these commands outside the service
+sandbox (replace `reviewer` and the binary path with the installed account/CLI):
 
 ```bash
-export FORGEJO_TOKEN=...
-./contrib/run.sh ~/.config/forge-bot/forge-bot.toml
-kill "$(cat ~/.local/state/forge-bot/forge-bot.pid)"   # stop
+sudo -u reviewer -H /usr/bin/claude auth login
+sudo -u reviewer -H /usr/bin/claude auth status
 ```
 
-Do not run the bot itself as root; install-user.sh never runs as root at all.
+Repeat provider setup for every CLI that may run as a fallback. A Forgejo
+token only grants forge access; it does not authenticate a model provider.
+
+Each run is isolated by identity: the addressed user's `token` is used for the
+agent environment and gateway replies, the checkout is rooted in the addressed
+user's `host_user` home (`<home>/<owner__repo-number>`), and
+job/session/backend-session keys are
+namespaced by `user_id`. Set a `token` on every non-default user; the default
+user falls back to the global `[forgejo] token`. `agent_model` applies only to
+the user's configured adapter (or the registry default when omitted); other
+adapters keep their own model defaults. Cancelling a run writes `cgroup.kill` to stop the whole run
+cgroup.
 
 ## 5. Verify
 
@@ -146,9 +170,9 @@ mentions reuse it while it is idle.
 
 ## 6. Operations
 
-* **Logs**: `journalctl --user -u forge-bot -f`, or the mirrored file
-  `~/.local/state/forge-bot/forge-bot.log` written by the user service.
-* **State**: `state/jobs/`, `state/sessions/`, `state/poller.json`.
+* **Logs**: `journalctl -u forge-bot -f`, or the mirrored file
+  `/var/log/forge-bot/forge-bot.log`.
+* **State**: `/var/lib/forge-bot/state/` (`jobs/`, `sessions/`, `poller.json`).
 * **Upgrade**: rebuild, reinstall the binary, restart the service.
 * **Uninstall**: stop and remove the unit/binary/config/state.
 
@@ -160,18 +184,17 @@ mentions reuse it while it is idle.
 | Webhook `401` | Secret mismatch or missing `X-Forgejo-Signature`. |
 | Forgejo cannot deliver to `127.0.0.1` | Allow loopback in `[webhook] ALLOWED_HOST_LIST`, or use the poller. |
 | Poller never triggers | `poller.enabled = false`, or the token cannot see the repository. Reset `state/poller.json` if a cursor ran ahead. |
-| `failed to spawn pi` (or `agy`) | `~/.local/bin` is not on the service `PATH`. The shipped unit sets it; for a custom unit add `Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin`, or set `[pi_rpc] command` to an absolute path. |
-| User service exits with `status=209/STDOUT` | The log directory is missing. `mkdir -p ~/.local/state/forge-bot` (`install-user.sh` does this) and restart. |
+| `failed to spawn pi` (or `agy`) | The agent's `~/.local/bin` is not on the unit `PATH`. The executor prepends it; otherwise set `[pi_rpc] command` to an absolute path. |
+| `No available agent` | The agent binary is missing or the account cannot execute it; check `journalctl -u forge-bot`. |
 | No reply comment | `[reply] result = false`, or the token lacks `write:issue`. |
 | Jobs pile up | Raise `[session] workers`, the single cap on concurrent agent runs (pooled `pi-rpc` and one-shot alike). |
 
 ## 8. This environment
 
-* Bot runs as the `agent` account (which also owns the `pi` auth under
-  `/home/agent/.pi`). Run it with `contrib/install-user.sh` so the service is
-  scoped to that account.
-* Binary: `~/.local/bin/forge-bot`; config: `~/.config/forge-bot/forge-bot.toml`
-  (mode `0600`); state: `~/.local/state/forge-bot/`.
+* Bot runs as a root-controlled system service; each agent runs as its
+  configured `[users.*].host_user`.
+* Binary: `/usr/local/bin/forge-bot`; config: `/etc/forge-bot/forge-bot.toml`
+  (mode `0600`); state: `/var/lib/forge-bot/state/`.
 * `shylock-bot` is only a collaborator, so the webhook cannot be created by the
   bot; `[poller] enabled = true` is used, with an empty `repositories` list so
   every repository visible to the bot is watched (new repositories included).

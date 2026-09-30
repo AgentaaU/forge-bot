@@ -18,9 +18,15 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
     if let Some(title) = &context.title {
         prompt.push_str(&format!("Title: {title}\n"));
     }
+    let working_directory = context
+        .host_user
+        .as_deref()
+        .and_then(|user| context.executor.account(user))
+        .map(|account| account.home.as_path())
+        .unwrap_or(context.workspace.as_path());
     prompt.push_str(&format!(
         "Your working directory: {}\n\n",
-        context.workspace.display()
+        working_directory.display()
     ));
     prompt.push_str("Requested work:\n");
     prompt.push_str(request.message.trim());
@@ -85,6 +91,18 @@ mod tests {
                 repository: "o/r".into(),
                 title: Some("A title".into()),
                 workspace: "/tmp/ws".into(),
+                host_user: Some("worker".into()),
+                executor: std::sync::Arc::new(crate::executor::Executor::with_accounts_for_tests(
+                    std::collections::BTreeMap::from([(
+                        "worker".into(),
+                        crate::executor::HostAccount {
+                            name: "worker".into(),
+                            uid: 1000,
+                            gid: 1000,
+                            home: "/srv/worker".into(),
+                        },
+                    )]),
+                )),
                 requester: "alice".into(),
                 is_pull_request: true,
                 reply_target: ReplyTarget::ReviewComment(ReviewCommentTarget {
@@ -125,7 +143,7 @@ mod tests {
                 "Location: https://forge.example/o/r/pulls/4#issuecomment-9\n",
                 "Repository: o/r\n",
                 "Title: A title\n",
-                "Your working directory: /tmp/ws\n\n",
+                "Your working directory: /srv/worker\n\n",
                 "Requested work:\nfix this\n",
                 "\nThis mention is an inline pull-request review comment. Post any reply in the same review thread (review id 7, file `src/lib.rs`, line 42) instead of opening a new top-level comment.\n",
                 "\nUse the tools available to you (forge CLI/API, git, shell, filesystem) to gather context, make changes, run tests, and commit/push when appropriate. Reply on the forge when you are done. Forge credentials are available in the environment.\n",

@@ -37,8 +37,10 @@ pub fn build(config: &AgentConfig) -> CommandAgent {
     };
     // `--print` consumes the next argument as its prompt, and the prompt is
     // appended after all configured arguments. Add `--print` last so agy does
-    // not mistake `--dangerously-skip-permissions` for the prompt.
-    agent.arg("--print")
+    // not mistake `--dangerously-skip-permissions` for the prompt, and pin a
+    // per-user `--model` to the index just before it.
+    let model_at = agent.arguments().len();
+    agent.model_at(model_at).arg("--print")
 }
 
 /// AGY's print output omits its default model. Read the same persisted
