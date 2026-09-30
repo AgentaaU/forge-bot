@@ -171,7 +171,14 @@ impl Dispatcher {
         agent_name: &str,
     ) -> Result<Uuid> {
         // Resolve eagerly so an unknown agent fails before we persist a job.
-        let _ = self.inner.agents.get(agent_name)?;
+        // A typo in `--agent=` is a caller error, not something to swallow, so
+        // report it in the thread with the registered names.
+        let resolved = self.inner.agents.get(agent_name);
+        if let Err(BotError::UnknownAgent(name)) = &resolved {
+            let body = unknown_agent_message(name, &self.inner.agents.names());
+            self.inner.reply(&message, &body).await;
+        }
+        resolved?;
 
         // A mention that lands while its conversation is busy will wait for the
         // run already in flight instead of starting, so say that rather than
@@ -952,6 +959,56 @@ fn no_available_agent_message(unavailable: &[(String, UnavailableReason)]) -> St
     )
 }
 
+/// Build the terminal reply for an unknown `--agent=` selection. It names the
+/// registered agents so the caller can retry with a valid one, and suggests the
+/// closest match when the name looks like a typo.
+fn unknown_agent_message(name: &str, available: &[String]) -> String {
+    let list = available.join(", ");
+    let suggestion = closest_agent(name, available)
+        .map(|candidate| format!(" Did you mean `{candidate}`?"))
+        .unwrap_or_default();
+    format!("🤖 Unknown agent `{name}`.{suggestion} Available agents: {list}.")
+}
+
+/// The registered agent closest to `name` by edit distance, when that distance
+/// is small enough to be a typo rather than an unrelated name.
+fn closest_agent<'a>(name: &str, available: &'a [String]) -> Option<&'a str> {
+    let requested = name.to_lowercase();
+    let threshold = match requested.chars().count() {
+        0..=3 => 1,
+        4..=6 => 2,
+        _ => 3,
+    };
+    available
+        .iter()
+        .map(|candidate| {
+            let distance = edit_distance(&requested, &candidate.to_lowercase());
+            (candidate, distance)
+        })
+        .filter(|(_, distance)| *distance <= threshold)
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(candidate, _)| candidate.as_str())
+}
+
+/// Levenshtein edit distance between two strings, counted in characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, a_char) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, b_char) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(a_char != b_char);
+            let insertion = current[j] + 1;
+            let deletion = previous[j + 1] + 1;
+            current[j + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
+}
+
 /// Build a failure outcome, replacing forge permission errors with a clear
 /// user-facing message.
 fn permission_aware_failure(job: &Job, error: &BotError) -> AgentOutcome {
@@ -1324,6 +1381,66 @@ mod tests {
         assert!(sessions.pending_jobs().unwrap().is_empty());
         let session = sessions.get(&SessionStore::key(&message("o/r"))).unwrap();
         assert_eq!(session.runs[0].success, Some(true));
+    }
+
+    #[tokio::test]
+    async fn unknown_agent_is_reported_in_the_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.policy.allow_all = true;
+        let config = Arc::new(config);
+
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(RecordingForgeApi::new());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(AgentRegistry::from_config(&config)),
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        // A typo in the requested agent name is a caller error, so it must be
+        // reported in the thread instead of being silently dropped.
+        let error = dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    agent: Some("pi-rcp".into()),
+                    message: "go".into(),
+                },
+                "pi-rcp",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BotError::UnknownAgent(ref name) if name == "pi-rcp"));
+
+        let comments = api.comments();
+        assert_eq!(comments.len(), 1, "the invalid call is reported once");
+        let body = &comments[0].1;
+        assert!(body.contains("Unknown agent `pi-rcp`"), "body: {body}");
+        assert!(body.contains("Did you mean `pi-rpc`?"), "body: {body}");
+        assert!(body.contains("Available agents:"), "body: {body}");
+        assert!(body.contains("pi-rpc"), "body: {body}");
+        assert!(sessions.pending_jobs().unwrap().is_empty());
+        assert!(sessions.get(&SessionStore::key(&message("o/r"))).is_none());
+    }
+
+    #[test]
+    fn unknown_agent_message_suggests_a_typo_and_lists_agents() {
+        let available: Vec<String> = ["codex", "agy", "pi-rpc", "claude", "kimi"]
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+
+        let with_suggestion = unknown_agent_message("pi-rcp", &available);
+        assert!(with_suggestion.contains("Did you mean `pi-rpc`?"));
+        assert!(with_suggestion.contains("Available agents: codex, agy, pi-rpc, claude, kimi."));
+
+        let without_suggestion = unknown_agent_message("totally-unrelated", &available);
+        assert!(!without_suggestion.contains("Did you mean"));
+        assert!(without_suggestion.contains("Unknown agent `totally-unrelated`."));
     }
 
     #[test]
