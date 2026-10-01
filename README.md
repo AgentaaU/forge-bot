@@ -439,8 +439,10 @@ The test suite covers URL parsing, mention extraction, HMAC verification,
 payload normalization for all three forges, policy decisions, session
 persistence, the dispatcher, and an end-to-end signed webhook flow.
 
-CI runs the suite through `cargo-llvm-cov` and posts the result as a comment on
-the pull request (updating the same comment on every push), using
+CI splits into two concurrent jobs: `lint` runs `cargo fmt` and `cargo clippy`,
+while `test` runs the whole suite once through `cargo-llvm-cov` (so the tests are
+validated and covered in a single pass) and posts the result as a comment on the
+pull request, updating the same comment on every push via
 [`contrib/coverage-comment.sh`](contrib/coverage-comment.sh).
 
 ## Research notes

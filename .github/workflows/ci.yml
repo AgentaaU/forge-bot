@@ -10,16 +10,22 @@ permissions:
   pull-requests: write
 
 jobs:
-  test:
+  # Formatting and lints do not need the coverage build, so run them in their
+  # own job. The self-hosted runner advertises `capacity: 2`, so this job and
+  # `test` execute concurrently instead of one waiting behind the other.
+  lint:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --all
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
       - name: Install cargo-llvm-cov
         run: |
           if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
@@ -27,8 +33,12 @@ jobs:
             curl -sSL https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz | tar -xz -C "$HOME/.cargo/bin"
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
-      - name: Coverage
-        run: ./contrib/coverage.sh --json --summary-only --output-path coverage.json --fail-under-lines 95
+      # `cargo llvm-cov` runs the whole suite under instrumentation, so it
+      # validates the tests *and* produces the coverage report in a single pass.
+      # A separate `cargo test --all` step compiled and ran the suite a second
+      # time, roughly doubling the job's wall-clock time without adding signal.
+      - name: Test with coverage
+        run: ./contrib/coverage.sh --locked --json --summary-only --output-path coverage.json --fail-under-lines 95
       - name: Post coverage report
         if: ${{ always() }}
         env:
