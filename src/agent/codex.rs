@@ -13,9 +13,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::agent::codex_app_server::CodexAppServerAgent;
 use crate::agent::command::{CommandAgent, SessionStyle};
 use crate::agent::session::SessionStore;
+use crate::agent::{Agent, AgentContext, AgentOutcome, AgentRequest, SteerReceipt, wire};
 use crate::config::{AgentConfig, PromptDelivery};
+use crate::error::Result;
 
 /// Built-in Codex adapter defaults.
 pub fn default_agent() -> CommandAgent {
@@ -25,7 +28,24 @@ pub fn default_agent() -> CommandAgent {
 }
 
 /// Build a Codex adapter, applying user overrides.
-pub fn build(config: &AgentConfig, sessions: Arc<SessionStore>) -> CommandAgent {
+///
+/// The default binary is driven through `codex app-server`, which supports
+/// same-turn steering. A custom `command` or `args` keeps the one-shot
+/// `codex exec` adapter, and an app-server that cannot start falls back to it
+/// at run time; either way a supported default binary is never broken by the
+/// richer path.
+pub fn build(config: &AgentConfig, sessions: Arc<SessionStore>) -> CodexAgent {
+    let one_shot = build_one_shot(config, Arc::clone(&sessions));
+    let app_server = (config.command.is_none() && config.args.is_none())
+        .then(|| CodexAppServerAgent::new(config, Arc::clone(&sessions)));
+    CodexAgent {
+        one_shot,
+        app_server,
+    }
+}
+
+/// Build the one-shot `codex exec` adapter.
+pub fn build_one_shot(config: &AgentConfig, sessions: Arc<SessionStore>) -> CommandAgent {
     let agent = default_agent()
         .apply_config(config)
         .arg("--dangerously-bypass-approvals-and-sandbox");
@@ -55,6 +75,58 @@ pub fn build(config: &AgentConfig, sessions: Arc<SessionStore>) -> CommandAgent 
         },
         sessions,
     )
+}
+
+/// The registered Codex adapter: app-server steering with a one-shot fallback.
+pub struct CodexAgent {
+    one_shot: CommandAgent,
+    app_server: Option<CodexAppServerAgent>,
+}
+
+impl CodexAgent {
+    /// Arguments the one-shot adapter would pass to the program.
+    pub fn arguments(&self) -> &[String] {
+        self.one_shot.arguments()
+    }
+
+    /// Program the one-shot adapter would execute.
+    pub fn program(&self) -> &str {
+        self.one_shot.program()
+    }
+}
+
+#[async_trait::async_trait]
+impl Agent for CodexAgent {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    async fn run(&self, request: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
+        if let Some(app_server) = &self.app_server {
+            match app_server.run(request, context).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if wire::is_unsupported(&error) => {
+                    tracing::info!(
+                        %error,
+                        "codex app-server is unavailable; falling back to codex exec"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.one_shot.run(request, context).await
+    }
+
+    async fn follow_up(
+        &self,
+        request: &AgentRequest,
+        context: &AgentContext,
+    ) -> Result<Option<SteerReceipt>> {
+        match &self.app_server {
+            Some(app_server) => app_server.follow_up(request, context).await,
+            None => Ok(None),
+        }
+    }
 }
 
 /// Read the model Codex recorded for its most recent turn in this thread.
@@ -196,11 +268,11 @@ with open(out, "w") as f:
         let config = AgentConfig {
             command: Some(script.display().to_string()),
             dangerously_skip_permissions: Some(false),
+            env: [("FAKE_LOG".into(), log.display().to_string())].into(),
             ..Default::default()
         };
         let sessions = Arc::new(SessionStore::load(dir.path()));
-        let agent =
-            build(&config, Arc::clone(&sessions)).env("FAKE_LOG", log.display().to_string());
+        let agent = build(&config, Arc::clone(&sessions));
         let request = AgentRequest {
             location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
             message: "go".into(),
@@ -242,5 +314,48 @@ with open(out, "w") as f:
                 .iter()
                 .any(|arg| arg == "--color" || arg == "--sandbox")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn app_server_failure_falls_back_to_one_shot() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_executable(
+            dir.path(),
+            "fallback.py",
+            "#!/usr/bin/env python3\nimport json,sys\nargs=sys.argv[1:]\nout=args[args.index('-o')+1]\nsys.stdin.read()\nprint(json.dumps({'type':'thread.started','thread_id':'tid-1'}))\nprint(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'cached_input_tokens':0,'output_tokens':1}}))\nopen(out,'w').write('FELL-BACK')\n",
+        );
+        let sessions = Arc::new(SessionStore::default());
+        let one_shot = build_one_shot(
+            &AgentConfig {
+                command: Some(script.display().to_string()),
+                ..Default::default()
+            },
+            Arc::clone(&sessions),
+        );
+        let app_server = CodexAppServerAgent::new(
+            &AgentConfig {
+                command: Some("/nonexistent/codex".into()),
+                ..Default::default()
+            },
+            sessions,
+        );
+        let agent = CodexAgent {
+            one_shot,
+            app_server: Some(app_server),
+        };
+        let request = AgentRequest {
+            location: "https://forge.example.com/o/r/issues/1".parse().unwrap(),
+            message: "go".into(),
+        };
+        let context = AgentContext {
+            workspace: dir.path().to_path_buf(),
+            repository: "o/r".into(),
+            issue_number: Some(1),
+            ..Default::default()
+        };
+        let outcome = agent.run(&request, &context).await.unwrap();
+        assert!(outcome.success, "{outcome:?}");
+        assert_eq!(outcome.summary, "FELL-BACK");
     }
 }

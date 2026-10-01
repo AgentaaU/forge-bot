@@ -167,6 +167,10 @@ retention_secs = 604800
 # enable it themselves; set it for a custom adapter whose CLI emits a JSON
 # result, and add the CLI's own machine-readable flag to `args`.
 
+# The default `codex` binary runs through `codex app-server`, which supports
+# same-turn steering for follow-ups. Setting `command` or `args` keeps the
+# one-shot `codex exec` adapter instead, and a Codex build without app-server
+# falls back to it automatically.
 [agents.codex]
 timeout_secs = 0
 
@@ -185,6 +189,10 @@ command = "claude"
 args = ["--print"]
 timeout_secs = 0
 
+# The default `kimi` binary runs through `kimi --wire` (Wire 1.4+), which
+# supports same-turn steering. Setting `command` or `args` keeps the one-shot
+# `kimi --print` adapter instead, and a Kimi build without wire mode falls
+# back to it automatically.
 # [agents.kimi]
 # command = "kimi"
 # args = ["--print"]
@@ -221,9 +229,10 @@ no_session = false
 # A same-thread follow-up mention is delivered into the live `pi` process with
 # pi's `steer` command: it is merged into the current run instead of waiting
 # for that run to settle and becoming the next turn, and it can unblock a run
-# that would otherwise never settle. One-shot CLIs (codex, agy, claude, kimi)
-# have no live stdin channel, so their follow-ups are still queued and run as a
-# separate next turn.
+# that would otherwise never settle. The default `codex` (via app-server
+# `turn/steer`) and `kimi` (via wire-mode `steer`) adapters also merge
+# follow-ups; a custom command/args or a CLI without that protocol, plus agy
+# and claude, still queue follow-ups and run them as a separate next turn.
 # Keep one session per conversation. When true (default) an idle process may
 # serve a different conversation in the same workspace, but the pool first
 # points it at that conversation's own session: it switches back to the session

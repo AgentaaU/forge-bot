@@ -6,6 +6,8 @@
 use std::path::PathBuf;
 
 use crate::agent::command::{CommandAgent, model_arg};
+use crate::agent::kimi_wire::KimiWireAgent;
+use crate::agent::{Agent, AgentContext, AgentOutcome, AgentRequest, Result, SteerReceipt, wire};
 use crate::config::{AgentConfig, PromptDelivery};
 
 /// Built-in Kimi adapter defaults.
@@ -16,8 +18,68 @@ pub fn default_agent() -> CommandAgent {
 }
 
 /// Build a Kimi adapter, applying user overrides.
-pub fn build(config: &AgentConfig) -> CommandAgent {
-    default_agent().apply_config(config)
+///
+/// The default binary is driven through `kimi --wire`, which supports
+/// same-turn steering. A custom `command` or `args` keeps the one-shot
+/// `kimi --print` adapter, and a CLI without wire mode falls back to it at run
+/// time.
+pub fn build(config: &AgentConfig) -> KimiAgent {
+    let one_shot = default_agent().apply_config(config);
+    let wire =
+        (config.command.is_none() && config.args.is_none()).then(|| KimiWireAgent::new(config));
+    KimiAgent { one_shot, wire }
+}
+
+/// The registered Kimi adapter: wire steering with a one-shot fallback.
+pub struct KimiAgent {
+    one_shot: CommandAgent,
+    wire: Option<KimiWireAgent>,
+}
+
+impl KimiAgent {
+    /// Arguments the one-shot adapter would pass to the program.
+    pub fn arguments(&self) -> &[String] {
+        self.one_shot.arguments()
+    }
+
+    /// Program the one-shot adapter would execute.
+    pub fn program(&self) -> &str {
+        self.one_shot.program()
+    }
+}
+
+#[async_trait::async_trait]
+impl Agent for KimiAgent {
+    fn name(&self) -> &str {
+        "kimi"
+    }
+
+    async fn run(&self, request: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
+        if let Some(wire_mode) = &self.wire {
+            match wire_mode.run(request, context).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if wire::is_unsupported(&error) => {
+                    tracing::info!(
+                        %error,
+                        "kimi wire mode is unavailable; falling back to kimi --print"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.one_shot.run(request, context).await
+    }
+
+    async fn follow_up(
+        &self,
+        request: &AgentRequest,
+        context: &AgentContext,
+    ) -> Result<Option<SteerReceipt>> {
+        match &self.wire {
+            Some(wire_mode) => wire_mode.follow_up(request, context).await,
+            None => Ok(None),
+        }
+    }
 }
 
 /// Kimi's print output contains messages only. Resolve the model name from
@@ -153,5 +215,92 @@ mod tests {
         assert!(outcome.success);
         assert_eq!(outcome.summary, "KIMI-REPLY");
         assert_eq!(outcome.model.as_deref(), Some("kimi-test-model"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wire_failure_falls_back_to_one_shot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("one-shot.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'KIMI-ONESHOT'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let one_shot = default_agent().apply_config(&AgentConfig {
+            command: Some(script.display().to_string()),
+            ..Default::default()
+        });
+        let wire = KimiWireAgent::new(&AgentConfig {
+            command: Some("/nonexistent/kimi".into()),
+            ..Default::default()
+        });
+        let agent = KimiAgent {
+            one_shot,
+            wire: Some(wire),
+        };
+        let request = AgentRequest {
+            location: "https://forge.example.com/o/r/issues/1".parse().unwrap(),
+            message: "go".into(),
+        };
+        let outcome = agent.run(&request, &AgentContext::default()).await.unwrap();
+        assert!(outcome.success, "{outcome:?}");
+        assert_eq!(outcome.summary, "KIMI-ONESHOT");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crash_after_the_prompt_is_not_replayed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("one-shot-ran");
+        let one_shot_script = dir.path().join("one-shot.sh");
+        std::fs::write(
+            &one_shot_script,
+            "#!/bin/sh\ntouch \"$FAKE_ONESHOT_MARKER\"\nprintf 'KIMI-ONESHOT'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&one_shot_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prompt_log = dir.path().join("prompt.log");
+        let wire_script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_kimi_wire.py"
+        );
+        let one_shot = default_agent().apply_config(&AgentConfig {
+            command: Some(one_shot_script.display().to_string()),
+            env: [("FAKE_ONESHOT_MARKER".into(), marker.display().to_string())].into(),
+            ..Default::default()
+        });
+        let wire = KimiWireAgent::new(&AgentConfig {
+            command: Some(wire_script.into()),
+            env: [
+                ("FAKE_KIMI_EXIT_ON_PROMPT".into(), "1".into()),
+                (
+                    "FAKE_KIMI_PROMPT_LOG".into(),
+                    prompt_log.display().to_string(),
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        });
+        let agent = KimiAgent {
+            one_shot,
+            wire: Some(wire),
+        };
+        let request = AgentRequest {
+            location: "https://forge.example.com/o/r/issues/1".parse().unwrap(),
+            message: "go".into(),
+        };
+        let outcome = agent.run(&request, &AgentContext::default()).await.unwrap();
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(
+            prompt_log.exists(),
+            "the prompt side effect should be recorded before the crash"
+        );
+        assert!(
+            !marker.exists(),
+            "the one-shot adapter must not run after the prompt was submitted"
+        );
     }
 }

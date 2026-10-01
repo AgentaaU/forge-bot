@@ -8,13 +8,16 @@ pub mod agy;
 pub mod capacity;
 pub mod claude;
 pub mod codex;
+pub mod codex_app_server;
 pub mod command;
 pub mod kimi;
+pub mod kimi_wire;
 pub mod pi;
 pub mod pi_rpc;
 mod prompt;
 pub mod registry;
 pub mod session;
+pub mod wire;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -256,6 +259,17 @@ impl SteerReceipt {
     pub fn merged() -> Self {
         Self {
             notice: "📎 Merged into the current run.".to_owned(),
+        }
+    }
+
+    /// Receipt for a follow-up that was written to a live agent but whose
+    /// acceptance could not be confirmed (the acknowledgment timed out or the
+    /// process disconnected). The scheduler surfaces this and drops the job
+    /// instead of starting a second run, because the agent may already have
+    /// acted on it.
+    pub fn uncertain() -> Self {
+        Self {
+            notice: "📎 Follow-up sent to the running agent, but its acknowledgment was not confirmed; not replaying it.".to_owned(),
         }
     }
 }
