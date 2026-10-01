@@ -660,6 +660,7 @@ impl PoolInner {
                         id,
                         client,
                         reset_session,
+                        session_ready: !reset_session,
                     });
                 }
 
@@ -719,6 +720,7 @@ impl PoolInner {
                         id,
                         client: Some(client),
                         reset_session: false,
+                        session_ready: true,
                     });
                 }
             }
@@ -753,6 +755,10 @@ pub struct PoolGuard {
     /// Set when an idle process was handed to a different conversation and
     /// must be pointed at that conversation's own session before prompting.
     reset_session: bool,
+    /// Whether the required session preparation completed. A guard dropped
+    /// while it is still pending is invalidated instead of returned to the
+    /// pool, so a retry can never prompt the previous conversation's session.
+    session_ready: bool,
 }
 
 impl PoolGuard {
@@ -774,6 +780,18 @@ impl PoolGuard {
 impl Drop for PoolGuard {
     fn drop(&mut self) {
         let client = self.client.take();
+        // A guard dropped before its session was pointed at the target
+        // conversation must not return to the pool: the next run for this
+        // conversation would skip preparation and prompt the previous
+        // conversation's session. Kill it and drop the binding instead.
+        let client = if self.session_ready {
+            client
+        } else {
+            if let Some(mut client) = client {
+                client.kill();
+            }
+            None
+        };
         {
             let mut state = self.inner.state.lock().expect("pi pool mutex poisoned");
             if let Some(entry) = state.agents.iter_mut().find(|entry| entry.id == self.id) {
@@ -888,13 +906,18 @@ impl Agent for PiPoolAgent {
                 .session_paths
                 .get(&key)
                 .cloned();
-            let switched = match path {
-                Some(path) => guard.client_mut()?.switch_session(&path).await.is_ok(),
-                None => false,
-            };
-            if !switched {
-                guard.client_mut()?.new_session().await?;
+            match path {
+                // An existing conversation: restore its own session. A failed
+                // switch must not silently fall back to a fresh session, which
+                // would discard the conversation's context. The error and the
+                // conversation's saved mapping are preserved, and the guard is
+                // invalidated on drop because preparation did not complete.
+                Some(path) => guard.client_mut()?.switch_session(&path).await?,
+                // A brand-new thread starts a fresh session so it never
+                // inherits the process's previous conversation.
+                None => guard.client_mut()?.new_session().await?,
             }
+            guard.session_ready = true;
         }
 
         let state = guard
@@ -1429,6 +1452,211 @@ mod tests {
         assert!(logged.contains("switch_session"), "{logged}");
         assert!(
             logged.contains("aaaaaaaa-1111-5111-8111-111111111111"),
+            "{logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_reset_does_not_let_a_retry_inherit_another_conversations_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let command_log = dir.path().join("commands.log");
+
+        let mut config = PiRpcConfig {
+            command: fake_pi_command(),
+            ..Default::default()
+        };
+        assert!(config.session_per_conversation);
+        // Every `new_session` is cancelled, mimicking a transient RPC failure.
+        config
+            .env
+            .insert("FAKE_PI_CANCEL_NEW_SESSION".into(), "1".into());
+        config.env.insert(
+            "FAKE_PI_COMMAND_LOG".into(),
+            command_log.display().to_string(),
+        );
+        let agent = PiPoolAgent::new(&config, store(), 1);
+
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let context = |number: u64| AgentContext {
+            workspace: dir.path().to_path_buf(),
+            forge: Some(ForgeKind::Forgejo),
+            repository: "o/r".into(),
+            issue_number: Some(number),
+            ..Default::default()
+        };
+        let key_a = conversation_key(&context(1));
+        let key_b = conversation_key(&context(2));
+
+        // Thread A spawns the process and starts its own session.
+        assert!(agent.run(&request, &context(1)).await.unwrap().success);
+        let id_a = agent.inner.sessions.get("pi-rpc", &key_a).unwrap();
+        assert_eq!(agent.live_agents(), 1);
+
+        // Thread B reuses the process, but resetting to a fresh session fails.
+        // The invalid process must not return to the pool still bound to B.
+        assert!(agent.run(&request, &context(2)).await.is_err());
+        assert_eq!(agent.live_agents(), 0, "failed preparation must invalidate");
+
+        // B's retry spawns a fresh process and must not resume A's session.
+        assert!(agent.run(&request, &context(2)).await.unwrap().success);
+        let id_b = agent.inner.sessions.get("pi-rpc", &key_b).unwrap();
+        let expected_b = agent.inner.sessions.deterministic_id("pi-rpc", &key_b);
+        assert_eq!(id_b, expected_b);
+        assert_ne!(id_b, id_a);
+        assert_eq!(agent.inner.sessions.get("pi-rpc", &key_a), Some(id_a));
+
+        let logged = std::fs::read_to_string(&command_log).unwrap();
+        assert!(logged.contains("new_session cancelled"), "{logged}");
+        // The retry solved it by spawning, not by reusing a live session.
+        assert!(
+            !logged.lines().any(|line| line == "new_session"),
+            "{logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_reset_invalidates_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let command_log = dir.path().join("commands.log");
+
+        let mut config = PiRpcConfig {
+            command: fake_pi_command(),
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        // `new_session` is accepted but never answered, so the run can be
+        // cancelled while preparation is still in flight.
+        config
+            .env
+            .insert("FAKE_PI_HANG_NEW_SESSION".into(), "1".into());
+        config.env.insert(
+            "FAKE_PI_COMMAND_LOG".into(),
+            command_log.display().to_string(),
+        );
+        let agent = Arc::new(PiPoolAgent::new(&config, store(), 1));
+
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let context = |number: u64| AgentContext {
+            workspace: dir.path().to_path_buf(),
+            forge: Some(ForgeKind::Forgejo),
+            repository: "o/r".into(),
+            issue_number: Some(number),
+            ..Default::default()
+        };
+        let key_a = conversation_key(&context(1));
+        let key_b = conversation_key(&context(2));
+
+        assert!(agent.run(&request, &context(1)).await.unwrap().success);
+        let id_a = agent.inner.sessions.get("pi-rpc", &key_a).unwrap();
+
+        let run = {
+            let agent = Arc::clone(&agent);
+            let request = request.clone();
+            let context = context(2);
+            tokio::spawn(async move { agent.run(&request, &context).await })
+        };
+        // Wait until the reused process has received `new_session`, then
+        // cancel the run before it can answer.
+        for _ in 0..500 {
+            if std::fs::read_to_string(&command_log)
+                .map(|log| log.contains("new_session"))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        run.abort();
+        let _ = run.await;
+        assert_eq!(
+            agent.live_agents(),
+            0,
+            "interrupted preparation must invalidate"
+        );
+
+        // B's retry gets a fresh session on a fresh process, not A's.
+        assert!(agent.run(&request, &context(2)).await.unwrap().success);
+        assert_ne!(agent.inner.sessions.get("pi-rpc", &key_b).unwrap(), id_a);
+    }
+
+    #[tokio::test]
+    async fn a_failed_switch_preserves_the_conversations_saved_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let command_log = dir.path().join("commands.log");
+
+        let mut config = PiRpcConfig {
+            command: fake_pi_command(),
+            ..Default::default()
+        };
+        config
+            .env
+            .insert("FAKE_PI_CANCEL_SWITCH_SESSION".into(), "1".into());
+        config.env.insert(
+            "FAKE_PI_COMMAND_LOG".into(),
+            command_log.display().to_string(),
+        );
+        let agent = PiPoolAgent::new(&config, store(), 1);
+
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let context = |number: u64| AgentContext {
+            workspace: dir.path().to_path_buf(),
+            forge: Some(ForgeKind::Forgejo),
+            repository: "o/r".into(),
+            issue_number: Some(number),
+            ..Default::default()
+        };
+        let key_a = conversation_key(&context(1));
+        let key_b = conversation_key(&context(2));
+
+        assert!(agent.run(&request, &context(1)).await.unwrap().success);
+        let id_a = agent.inner.sessions.get("pi-rpc", &key_a).unwrap();
+        let path_a = agent
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .session_paths
+            .get(&key_a)
+            .cloned()
+            .unwrap();
+
+        // B takes over the process and starts a fresh session.
+        assert!(agent.run(&request, &context(2)).await.unwrap().success);
+        assert_ne!(agent.inner.sessions.get("pi-rpc", &key_b).unwrap(), id_a);
+
+        // A returns, but the switch back is cancelled. Its saved session and
+        // file must be preserved, not replaced by a fresh session.
+        assert!(agent.run(&request, &context(1)).await.is_err());
+        assert_eq!(
+            agent.inner.sessions.get("pi-rpc", &key_a),
+            Some(id_a.clone())
+        );
+        assert_eq!(
+            agent.inner.state.lock().unwrap().session_paths.get(&key_a),
+            Some(&path_a)
+        );
+
+        // The next attempt resumes A's session on a fresh process.
+        assert!(agent.run(&request, &context(1)).await.unwrap().success);
+        assert_eq!(agent.inner.sessions.get("pi-rpc", &key_a), Some(id_a));
+
+        // B's fresh session is the only new session started; the failed switch
+        // must not have fallen through to a new session for A.
+        let logged = std::fs::read_to_string(&command_log).unwrap();
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 2, "{logged}");
+        assert_eq!(lines[0], "new_session", "{logged}");
+        assert!(
+            lines[1].starts_with("switch_session cancelled "),
             "{logged}"
         );
     }
