@@ -31,6 +31,10 @@ pub struct AppState {
     pub agents: Arc<AgentRegistry>,
     pub dispatcher: Arc<Dispatcher>,
     dedupe: Arc<Mutex<RecentComments>>,
+    /// Latest client diagnostic report uploaded from `/notifications`. The
+    /// Android notification path depends on OS/browser state the server cannot
+    /// see, so the page uploads its self-test here for the operator to read.
+    diagnostics: Arc<Mutex<Option<serde_json::Value>>>,
     auto: Arc<AutoTrigger>,
 }
 
@@ -48,6 +52,7 @@ impl AppState {
             agents,
             dispatcher,
             dedupe: Arc::new(Mutex::new(RecentComments::new(1024))),
+            diagnostics: Arc::new(Mutex::new(None)),
             auto,
         }
     }
@@ -71,6 +76,12 @@ pub fn router(state: AppState) -> Router {
         .route("/notifications", get(notifications_page))
         .route("/notifications.json", get(notifications_json))
         .route("/notifications.webmanifest", get(notifications_manifest))
+        .route("/notifications/icon.png", get(notifications_icon))
+        .route("/notifications/badge.png", get(notifications_badge))
+        .route(
+            "/notifications/diagnostics",
+            get(notifications_diagnostics).post(notifications_diagnostics_upload),
+        )
         .route("/notifications/sw.js", get(notifications_service_worker))
         .route("/notify", get(notifications_page))
         .route("/notify.json", get(notifications_json))
@@ -227,6 +238,61 @@ async fn notifications_manifest() -> Response {
         crate::notify::manifest_json(),
     )
         .into_response()
+}
+
+/// The notification large icon (also the web app icon).
+async fn notifications_icon() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        axum::body::Bytes::from_static(crate::notify::notification_icon_png()),
+    )
+        .into_response()
+}
+
+/// The monochrome badge Android uses for the status-bar icon.
+async fn notifications_badge() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        axum::body::Bytes::from_static(crate::notify::notification_badge_png()),
+    )
+        .into_response()
+}
+
+/// Upload a diagnostic report from the notification page.
+async fn notifications_diagnostics_upload(
+    State(state): State<AppState>,
+    Json(report): Json<serde_json::Value>,
+) -> Response {
+    if !report.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "diagnostics must be a JSON object" })),
+        )
+            .into_response();
+    }
+    tracing::info!(report = %report, "received notification diagnostics");
+    *state
+        .diagnostics
+        .lock()
+        .expect("diagnostics mutex poisoned") = Some(report);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Return the most recently uploaded diagnostic report.
+async fn notifications_diagnostics(State(state): State<AppState>) -> Response {
+    match state
+        .diagnostics
+        .lock()
+        .expect("diagnostics mutex poisoned")
+        .clone()
+    {
+        Some(report) => Json(report).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no diagnostics uploaded yet" })),
+        )
+            .into_response(),
+    }
 }
 
 /// The service worker the notification page registers so mobile browsers can

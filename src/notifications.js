@@ -108,6 +108,128 @@ async function testNotification() {
   if (shown) { setStatus('Test notification sent.'); }
 }
 
+function serializeDelivered() {
+  const out = {};
+  for (const key of Object.keys(delivered)) {
+    out[key] = Array.from(delivered[key]);
+  }
+  return out;
+}
+
+// Collect the browser/OS state that decides whether Android can show a
+// notification. The page uploads this to `/notifications/diagnostics` so the
+// operator can read it even when the notification never appears.
+async function collectDiagnostics() {
+  const report = {
+    at: new Date().toISOString(),
+    userAgent: navigator.userAgent,
+    platform: navigator.platform || null,
+    href: location.href,
+    origin: location.origin,
+    visibility: document.visibilityState,
+    secureContext: window.isSecureContext,
+    notificationApi: 'Notification' in window,
+    notificationPermission: typeof Notification === 'undefined' ? null : Notification.permission,
+    maxActions: typeof Notification === 'undefined' ? null : (Notification.maxActions || 0),
+    serviceWorkerApi: 'serviceWorker' in navigator,
+    controller: null,
+    registrations: [],
+    ready: null,
+    permissionState: null,
+    displayTest: null,
+    generation: generation,
+    cursors: cursors,
+    delivered: serializeDelivered(),
+  };
+  if (navigator.permissions && navigator.permissions.query) {
+    try {
+      const state = await navigator.permissions.query({ name: 'notifications' });
+      report.permissionState = state.state;
+    } catch (error) {
+      report.permissionState = 'error: ' + error.message;
+    }
+  }
+  if ('serviceWorker' in navigator) {
+    report.controller = navigator.serviceWorker.controller
+      ? navigator.serviceWorker.controller.scriptURL
+      : null;
+    try {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      report.registrations = registrations.map(function (entry) {
+        return {
+          scope: entry.scope,
+          active: entry.active ? entry.active.scriptURL : null,
+          installing: entry.installing
+            ? entry.installing.scriptURL + ' (' + entry.installing.state + ')'
+            : null,
+          waiting: entry.waiting
+            ? entry.waiting.scriptURL + ' (' + entry.waiting.state + ')'
+            : null,
+        };
+      });
+    } catch (error) {
+      report.registrations = 'error: ' + error.message;
+    }
+    try {
+      const ready = await Promise.race([
+        navigator.serviceWorker.ready,
+        new Promise(function (_, reject) {
+          setTimeout(function () { reject(new Error('ready timeout')); }, 5000);
+        }),
+      ]);
+      report.ready = {
+        scope: ready.scope,
+        active: ready.active ? ready.active.scriptURL : null,
+      };
+    } catch (error) {
+      report.ready = 'error: ' + error.message;
+    }
+  }
+  let target = registration;
+  if (!target && 'serviceWorker' in navigator) {
+    target = await Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 5000); }),
+    ]).catch(function () { return null; });
+  }
+  if (target && typeof target.showNotification === 'function') {
+    try {
+      await target.showNotification('forge-bot diagnostics', {
+        body: 'Diagnostic notification from forge-bot.',
+        icon: '/notifications/icon.png',
+        badge: '/notifications/badge.png',
+        tag: 'forge-bot-diagnostics',
+      });
+      report.displayTest = 'resolved';
+    } catch (error) {
+      report.displayTest = error.name + ': ' + error.message;
+    }
+  } else {
+    report.displayTest = 'no active registration';
+  }
+  return report;
+}
+
+async function runDiagnostics() {
+  setStatus('Running diagnostics...');
+  const report = await collectDiagnostics();
+  const box = document.getElementById('diagnostics');
+  box.textContent = JSON.stringify(report, null, 2);
+  box.style.display = 'block';
+  try {
+    const response = await fetch('/notifications/diagnostics', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(report),
+    });
+    setStatus(response.ok
+      ? 'Diagnostics uploaded; read them at /notifications/diagnostics.'
+      : 'Diagnostics collected locally (upload returned ' + response.status + ').');
+  } catch (error) {
+    setStatus('Diagnostics collected locally (upload failed: ' + error + ').');
+  }
+}
+
 // Display one entry. Resolves to true when it is fully handled (shown, or
 // impossible to show) and the cursor may advance; false keeps it pending so the
 // next poll tries again.
@@ -124,7 +246,15 @@ async function display(notification) {
     return false;
   }
   const title = 'forge-bot: ' + notification.repository;
-  const options = { body: notification.message, data: notification.location };
+  // Android needs a small monochrome badge for the status bar and some OEM
+  // builds will not surface a notification without an icon, so always provide
+  // both.
+  const options = {
+    body: notification.message,
+    data: notification.location,
+    icon: '/notifications/icon.png',
+    badge: '/notifications/badge.png',
+  };
   if (registration && typeof registration.showNotification === 'function') {
     try {
       await registration.showNotification(title, options);
@@ -282,6 +412,7 @@ recipientSelect.addEventListener('change', function () {
 });
 document.getElementById('enable').addEventListener('click', enable);
 document.getElementById('test').addEventListener('click', testNotification);
+document.getElementById('diagnostics-button').addEventListener('click', runDiagnostics);
 document.getElementById('refresh').addEventListener('click', poll);
 // A permission change (for example the user unblocks notifications in browser
 // settings) should deliver whatever is still pending without waiting.

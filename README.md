@@ -394,7 +394,11 @@ Desktop browsers use the page directly. Android and iOS browsers reject the
 `Notification` constructor and require
 `ServiceWorkerRegistration.showNotification`, so the page registers a small
 service worker (`/notifications/sw.js`, scope `/`) and prefers
-`showNotification` when it is available. The page also links a web app manifest
+`showNotification` when it is available. Each notification carries a large
+`icon` (`/notifications/icon.png`) and a monochrome `badge`
+(`/notifications/badge.png`), because Android shows the badge in the status
+bar and some OEM builds will not surface a notification without them. The page
+also links a web app manifest
 (`/notifications.webmanifest`, `display: "standalone"`) and the
 `apple-mobile-web-app-capable` metadata, so "Add to Home Screen" installs a
 notification-capable app rather than a bookmark that reopens in the default
@@ -405,6 +409,18 @@ permission is per-origin:
 - on **iOS 16.4+**, add the page to the **Home Screen** first, then open it from
 there and grant notification permission. Safari tabs cannot receive these
 notifications.
+
+On Android 13+ the site permission is separate from Chrome's own OS-level
+notification permission. If the page reports "Test notification sent." but no
+notification appears, enable Android **Settings → Apps → Chrome →
+Notifications** and check Do Not Disturb / battery restrictions; `notify()` is
+allowed to resolve even when the platform drops the notification.
+
+The page's **Run diagnostics** button re-checks the same state
+(`isSecureContext`, `Notification.permission`, the Permissions API, the service
+worker registrations/controller and a live `showNotification` result) and
+uploads the report to `GET /notifications/diagnostics`, so the browser/OS state
+can be inspected without a remote debugger.
 
 The cursors are kept per human account, so switching accounts does not hide a
 recipient's pending notifications, and a server restart is detected through a

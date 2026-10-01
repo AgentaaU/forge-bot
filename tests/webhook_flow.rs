@@ -1552,6 +1552,114 @@ async fn notifications_page_links_an_installable_manifest() {
 }
 
 #[tokio::test]
+async fn notifications_serve_png_icon_and_badge() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+
+    for uri in ["/notifications/icon.png", "/notifications/badge.png"] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png"),
+            "{uri}"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{uri} is not a PNG");
+    }
+}
+
+#[tokio::test]
+async fn notifications_store_and_return_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+
+    // Nothing uploaded yet.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/notifications/diagnostics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let report = json!({
+        "userAgent": "Android Chrome",
+        "notificationPermission": "granted",
+        "displayTest": "resolved",
+    });
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/notifications/diagnostics")
+                .header("content-type", "application/json")
+                .body(Body::from(report.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/notifications/diagnostics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["userAgent"], "Android Chrome", "{body}");
+    assert_eq!(body["displayTest"], "resolved", "{body}");
+
+    // A non-object body is rejected rather than stored.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/notifications/diagnostics")
+                .header("content-type", "application/json")
+                .body(Body::from("[]"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn notifications_json_resets_a_stale_generation() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness_with(dir.path(), with_human);

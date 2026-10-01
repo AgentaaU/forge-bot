@@ -98,6 +98,8 @@ function createHarness({ permission, entries = [], onShow } = {}) {
     recipient: element(),
     enable: element(),
     test: element(),
+    diagnostics: element(),
+    'diagnostics-button': element(),
     refresh: element(),
   };
 

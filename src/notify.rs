@@ -36,6 +36,12 @@ use crate::forge::ForgeMessage;
 /// template.
 const PAGE_SCRIPT: &str = include_str!("notifications.js");
 
+/// PNG used as the notification's large icon (and the web app/manifest icon).
+const NOTIFICATION_ICON: &[u8] = include_bytes!("notifications-icon.png");
+
+/// Monochrome PNG used as the Android notification badge (status-bar icon).
+const NOTIFICATION_BADGE: &[u8] = include_bytes!("notifications-badge.png");
+
 /// One pending human notification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Notification {
@@ -276,6 +282,8 @@ pub fn render_html(humans: &[String]) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="manifest" href="/notifications.webmanifest">
+<link rel="icon" type="image/png" href="/notifications/icon.png">
+<link rel="apple-touch-icon" href="/notifications/icon.png">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -288,6 +296,7 @@ select, button {{ font: inherit; padding: .4rem .6rem; }}
 #log {{ list-style: none; padding: 0; }}
 #log li {{ border: 1px solid #ddd; border-radius: .4rem; margin: .5rem 0; padding: .6rem; }}
 #log a {{ font-weight: 600; }}
+#diagnostics {{ background: #f6f8fa; border: 1px solid #ddd; border-radius: .4rem; padding: .6rem; white-space: pre-wrap; word-break: break-word; display: none; }}
 small {{ color: #666; }}
 </style>
 </head>
@@ -297,15 +306,18 @@ small {{ color: #666; }}
 Desktop browsers use the page directly. Mobile browsers require HTTPS and a
 service worker; on iOS 16.4+ add this page to the Home Screen first, then grant
 notification permission. Use <em>Send test notification</em> to confirm the
-browser can raise them.</p>
+browser can raise them, or <em>Run diagnostics</em> to upload the browser/OS
+state for debugging.</p>
 <p id="hint"><em>{empty_hint}</em></p>
 <div class="row">
 <label>Human <select id="recipient">{options}</select></label>
 <button id="enable">Enable notifications</button>
 <button id="test">Send test notification</button>
+<button id="diagnostics-button">Run diagnostics</button>
 <button id="refresh">Refresh</button>
 </div>
 <p><small id="status"></small></p>
+<pre id="diagnostics"></pre>
 <ul id="log"></ul>
 <script>
 {PAGE_SCRIPT}
@@ -347,9 +359,22 @@ pub fn manifest_json() -> &'static str {
   "scope": "/",
   "display": "standalone",
   "background_color": "#ffffff",
-  "theme_color": "#ffffff"
+  "theme_color": "#ffffff",
+  "icons": [
+    {"src": "/notifications/icon.png", "sizes": "192x192", "type": "image/png"}
+  ]
 }
 "##
+}
+
+/// The PNG used as the notification's large icon and the web app icon.
+pub fn notification_icon_png() -> &'static [u8] {
+    NOTIFICATION_ICON
+}
+
+/// The monochrome PNG used as the Android notification badge.
+pub fn notification_badge_png() -> &'static [u8] {
+    NOTIFICATION_BADGE
 }
 
 #[cfg(test)]
@@ -477,6 +502,7 @@ mod tests {
         // in the default browser, where notifications are unavailable.
         assert!(html.contains("rel=\"manifest\""), "{html}");
         assert!(html.contains("/notifications.webmanifest"), "{html}");
+        assert!(html.contains("apple-touch-icon"), "{html}");
         assert!(
             html.contains("name=\"apple-mobile-web-app-capable\" content=\"yes\""),
             "{html}"
@@ -496,6 +522,20 @@ mod tests {
             "{manifest}"
         );
         assert!(manifest.contains("\"scope\": \"/\""), "{manifest}");
+        assert!(manifest.contains("/notifications/icon.png"), "{manifest}");
+    }
+
+    #[test]
+    fn notification_options_include_an_icon_and_badge() {
+        let html = render_html(&["alice".into()]);
+        assert!(html.contains("/notifications/icon.png"), "{html}");
+        assert!(html.contains("/notifications/badge.png"), "{html}");
+
+        // The served images are real PNGs (the mobile notification APIs need a
+        // bitmap icon/badge, not an SVG).
+        for image in [notification_icon_png(), notification_badge_png()] {
+            assert_eq!(&image[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
+        }
     }
 
     #[test]
@@ -546,5 +586,27 @@ mod tests {
         assert!(html.contains("const delivered = {}"), "{html}");
         assert!(html.contains("deliveredSet.has(notification.id)"), "{html}");
         assert!(html.contains("inFlight.get(notification.id)"), "{html}");
+    }
+
+    #[test]
+    fn page_can_upload_diagnostics() {
+        let html = render_html(&["alice".into()]);
+        // The page can self-test the browser/OS notification path and upload
+        // the report, because the Android failure is invisible to the server.
+        assert!(html.contains("id=\"diagnostics-button\""), "{html}");
+        assert!(html.contains("id=\"diagnostics\""), "{html}");
+        assert!(
+            html.contains("async function collectDiagnostics()"),
+            "{html}"
+        );
+        assert!(html.contains("async function runDiagnostics()"), "{html}");
+        assert!(
+            html.contains("fetch('/notifications/diagnostics'"),
+            "{html}"
+        );
+        // The report covers the state that decides whether the OS shows it.
+        assert!(html.contains("notificationPermission"), "{html}");
+        assert!(html.contains("getRegistrations()"), "{html}");
+        assert!(html.contains("displayTest"), "{html}");
     }
 }
