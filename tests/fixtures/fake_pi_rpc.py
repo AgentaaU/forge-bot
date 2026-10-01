@@ -95,7 +95,10 @@ for line in sys.stdin:
         )
         if stream_text:
             print(json.dumps({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": stream_text}}), flush=True)
-        if wait_for_steer:
+        if os.environ.get("FAKE_PI_EVENTS"):
+            for event in json.loads(os.environ["FAKE_PI_EVENTS"]):
+                print(json.dumps(event), flush=True)
+        elif wait_for_steer:
             waiting = True
         else:
             emit_usage()

@@ -393,6 +393,7 @@ impl PiRpcClient {
         let mut streamed = String::new();
         let mut usage = TokenUsage::default();
         let mut streamed_usage = TokenUsage::default();
+        let mut assistant_error = None;
         loop {
             let record = self.next_record_before(deadline).await?;
             match record["type"].as_str().unwrap_or_default() {
@@ -427,12 +428,62 @@ impl PiRpcClient {
                     }
                 }
                 "message_end" => {
+                    let message = &record["message"];
+                    if message["role"] == "assistant" {
+                        assistant_error = if message["stopReason"] == "error" {
+                            Some(
+                                message["errorMessage"]
+                                    .as_str()
+                                    .unwrap_or("pi assistant failed")
+                                    .to_owned(),
+                            )
+                        } else {
+                            None
+                        };
+                        // A provider limit must reach the queue immediately, even
+                        // if pi keeps its process alive or schedules local retries.
+                        if let Some(error) = &assistant_error
+                            && crate::agent::capacity::is_capacity_limited(error, &[])
+                        {
+                            return Err(BotError::Agent {
+                                name: "pi-rpc".into(),
+                                reason: error.clone(),
+                            });
+                        }
+                    }
                     if let Some(settled) = assistant_usage(&record["message"]["usage"]) {
                         usage.prompt_tokens += settled.prompt_tokens;
                         usage.cached_tokens += settled.cached_tokens;
                     }
                 }
-                "agent_settled" => break,
+                "auto_retry_start" => {
+                    if let Some(error) = record["errorMessage"].as_str()
+                        && crate::agent::capacity::is_capacity_limited(error, &[])
+                    {
+                        return Err(BotError::Agent {
+                            name: "pi-rpc".into(),
+                            reason: error.to_owned(),
+                        });
+                    }
+                }
+                "auto_retry_end" if record["success"] == false => {
+                    return Err(BotError::Agent {
+                        name: "pi-rpc".into(),
+                        reason: record["finalError"]
+                            .as_str()
+                            .unwrap_or("pi retries exhausted")
+                            .to_owned(),
+                    });
+                }
+                "agent_settled" => {
+                    if let Some(error) = assistant_error {
+                        return Err(BotError::Agent {
+                            name: "pi-rpc".into(),
+                            reason: error,
+                        });
+                    }
+                    break;
+                }
                 _ => {}
             }
         }
@@ -1648,6 +1699,104 @@ mod tests {
         assert_ne!(second.id, first_id);
         assert_eq!(agent.live_agents(), 1);
         assert_eq!(agent.conversation_binding("first"), None);
+    }
+
+    async fn run_rpc_events(events: Value) -> (AgentOutcome, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = PiRpcConfig {
+            command: fake_pi_command(),
+            timeout_secs: 0,
+            ..Default::default()
+        };
+        config
+            .env
+            .insert("FAKE_PI_EVENTS".into(), events.to_string());
+        let agent = PiPoolAgent::new(&config, store(), 1);
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let context = AgentContext {
+            workspace: dir.path().to_path_buf(),
+            repository: "o/r".into(),
+            issue_number: Some(1),
+            ..Default::default()
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(5), agent.run(&request, &context))
+            .await
+            .expect("RPC error must not wait indefinitely")
+            .unwrap();
+        (outcome, agent.live_agents())
+    }
+
+    #[tokio::test]
+    async fn capacity_error_without_settled_fails_and_invalidates_process() {
+        let error = r#"429: {"type":"GoUsageLimitError","message":"Go usage limit exceeded"}"#;
+        let (outcome, live) = run_rpc_events(json!([{
+            "type": "message_end", "message": {
+                "role": "assistant", "stopReason": "error", "errorMessage": error
+            }
+        }]))
+        .await;
+        assert!(!outcome.success);
+        assert!(outcome.summary.contains(error));
+        assert!(crate::agent::capacity::is_capacity_limited(
+            &outcome.summary,
+            &[]
+        ));
+        assert_eq!(live, 0);
+    }
+
+    #[tokio::test]
+    async fn capacity_retry_notice_without_settled_fails() {
+        let (outcome, _) = run_rpc_events(json!([{
+            "type": "auto_retry_start", "errorMessage": "429 Too Many Requests"
+        }]))
+        .await;
+        assert!(!outcome.success);
+        assert!(outcome.summary.contains("429 Too Many Requests"));
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_without_settled_fail() {
+        let (outcome, _) = run_rpc_events(json!([{
+            "type": "auto_retry_end", "success": false, "finalError": "connection reset"
+        }]))
+        .await;
+        assert!(!outcome.success);
+        assert!(outcome.summary.contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn settled_assistant_error_is_not_success() {
+        let (outcome, _) = run_rpc_events(json!([
+            {"type": "message_end", "message": {
+                "role": "assistant", "stopReason": "error", "errorMessage": "connection reset"
+            }},
+            {"type": "agent_settled"}
+        ]))
+        .await;
+        assert!(!outcome.success);
+        assert!(outcome.summary.contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn successful_retry_clears_transient_error() {
+        let (outcome, live) = run_rpc_events(json!([
+            {"type": "message_end", "message": {
+                "role": "assistant", "stopReason": "error", "errorMessage": "connection reset"
+            }},
+            {"type": "auto_retry_start", "errorMessage": "connection reset"},
+            {"type": "message_end", "message": {
+                "role": "assistant", "stopReason": "stop"
+            }},
+            {"type": "auto_retry_end", "success": true},
+            {"type": "agent_settled"}
+        ]))
+        .await;
+        assert!(outcome.success);
+        assert_eq!(outcome.summary, "fake-result");
+        assert_eq!(live, 1);
     }
 
     #[tokio::test]
