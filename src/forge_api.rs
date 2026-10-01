@@ -14,9 +14,14 @@ use crate::error::{BotError, Result};
 use crate::forge::{ForgeMessage, ReplyTarget, ReviewCommentTarget};
 use crate::location::{ForgeKind, ForgeLocation};
 
-/// Minimal forge write API used by the gateway.
+/// Minimal forge API used by the gateway.
 #[async_trait]
 pub trait ForgeApi: Send + Sync {
+    /// Read the PR author's login when supported by the forge.
+    async fn pull_request_author(&self, _message: &ForgeMessage) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Post `body` as a comment on the issue / pull request at `location`.
     async fn post_comment(&self, location: &Url, body: &str) -> Result<()>;
 
@@ -309,6 +314,38 @@ impl HttpForgeApi {
 
 #[async_trait]
 impl ForgeApi for HttpForgeApi {
+    async fn pull_request_author(&self, message: &ForgeMessage) -> Result<Option<String>> {
+        if !message.is_pull_request
+            || !matches!(message.forge, ForgeKind::Forgejo | ForgeKind::Gitea)
+        {
+            return Ok(None);
+        }
+        let Some(number) = message.number else {
+            return Ok(None);
+        };
+        let cfg = self
+            .config
+            .forges
+            .forgejo
+            .as_ref()
+            .ok_or_else(|| BotError::ForgeApi("forgejo is not configured".into()))?;
+        let url = format!(
+            "{}/api/v1/repos/{}/pulls/{number}",
+            cfg.base_url.trim_end_matches('/'),
+            message.repository
+        );
+        let mut request = self.client.get(url);
+        if let Some(token) = &self.forgejo_token {
+            request = request.header("Authorization", format!("token {token}"));
+        }
+        let pr: serde_json::Value = request.send().await?.error_for_status()?.json().await?;
+        Ok(pr
+            .pointer("/user/login")
+            .and_then(serde_json::Value::as_str)
+            .filter(|login| crate::config::is_valid_user_identifier(login))
+            .map(str::to_owned))
+    }
+
     async fn post_comment(&self, location: &Url, body: &str) -> Result<()> {
         let loc = ForgeLocation::parse(location)?;
         match loc.forge {
@@ -476,6 +513,41 @@ mod tests {
                 extra_lines_count: 0,
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn reads_pr_author_with_addressed_users_token() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new().route(
+            "/api/v1/repos/a/b/pulls/22",
+            get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["authorization"], "token reviewer-token");
+                Json(serde_json::json!({"user": {"login": "submitter-bot"}}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = Config::default();
+        config.forges.forgejo = Some(ForgejoConfig {
+            base_url: format!("http://{addr}"),
+            token: Some("global-token".into()),
+            ..Default::default()
+        });
+        let api = HttpForgeApi::with_forgejo_token(config, Some("reviewer-token".into())).unwrap();
+        assert_eq!(
+            api.pull_request_author(&review_message())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("submitter-bot")
+        );
+        let mut issue = review_message();
+        issue.is_pull_request = false;
+        assert!(api.pull_request_author(&issue).await.unwrap().is_none());
+        server.abort();
     }
 
     #[tokio::test]

@@ -416,6 +416,9 @@ async fn explicit_users_route_by_login() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness_with(dir.path(), |config| {
         config.users.clear();
+        config.policy.allow_all = false;
+        config.policy.allowed_users = vec!["shylock".into()];
+        config.policy.allowed_repos = vec!["shylock/forge-bot".into()];
         let user = |role, host: &str, agent: Option<&str>| UserConfig {
             role,
             host_user: host.into(),
@@ -473,6 +476,20 @@ async fn explicit_users_route_by_login() {
         0
     );
 
+    // Configured peers can invoke each other even with a human-only allow-list.
+    let peer = payload(105, "@shylock-reviewer review the updated PR")
+        .replace("\"login\": \"shylock\"", "\"login\": \"shylock-bot\"");
+    assert_eq!(accepted(&harness.app, "issue_comment", &peer).await, 1);
+    let reply = payload(106, "@shylock-bot fix these findings")
+        .replace("\"login\": \"shylock\"", "\"login\": \"shylock-reviewer\"");
+    assert_eq!(accepted(&harness.app, "issue_comment", &reply).await, 1);
+    let self_mention = payload(107, "@shylock-reviewer review again")
+        .replace("\"login\": \"shylock\"", "\"login\": \"shylock-reviewer\"");
+    assert_eq!(
+        accepted(&harness.app, "issue_comment", &self_mention).await,
+        0
+    );
+
     // A mention of an unconfigured login does nothing.
     assert_eq!(
         accepted(
@@ -482,6 +499,34 @@ async fn explicit_users_route_by_login() {
         )
         .await,
         0
+    );
+    for _ in 0..200 {
+        if harness.sessions.pending_jobs().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let submitter = harness
+        .sessions
+        .get("user:shylock-bot:forgejo:shylock/forge-bot:issue:1")
+        .unwrap();
+    assert!(
+        submitter.runs[0]
+            .summary
+            .as_ref()
+            .unwrap()
+            .contains("mentioning only @shylock-reviewer")
+    );
+    let reviewer = harness
+        .sessions
+        .get("user:shylock-reviewer:forgejo:shylock/forge-bot:issue:1")
+        .unwrap();
+    assert!(
+        reviewer.runs[0]
+            .summary
+            .as_ref()
+            .unwrap()
+            .contains("approve the final head")
     );
 }
 

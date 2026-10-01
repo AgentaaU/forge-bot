@@ -74,12 +74,15 @@ pub fn build_adapters(config: &Config) -> HashMap<String, Arc<dyn ForgeAdapter>>
     adapters
 }
 
-/// Build the policy from configuration, adding the configured bot users to the
-/// ignore list.
+/// Build the policy, ignoring unconfigured forge bot accounts.
 pub fn build_policy(config: &Config) -> Policy {
     let mut policy = Policy::new(&config.policy);
     if let Some(forgejo) = &config.forges.forgejo
         && let Some(user) = &forgejo.bot_username
+        && !config
+            .effective_logins()
+            .iter()
+            .any(|login| login.eq_ignore_ascii_case(user))
     {
         policy.ignore_user(user);
     }
@@ -92,13 +95,6 @@ pub fn build_policy(config: &Config) -> Policy {
         && let Some(user) = &gitlab.bot_username
     {
         policy.ignore_user(user);
-    }
-    // Every explicit agent user is ignored too, so one configured user never
-    // reacts to another's comments.
-    for login in config.effective_logins() {
-        if !login.is_empty() {
-            policy.ignore_user(&login);
-        }
     }
     policy
 }
@@ -227,17 +223,17 @@ mod tests {
     }
 
     #[test]
-    fn policy_ignores_every_configured_bot_user() {
+    fn policy_ignores_unconfigured_bot_users() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_all_forges(dir.path());
         let policy = build_policy(&config);
-        assert!(policy.is_ignored("forgejo-bot"));
+        assert!(!policy.is_ignored("forgejo-bot"));
         assert!(policy.is_ignored("github-bot"));
         assert!(policy.is_ignored("gitlab-bot"));
     }
 
     #[test]
-    fn policy_ignores_every_explicit_agent_login() {
+    fn policy_allows_explicit_agent_handoffs() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_with_all_forges(dir.path());
         let user = |role, host: &str| UserConfig {
@@ -255,8 +251,8 @@ mod tests {
             user(UserRole::Reviewer, "reviewer"),
         );
         let policy = build_policy(&config);
-        assert!(policy.is_ignored("forgejo-bot"));
-        assert!(policy.is_ignored("forgejo-reviewer"));
+        assert!(!policy.is_ignored("forgejo-bot"));
+        assert!(!policy.is_ignored("forgejo-reviewer"));
     }
 
     #[tokio::test]

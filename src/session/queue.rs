@@ -193,7 +193,20 @@ impl Dispatcher {
         mention: Mention,
         agent_name: &str,
     ) -> Result<Uuid> {
-        self.inner.policy.authorize(&message)?;
+        let author = (message.forge == crate::location::ForgeKind::Forgejo)
+            .then(|| self.inner.identities.by_login(&message.author))
+            .flatten();
+        if author.is_some() {
+            let recipient = self.inner.identities.recipient(&message.body)?;
+            if recipient.login.eq_ignore_ascii_case(&message.author) {
+                return Err(BotError::Unauthorized(
+                    "agent self-mention is ignored".into(),
+                ));
+            }
+        }
+        self.inner
+            .policy
+            .authorize_with_agent(&message, author.is_some())?;
         self.enqueue(message, mention, agent_name).await
     }
 
@@ -760,6 +773,22 @@ impl Inner {
             location: job.message.location.clone(),
             message: job.mention.message_or_default().to_owned(),
         };
+        let pull_request_author =
+            if user.role == crate::config::UserRole::Reviewer && job.message.is_pull_request {
+                match self
+                    .api_for(user_id.as_deref())
+                    .pull_request_author(&job.message)
+                    .await
+                {
+                    Ok(author) => author,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not resolve PR author for reviewer");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         let mut context = AgentContext {
             workspace,
             forge: Some(job.message.forge),
@@ -777,6 +806,12 @@ impl Inner {
             host_user,
             user_id: user_id.clone(),
             model: None,
+            reviewer: self
+                .identities
+                .reviewer_for(&user.login)
+                .map(|reviewer| reviewer.login.clone()),
+            is_reviewer: user.role == crate::config::UserRole::Reviewer,
+            pull_request_author,
         };
 
         // The requested agent first, then every other available agent. The

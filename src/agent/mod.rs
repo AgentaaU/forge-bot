@@ -47,6 +47,12 @@ pub struct AgentContext {
     pub repository: String,
     /// Login of the forge user who requested this run.
     pub requester: String,
+    /// One configured reviewer selected for PR handoffs.
+    pub reviewer: Option<String>,
+    /// Whether this run belongs to an account with the reviewer role.
+    pub is_reviewer: bool,
+    /// PR submitter resolved by the gateway, distinct from the comment author.
+    pub pull_request_author: Option<String>,
     pub issue_number: Option<u64>,
     pub is_pull_request: bool,
     /// Issue a pull request closes, when known. Used to prefer the same pooled
@@ -294,6 +300,9 @@ mod tests {
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
             requester: "alice".into(),
+            reviewer: None,
+            is_reviewer: false,
+            pull_request_author: None,
             issue_number: Some(1),
             is_pull_request: false,
             linked_issue: None,

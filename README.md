@@ -221,13 +221,27 @@ agent = "codex"        # optional adapter override
 agent_model = "gpt-fast"   # optional model passed to the agent
 ```
 
+When an agent submits or updates a PR, its prompt asks it to post a separate
+comment mentioning one configured `role = "reviewer"` account. Forge-bot
+selects the first reviewer in configuration order, excluding the running user;
+without a reviewer, no automatic reviewer handoff is requested. Reviewers are
+given the PR author login by forge-bot and instructed to mention that author
+for fixes and ask for another review after updates. If the author lookup fails,
+the reviewer is asked to read it from the forge. On a successful review, they rebase/squash to one commit, verify the
+final result, approve, and enable fast-forward auto-merge. These are agent
+instructions; completion depends on the agent and its forge permissions.
+Configured accounts can mention peers within the repository policy even when
+`allowed_users` lists only humans. Self-mentions, ambiguous mentions, and
+explicitly ignored authors remain blocked. Use a separate comment containing
+only the intended agent handle for each handoff.
+
 Each user is addressed by its own login (`@forge-reviewer`). The default user
 logs in as `forgejo.bot_username`, or its table key when that is unset; a
 non-default user logs in as its table key. An `--agent=` in the mention still
 takes precedence, then the user's `agent`, then the registry default. A
 comment that addresses more than one configured user is ignored rather than
-routed arbitrarily, and every configured login is added to the ignore set so
-agent users never react to one another.
+routed arbitrarily. Configured agent users may address one another, but may
+not invoke themselves.
 
 Every operation for a run uses the addressed user's identity:
 
@@ -373,7 +387,7 @@ Keep the space before `--agent` so Forgejo renders `@agent` as a clickable
 mention. Colon selector forms are no longer accepted.
 
 The mention is matched case-insensitively and only at a word boundary, so
-`foo@agent.com` does not trigger it. Bot comments are ignored to avoid loops.
+`foo@agent.com` does not trigger it. Self-mentions are ignored to avoid loops.
 
 ## Security
 
@@ -381,7 +395,8 @@ The mention is matched case-insensitively and only at a word boundary, so
   without one in production.
 - Authorization is separate from authentication. With no allow-list and no
   `allow_all`, the bot rejects everything.
-- The bot's own login is added to the ignore list automatically.
+- Unconfigured forge bot logins are ignored automatically; configured accounts
+  may invoke peers, with self-mentions blocked.
 - Agents receive a scoped forge token plus `FORGEJO_URL`/`FORGE_TOKEN` in their
   environment. They are *not* given an administrator token; grant only the
   scopes needed to comment and push.

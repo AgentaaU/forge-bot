@@ -53,6 +53,11 @@ impl Policy {
 
     /// Authorize a message, returning a descriptive error when denied.
     pub fn authorize(&self, message: &ForgeMessage) -> Result<()> {
+        self.authorize_with_agent(message, false)
+    }
+
+    /// Configured agents may hand work to peers within the repository policy.
+    pub(crate) fn authorize_with_agent(&self, message: &ForgeMessage, agent: bool) -> Result<()> {
         if self.is_ignored(&message.author) {
             return Err(BotError::Unauthorized(format!(
                 "author `{}` is ignored",
@@ -60,7 +65,14 @@ impl Policy {
             )));
         }
 
-        if self.allow_all {
+        if self.allow_all
+            || (agent
+                && (!self.allowed_users.is_empty() || !self.allowed_repos.is_empty())
+                && (self.allowed_repos.is_empty()
+                    || self
+                        .allowed_repos
+                        .contains(&message.repository.to_lowercase())))
+        {
             return Ok(());
         }
 
@@ -147,6 +159,32 @@ mod tests {
         });
         assert!(policy.authorize(&msg("anyone", "org/repo")).is_ok());
         assert!(policy.authorize(&msg("anyone", "org/other")).is_err());
+    }
+
+    #[test]
+    fn agent_handoffs_keep_repository_and_explicit_ignore_restrictions() {
+        let mut policy = Policy::new(&PolicyConfig {
+            allowed_users: vec!["alice".into()],
+            allowed_repos: vec!["o/r".into()],
+            ..Default::default()
+        });
+        assert!(
+            policy
+                .authorize_with_agent(&msg("bot", "o/r"), true)
+                .is_ok()
+        );
+        assert!(policy.authorize(&msg("bot", "o/r")).is_err());
+        assert!(
+            policy
+                .authorize_with_agent(&msg("bot", "o/other"), true)
+                .is_err()
+        );
+        policy.ignore_user("bot");
+        assert!(
+            policy
+                .authorize_with_agent(&msg("bot", "o/r"), true)
+                .is_err()
+        );
     }
 
     #[test]

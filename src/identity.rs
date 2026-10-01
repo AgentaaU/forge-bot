@@ -85,6 +85,19 @@ impl Identities {
             .expect("resolution guarantees exactly one default user")
     }
 
+    /// Select one reviewer in stable configuration order, excluding the submitter.
+    pub fn reviewer_for(&self, login: &str) -> Option<&Arc<UserRuntime>> {
+        self.users
+            .iter()
+            .find(|user| user.role == UserRole::Reviewer && !user.login.eq_ignore_ascii_case(login))
+    }
+
+    pub fn by_login(&self, login: &str) -> Option<&Arc<UserRuntime>> {
+        self.users
+            .iter()
+            .find(|user| user.login.eq_ignore_ascii_case(login))
+    }
+
     /// Resolve the single user a comment body addresses.
     ///
     /// Rejects an empty mention (no configured user) and any comment that
@@ -250,6 +263,28 @@ mod tests {
 
     fn names() -> Vec<String> {
         vec!["codex".into(), "pi-rpc".into()]
+    }
+
+    #[test]
+    fn selects_one_reviewer_and_never_the_submitter() {
+        let config = config_with_users(&[
+            ("bot", UserRole::Default, "agent"),
+            ("review-a", UserRole::Reviewer, "reviewer"),
+            ("review-b", UserRole::Reviewer, "reviewer"),
+        ]);
+        let identities = Identities::resolve(&config, &names()).unwrap();
+        assert_eq!(identities.reviewer_for("bot").unwrap().login, "review-a");
+        assert_eq!(
+            identities.reviewer_for("REVIEW-A").unwrap().login,
+            "review-b"
+        );
+        let config = config_with_users(&[("bot", UserRole::Default, "agent")]);
+        assert!(
+            Identities::resolve(&config, &names())
+                .unwrap()
+                .reviewer_for("bot")
+                .is_none()
+        );
     }
 
     #[test]

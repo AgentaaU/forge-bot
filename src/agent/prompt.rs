@@ -39,6 +39,29 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
         ));
     }
 
+    if context.is_reviewer {
+        let submitter_mention = context
+            .pull_request_author
+            .as_ref()
+            .map(|submitter| format!("'@{submitter}'"))
+            .unwrap_or_else(|| {
+                "the PR submitter's login (read it from the forge PR author)".into()
+            });
+        prompt.push_str(&format!(
+            "\nYou are acting as a reviewer. On a pull request, inspect the current diff and run relevant checks. \
+             If changes are needed, post an actionable comment mentioning only {submitter_mention}, asking them to fix the findings and mention you again after updating. \
+             When the review is OK, rebase the branch onto the current base and squash it to one commit, \
+             verify the final diff and checks, then approve the final head and enable auto-merge using fast-forward only. \
+             Do not approve or enable auto-merge while findings or checks remain unresolved.\n",
+        ));
+    } else if let Some(reviewer) = &context.reviewer {
+        prompt.push_str(&format!(
+            "\nWhenever you submit or update a pull request, post a separate comment on that PR \
+             mentioning only @{reviewer} and asking them to review the current head. Include the changes \
+             and validation results. Use a new comment after each update so the reviewer is invoked again.\n"
+        ));
+    }
+
     if let ReplyTarget::ReviewComment(target) = &context.reply_target {
         prompt.push_str(&format!(
             "\nThis mention is an inline pull-request review comment. Post any reply in \
@@ -114,6 +137,33 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn submitter_and_reviewer_get_handoff_instructions() {
+        let (request, mut context) = sample();
+        context.reviewer = Some("review-bot".into());
+        let prompt = build_prompt(&request, &context);
+        assert!(prompt.contains("Whenever you submit or update a pull request"));
+        assert!(prompt.contains("mentioning only @review-bot"));
+        context.is_reviewer = true;
+        let prompt = build_prompt(&request, &context);
+        assert!(prompt.contains("PR submitter's login"));
+        assert!(prompt.contains("squash it to one commit"));
+        assert!(prompt.contains("approve the final head"));
+        assert!(prompt.contains("fast-forward only"));
+        assert!(!prompt.contains("mentioning only @review-bot"));
+    }
+
+    #[test]
+    fn reviewer_prompt_names_resolved_pr_author_instead_of_requester() {
+        let (request, mut context) = sample();
+        context.is_reviewer = true;
+        context.pull_request_author = Some("submitter-bot".into());
+        let prompt = build_prompt(&request, &context);
+        assert!(prompt.contains("mentioning only '@submitter-bot'"));
+        assert!(!prompt.contains("read it from the forge PR author"));
+        assert!(!prompt.contains("mentioning only @alice"));
     }
 
     #[test]
