@@ -296,11 +296,13 @@ small {{ color: #666; }}
 <p>Pick your human account, enable browser notifications, and keep this page open.
 Desktop browsers use the page directly. Mobile browsers require HTTPS and a
 service worker; on iOS 16.4+ add this page to the Home Screen first, then grant
-notification permission.</p>
+notification permission. Use <em>Send test notification</em> to confirm the
+browser can raise them.</p>
 <p id="hint"><em>{empty_hint}</em></p>
 <div class="row">
 <label>Human <select id="recipient">{options}</select></label>
 <button id="enable">Enable notifications</button>
+<button id="test">Send test notification</button>
 <button id="refresh">Refresh</button>
 </div>
 <p><small id="status"></small></p>
@@ -452,7 +454,19 @@ mod tests {
         // changes.
         assert!(html.contains("const cursors = {}"));
         assert!(html.contains("data.generation !== generation"));
-        assert!(html.contains("seq !== requestSeq"));
+        // A stale response is rejected, and an in-flight old-generation batch
+        // is abandoned after each awaited display.
+        assert!(html.contains("function isCurrent(seq, recipient)"));
+        assert!(html.contains("seq === requestSeq"));
+        assert!(html.contains("generation !== batchGeneration"));
+        // Deleting (not clearing) the maps stops an in-flight old-generation
+        // display from writing back into the fresh state.
+        assert!(
+            html.contains("for (const key of Object.keys(delivered)) { delete delivered[key]; }")
+        );
+        assert!(
+            html.contains("for (const key of Object.keys(displaying)) { delete displaying[key]; }")
+        );
         assert!(!html.contains("let after = 0"));
     }
 
@@ -497,5 +511,40 @@ mod tests {
         // The broad scope is what lets `navigator.serviceWorker.ready` resolve
         // on both `/notifications` and `/notify`.
         assert!(html.contains("{ scope: '/' }"), "{html}");
+    }
+
+    #[test]
+    fn page_only_consumes_a_notification_once_it_is_displayed() {
+        let html = render_html(&["alice".into()]);
+        // A rejected display (for example permission not yet granted on a new
+        // Android install) must not advance the cursor past the entry.
+        assert!(
+            html.contains("const displayed = await handle(recipient, notification)"),
+            "{html}"
+        );
+        assert!(
+            html.contains("await registration.showNotification(title, options)"),
+            "{html}"
+        );
+        assert!(html.contains("rendered.has(notification.id)"), "{html}");
+        assert!(html.contains("permission !== 'granted'"), "{html}");
+        assert!(html.contains("Click \"Enable notifications\""), "{html}");
+        // Granting permission re-polls immediately instead of losing the batch.
+        assert!(
+            html.contains("if (permission === 'granted') { poll(); }"),
+            "{html}"
+        );
+        // Only a contiguous handled prefix may advance the cursor, so a later
+        // success never consumes an earlier failure.
+        assert!(
+            html.contains("if (handled) { committed = notification.id; }"),
+            "{html}"
+        );
+        // A successfully displayed entry is remembered separately so retrying
+        // an earlier failure does not raise the later entry a second time, and
+        // overlapping polls share one in-flight display per id.
+        assert!(html.contains("const delivered = {}"), "{html}");
+        assert!(html.contains("deliveredSet.has(notification.id)"), "{html}");
+        assert!(html.contains("inFlight.get(notification.id)"), "{html}");
     }
 }

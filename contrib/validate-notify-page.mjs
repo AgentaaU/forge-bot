@@ -2,15 +2,21 @@
 // Dynamic regression for the emitted /notifications page script.
 //
 // The page is plain JavaScript with no build step, so this harness runs the
-// real `src/notifications.js` against a deterministic browser-API stub:
-//   * notification permission is already granted,
-//   * the service worker registration resolves while the worker is still
-//     `installing`, then activates later.
+// real `src/notifications.js` against a deterministic browser-API stub. It
+// covers the regressions that are hard to catch with static assertions:
 //
-// It asserts that no notification request or display happens before the
-// worker is active, that the first poll uses `after=0`, and that the batch is
-// delivered through `ServiceWorkerRegistration.showNotification` (never the
-// unsupported `Notification` constructor).
+//   1. Delayed activation: the registration resolves while the worker is still
+//      `installing`, so polling/display must wait for `activated`.
+//   2. Missing permission: the first batch must not be consumed while
+//      permission is `default`; after the user grants it, the same batch is
+//      displayed and only then does the cursor advance.
+//   3. Partial display failure: a later entry succeeding in a batch must not
+//      let the cursor pass an earlier entry that failed, and retrying the
+//      earlier entry must not raise the already-displayed later entry again.
+//   4. Recipient switch while a display is pending: the abandoned batch must
+//      not render, raise or advance anything on the newly selected page.
+//   5. Restart-generation reset while a display is pending: the abandoned old
+//      batch must not restore a stale cursor or repopulate the reset log.
 //
 // Run from the repository root with: node contrib/validate-notify-page.mjs
 
@@ -26,138 +32,381 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-const requests = [];
-const shown = [];
-let constructorCalls = 0;
-let worker;
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+async function settle() {
+  await tick();
+  await tick();
+  await tick();
+}
 
-function element() {
+function notification(id, recipient, message) {
   return {
-    textContent: '',
-    value: 'alice',
-    children: [],
-    href: '',
-    listeners: {},
-    append(...nodes) {
-      this.children.push(...nodes);
-    },
-    prepend(node) {
-      this.children.unshift(node);
-    },
-    addEventListener(type, handler) {
-      this.listeners[type] = handler;
-    },
+    id,
+    recipient,
+    author: 'shylock-bot',
+    repository: 'shylock/forge-bot',
+    location: `https://forge.example/shylock/forge-bot/issues/${id}`,
+    message,
+    created_at: '2026-01-01T00:00:00Z',
   };
 }
 
-const elements = {
-  status: element(),
-  log: element(),
-  recipient: element(),
-  enable: element(),
-  refresh: element(),
-};
+// `entries` is filtered by recipient and `after` exactly like the real
+// endpoint, so a test can prove which cursor the page asked for. `onShow`
+// receives the entry, the per-entry attempt count and the options; it may
+// resolve, reject (to simulate a failed display) or return a promise the test
+// resolves later (to hold a display in flight).
+function createHarness({ permission, entries = [], onShow } = {}) {
+  const requests = [];
+  const shown = [];
+  const attempts = new Map();
+  let currentPermission = permission;
+  let currentGeneration = 'gen-1';
+  let constructorCalls = 0;
+  let worker;
 
-class Notification {
-  static permission = 'granted';
-  static requestPermission() {
-    return Promise.resolve('granted');
+  function element() {
+    return {
+      _text: '',
+      value: 'alice',
+      children: [],
+      href: '',
+      listeners: {},
+      get textContent() {
+        return this._text;
+      },
+      set textContent(value) {
+        this._text = value;
+        // The real DOM clears children when textContent is assigned.
+        if (value === '') { this.children = []; }
+      },
+      append(...nodes) {
+        this.children.push(...nodes);
+      },
+      prepend(node) {
+        this.children.unshift(node);
+      },
+      addEventListener(type, handler) {
+        this.listeners[type] = handler;
+      },
+    };
   }
-  constructor() {
-    constructorCalls += 1;
-    throw new TypeError('Notification constructor is unsupported on mobile');
+
+  const elements = {
+    status: element(),
+    log: element(),
+    recipient: element(),
+    enable: element(),
+    test: element(),
+    refresh: element(),
+  };
+
+  class Notification {
+    static get permission() {
+      return currentPermission;
+    }
+    static requestPermission() {
+      currentPermission = 'granted';
+      return Promise.resolve('granted');
+    }
+    constructor() {
+      constructorCalls += 1;
+      throw new TypeError('Illegal constructor on mobile');
+    }
   }
+
+  const registration = {
+    active: null,
+    installing: null,
+    showNotification(title, options) {
+      const entry = entries.find((candidate) => candidate.message === options.body);
+      const id = entry ? entry.id : 0;
+      const attempt = (attempts.get(id) || 0) + 1;
+      attempts.set(id, attempt);
+      return Promise.resolve()
+        .then(() => (onShow ? onShow(entry || { id }, attempt, options) : undefined))
+        .then(() => {
+          shown.push({ id, title, body: options.body });
+        });
+    },
+  };
+
+  const sandbox = {
+    console,
+    Promise,
+    Object,
+    Math,
+    Date,
+    encodeURIComponent,
+    decodeURIComponent,
+    setTimeout,
+    clearTimeout,
+    document: {
+      getElementById: (id) => elements[id],
+      createElement: () => element(),
+    },
+    navigator: {
+      serviceWorker: {
+        register(script, options) {
+          if (script !== '/notifications/sw.js') throw new Error(`unexpected script ${script}`);
+          if (!options || options.scope !== '/') {
+            throw new Error('service worker not registered at root scope');
+          }
+          worker = {
+            state: 'installing',
+            listeners: {},
+            addEventListener(type, handler) {
+              this.listeners[type] = handler;
+            },
+            activate() {
+              this.state = 'activated';
+              registration.active = this;
+              if (this.listeners.statechange) this.listeners.statechange();
+            },
+          };
+          registration.installing = worker;
+          return Promise.resolve(registration);
+        },
+        // Never resolves, so the script must use the registration's worker
+        // state rather than the container readiness promise.
+        ready: new Promise(() => {}),
+      },
+    },
+    Notification,
+    fetch(url) {
+      requests.push(url);
+      const recipient = /[?&]recipient=([^&]+)/.exec(url);
+      const after = /[?&]after=(\d+)/.exec(url);
+      const selected = recipient ? decodeURIComponent(recipient[1]) : '';
+      const cursor = after ? Number(after[1]) : 0;
+      return Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            generation: currentGeneration,
+            notifications: entries.filter(
+              (entry) => entry.recipient === selected && entry.id > cursor,
+            ),
+          }),
+      });
+    },
+    setInterval() {},
+  };
+
+  vm.runInNewContext(source, sandbox, { filename: 'notifications.js' });
+
+  return {
+    elements,
+    requests,
+    shown,
+    attempts,
+    entries,
+    activate: () => worker.activate(),
+    grant: () => {
+      currentPermission = 'granted';
+    },
+    setGeneration: (value) => {
+      currentGeneration = value;
+    },
+    poll: () => elements.refresh.listeners.click(),
+    constructorCalls: () => constructorCalls,
+  };
 }
 
-const workerPromise = new Promise(() => {});
+// Scenario 1: permission already granted, worker activates late.
+{
+  const h = createHarness({
+    permission: 'granted',
+    entries: [notification(1, 'alice', 'please rotate the key')],
+  });
+  await settle();
+  assert(h.requests.length === 0, `polled before the worker was active: ${JSON.stringify(h.requests)}`);
+  assert(h.shown.length === 0, `displayed before the worker was active: ${JSON.stringify(h.shown)}`);
 
-const registration = {
-  active: null,
-  installing: null,
-  showNotification(title, options) {
-    shown.push({ title, body: options && options.body });
-    return Promise.resolve();
-  },
-};
+  h.activate();
+  await settle();
+  assert(h.requests.length === 1, `expected one poll after activation, got ${JSON.stringify(h.requests)}`);
+  assert(h.requests[0].includes('after=0'), `first poll must start at after=0: ${h.requests[0]}`);
+  assert(h.shown.length === 1, `expected the notification to be displayed: ${JSON.stringify(h.shown)}`);
+  assert(h.constructorCalls() === 0, 'used the unsupported Notification constructor');
+  assert(h.elements.log.children.length === 1, 'notification was not rendered in the log');
+  console.log('delayed activation: waited, then delivered via showNotification');
+}
 
-const sandbox = {
-  console,
-  Promise,
-  Object,
-  Math,
-  Date,
-  encodeURIComponent,
-  setTimeout,
-  clearTimeout,
-  document: {
-    getElementById: (id) => elements[id],
-    createElement: () => element(),
-  },
-  navigator: {
-    serviceWorker: {
-      register(script, options) {
-        if (script !== '/notifications/sw.js') throw new Error(`unexpected script ${script}`);
-        if (!options || options.scope !== '/') throw new Error('service worker not registered at root scope');
-        worker = {
-          state: 'installing',
-          listeners: {},
-          addEventListener(type, handler) {
-            this.listeners[type] = handler;
-          },
-          activate() {
-            this.state = 'activated';
-            registration.active = this;
-            if (this.listeners.statechange) this.listeners.statechange();
-          },
-        };
-        registration.installing = worker;
-        return Promise.resolve(registration);
-      },
-      ready: workerPromise,
+// Scenario 2: permission is still "default" for the first batch. The entry is
+// shown in the log but must not be consumed until it is actually displayed.
+{
+  const h = createHarness({
+    permission: 'default',
+    entries: [notification(1, 'alice', 'please rotate the key')],
+  });
+  h.activate();
+  await settle();
+  assert(h.requests.length === 1, `expected the initial poll, got ${JSON.stringify(h.requests)}`);
+  assert(h.shown.length === 0, 'displayed without permission');
+  assert(h.elements.log.children.length === 1, 'pending entry missing from the log');
+
+  // Grant permission and poll again: the same entry is delivered and the
+  // cursor finally advances.
+  h.grant();
+  await h.poll();
+  await settle();
+  assert(h.shown.length === 1, `granting permission did not deliver the entry: ${JSON.stringify(h.shown)}`);
+
+  // The next poll starts after the delivered id.
+  await h.poll();
+  await settle();
+  assert(
+    h.requests.at(-1).includes('after=1'),
+    `cursor did not advance after delivery: ${JSON.stringify(h.requests)}`,
+  );
+  assert(h.constructorCalls() === 0, 'used the unsupported Notification constructor');
+  console.log('missing permission: kept the entry pending, delivered after grant');
+}
+
+// Scenario 3: a two-entry batch where the first display fails and the second
+// succeeds. The cursor must stay before the failure so entry 1 is retried, and
+// the successful entry 2 must not be raised again on that retry.
+{
+  let failedOnce = false;
+  const h = createHarness({
+    permission: 'granted',
+    entries: [
+      notification(1, 'alice', 'first'),
+      notification(2, 'alice', 'second'),
+    ],
+    onShow: (entry) => {
+      if (entry.id === 1 && !failedOnce) {
+        failedOnce = true;
+        throw new Error('service worker is not active yet');
+      }
     },
-  },
-  Notification,
-  fetch(url) {
-    requests.push(url);
-    return Promise.resolve({
-      ok: true,
-      json: () =>
-        Promise.resolve({
-          generation: 'gen-1',
-          notifications: [
-            {
-              id: 1,
-              recipient: 'alice',
-              author: 'shylock-bot',
-              repository: 'shylock/forge-bot',
-              location: 'https://forge.example/shylock/forge-bot/issues/1',
-              message: 'please rotate the key',
-              created_at: '2026-01-01T00:00:00Z',
-            },
-          ],
-        }),
-    });
-  },
-  setInterval() {},
-};
+  });
+  h.activate();
+  await settle();
+  assert(
+    h.shown.length === 1 && h.shown[0].id === 2,
+    `expected only entry 2 on the first batch: ${JSON.stringify(h.shown)}`,
+  );
+  assert(h.elements.log.children.length === 2, 'both entries should be rendered in the log');
+  assert(
+    h.requests.at(-1).includes('after=0'),
+    `a later success must not consume an earlier failure: ${h.requests.at(-1)}`,
+  );
 
-vm.runInNewContext(source, sandbox, { filename: 'notifications.js' });
+  // Retry: entry 1 is delivered, entry 2 is not displayed a second time.
+  await h.poll();
+  await settle();
+  assert(
+    h.shown.filter((entry) => entry.id === 1).length === 1,
+    `entry 1 was not delivered on retry: ${JSON.stringify(h.shown)}`,
+  );
+  assert(
+    h.shown.filter((entry) => entry.id === 2).length === 1,
+    `entry 2 was displayed again on retry: ${JSON.stringify(h.shown)}`,
+  );
+  assert(h.attempts.get(2) === 1, `entry 2 was displayed ${h.attempts.get(2)} times`);
 
-// Give the registration promise a chance to resolve; the worker is still
-// installing, so the page must not poll or display anything yet.
-await new Promise((resolve) => setImmediate(resolve));
-await new Promise((resolve) => setImmediate(resolve));
-assert(requests.length === 0, `polled before the worker was active: ${JSON.stringify(requests)}`);
-assert(shown.length === 0, `displayed before the worker was active: ${JSON.stringify(shown)}`);
+  // Only now does the cursor pass both entries.
+  await h.poll();
+  await settle();
+  assert(
+    h.requests.at(-1).includes('after=2'),
+    `cursor did not advance after the prefix was handled: ${h.requests.at(-1)}`,
+  );
+  console.log('partial failure: retried entry 1, did not redisplay entry 2, cursor advanced to 2');
+}
 
-// Activate the worker; now the first poll may run.
-worker.activate();
-await new Promise((resolve) => setImmediate(resolve));
-await new Promise((resolve) => setImmediate(resolve));
-assert(requests.length === 1, `expected one poll after activation, got ${JSON.stringify(requests)}`);
-assert(requests[0].includes('after=0'), `first poll must start at after=0: ${requests[0]}`);
-assert(shown.length === 1, `expected the notification to be displayed: ${JSON.stringify(shown)}`);
-assert(constructorCalls === 0, 'used the unsupported Notification constructor');
-assert(elements.log.children.length === 1, 'notification was not rendered in the log');
+// Scenario 4: switch recipients while Alice's first display is still pending.
+// The abandoned batch must not render Alice's second entry or claim Alice is
+// being watched on Bob's page.
+{
+  let releaseFirst;
+  const h = createHarness({
+    permission: 'granted',
+    entries: [
+      notification(1, 'alice', 'alice-one'),
+      notification(2, 'alice', 'alice-two'),
+    ],
+    onShow: (entry) => {
+      if (entry.id === 1) {
+        return new Promise((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      return undefined;
+    },
+  });
+  h.activate();
+  await settle();
+  assert(typeof releaseFirst === 'function', 'the first display was not held in flight');
 
-console.log('validated: waits for an active worker, then delivers via showNotification');
+  h.elements.recipient.value = 'bob';
+  h.elements.recipient.listeners.change();
+  await settle();
+
+  releaseFirst();
+  await settle();
+
+  assert(
+    h.attempts.get(2) === undefined,
+    `the abandoned batch displayed a later entry: attempts=${h.attempts.get(2)}`,
+  );
+  assert(h.elements.log.children.length === 0, 'the abandoned batch rendered on the new page');
+  assert(
+    h.elements.status.textContent.includes('bob'),
+    `status leaked the old recipient: ${h.elements.status.textContent}`,
+  );
+  console.log('recipient switch: pending display did not leak into the new recipient');
+}
+
+// Scenario 5: a server restart changes the generation while Alice's old
+// display is pending and the new generation reuses the same ids. The old batch
+// must not restore a stale cursor or repopulate the reset log.
+{
+  let releaseOld;
+  const h = createHarness({
+    permission: 'granted',
+    entries: [
+      notification(1, 'alice', 'old-one'),
+      notification(2, 'alice', 'old-two'),
+    ],
+    onShow: (entry) => {
+      if (entry.message === 'old-one') {
+        return new Promise((resolve) => {
+          releaseOld = resolve;
+        });
+      }
+      return undefined;
+    },
+  });
+  h.activate();
+  await settle();
+  assert(typeof releaseOld === 'function', 'the old display was not held in flight');
+
+  // The server restarts: ids begin again and the generation changes.
+  h.entries.length = 0;
+  h.entries.push(notification(1, 'alice', 'new-one'));
+  h.setGeneration('gen-2');
+  await h.poll();
+  await settle();
+  assert(
+    h.shown.some((entry) => entry.body === 'new-one'),
+    `the fresh-generation entry was not displayed: ${JSON.stringify(h.shown)}`,
+  );
+  assert(h.elements.log.children.length === 1, 'the reset log has stale entries');
+
+  releaseOld();
+  await settle();
+  assert(h.elements.log.children.length === 1, 'the old batch rendered after the reset');
+
+  await h.poll();
+  await settle();
+  assert(
+    h.requests.at(-1).includes('after=1'),
+    `the old batch restored a stale cursor: ${h.requests.at(-1)}`,
+  );
+  console.log('generation reset: pending old display abandoned, cursor stayed fresh');
+}
+
+console.log('VALIDATION OK');

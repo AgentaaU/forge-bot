@@ -409,9 +409,13 @@ notifications.
 The cursors are kept per human account, so switching accounts does not hide a
 recipient's pending notifications, and a server restart is detected through a
 per-process generation that resets stale cursors instead of skipping the new
-entries. The notification log is in memory and bounded (the newest 1024
-entries); the forge comment that mentioned the human remains the durable
-record.
+entries. A cursor only advances once an entry has actually been handed to the
+browser (`showNotification` resolved) — a missing permission or a rejected
+display keeps it pending and retried, instead of consuming it silently. The
+page shows the current permission/error state and a **Send test notification**
+button for troubleshooting. The notification log is in memory and bounded (the
+newest 1024 entries); the forge comment that mentioned the human remains the
+durable record.
 
 ## Trigger syntax
 
