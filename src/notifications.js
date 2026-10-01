@@ -2,6 +2,11 @@ const status = document.getElementById('status');
 const log = document.getElementById('log');
 const recipientSelect = document.getElementById('recipient');
 let registration = null;
+// Why the service worker registration failed, if it did. `register()` rejects
+// for environment-specific reasons (site data blocked, insecure context, a
+// transient network error) that the page otherwise swallows, and the Android
+// notification failure cannot be diagnosed without it.
+let serviceWorkerError = null;
 let generation = null;
 let requestSeq = 0;
 // One cursor per human, so switching accounts never hides the new account's
@@ -38,8 +43,12 @@ async function setupServiceWorker() {
     // active state before polling; otherwise the first batch advances the
     // cursor without ever raising a notification.
     registration = await activeRegistration(pending);
+    if (!registration) {
+      serviceWorkerError = 'registered but never activated';
+    }
   } catch (error) {
     registration = null;
+    serviceWorkerError = error.name + ': ' + error.message;
   }
 }
 
@@ -99,13 +108,13 @@ async function testNotification() {
       return;
     }
   }
-  const shown = await display({
+  const result = await display({
     id: 0,
     repository: 'forge-bot test',
     message: 'This is a test notification from forge-bot.',
     location: location.href,
   });
-  if (shown) { setStatus('Test notification sent.'); }
+  if (result.raised) { setStatus('Test notification sent.'); }
 }
 
 function serializeDelivered() {
@@ -132,6 +141,7 @@ async function collectDiagnostics() {
     notificationPermission: typeof Notification === 'undefined' ? null : Notification.permission,
     maxActions: typeof Notification === 'undefined' ? null : (Notification.maxActions || 0),
     serviceWorkerApi: 'serviceWorker' in navigator,
+    serviceWorkerError: serviceWorkerError,
     controller: null,
     registrations: [],
     ready: null,
@@ -230,20 +240,20 @@ async function runDiagnostics() {
   }
 }
 
-// Display one entry. Resolves to true when it is fully handled (shown, or
-// impossible to show) and the cursor may advance; false keeps it pending so the
-// next poll tries again.
+// Display one entry. Resolves to `{ handled, raised }`: `handled` means the
+// entry may be consumed (shown, blocked, or impossible to show) so the cursor
+// can advance, while `raised` means the OS was actually asked to show it.
 async function display(notification) {
-  if (typeof Notification === 'undefined') { return true; }
+  if (typeof Notification === 'undefined') { return { handled: true, raised: false }; }
   const permission = Notification.permission;
   if (permission === 'denied') {
     // The user blocked this origin; the log below is all we can offer.
     setStatus('Browser notifications are blocked for this site; showing them on the page only.');
-    return true;
+    return { handled: true, raised: false };
   }
   if (permission !== 'granted') {
     setStatus('Click "Enable notifications" to receive browser notifications.');
-    return false;
+    return { handled: false, raised: false };
   }
   const title = 'forge-bot: ' + notification.repository;
   // Android needs a small monochrome badge for the status bar and some OEM
@@ -258,22 +268,23 @@ async function display(notification) {
   if (registration && typeof registration.showNotification === 'function') {
     try {
       await registration.showNotification(title, options);
-      return true;
+      return { handled: true, raised: true };
     } catch (error) {
       // Android rejects `new Notification` and can reject `showNotification`
       // while the worker is settling; retry rather than consume the entry.
       setStatus('Could not show a notification: ' + error.message);
-      return false;
+      return { handled: false, raised: false };
     }
   }
   try {
     new Notification(title, options);
-    return true;
+    return { handled: true, raised: true };
   } catch (error) {
     // No service worker and no usable constructor: keep the log entry and
-    // advance so the same batch is not fetched forever.
+    // advance so the same batch is not fetched forever, but report honestly
+    // that nothing was raised (the mobile constructor throws).
     setStatus('This browser cannot raise system notifications; showing them on the page only.');
-    return true;
+    return { handled: true, raised: false };
   }
 }
 
@@ -334,10 +345,10 @@ async function handle(recipient, notification) {
   let pending = inFlight.get(notification.id);
   if (!pending) {
     pending = display(notification).then(
-      function (shown) {
+      function (result) {
         inFlight.delete(notification.id);
-        if (shown) { deliveredSet.add(notification.id); }
-        return shown;
+        if (result.handled) { deliveredSet.add(notification.id); }
+        return result.handled;
       },
       function (error) {
         inFlight.delete(notification.id);

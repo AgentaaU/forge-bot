@@ -56,7 +56,7 @@ function notification(id, recipient, message) {
 // receives the entry, the per-entry attempt count and the options; it may
 // resolve, reject (to simulate a failed display) or return a promise the test
 // resolves later (to hold a display in flight).
-function createHarness({ permission, entries = [], onShow } = {}) {
+function createHarness({ permission, entries = [], onShow, registrationError } = {}) {
   const requests = [];
   const shown = [];
   const attempts = new Map();
@@ -143,6 +143,7 @@ function createHarness({ permission, entries = [], onShow } = {}) {
     decodeURIComponent,
     setTimeout,
     clearTimeout,
+    location: { href: 'https://forge.example/notifications', origin: 'https://forge.example' },
     document: {
       getElementById: (id) => elements[id],
       createElement: () => element(),
@@ -153,6 +154,9 @@ function createHarness({ permission, entries = [], onShow } = {}) {
           if (script !== '/notifications/sw.js') throw new Error(`unexpected script ${script}`);
           if (!options || options.scope !== '/') {
             throw new Error('service worker not registered at root scope');
+          }
+          if (registrationError) {
+            return Promise.reject(registrationError);
           }
           worker = {
             state: 'installing',
@@ -409,6 +413,30 @@ function createHarness({ permission, entries = [], onShow } = {}) {
     `the old batch restored a stale cursor: ${h.requests.at(-1)}`,
   );
   console.log('generation reset: pending old display abandoned, cursor stayed fresh');
+}
+
+// Scenario 6: the service worker fails to register, so `display` falls back to
+// the mobile `Notification` constructor, which throws. The test button must
+// report the failure instead of claiming the notification was sent.
+{
+  const h = createHarness({
+    permission: 'granted',
+    registrationError: new Error('site data is blocked'),
+  });
+  await settle();
+  assert(h.shown.length === 0, 'nothing should be shown without a registration');
+
+  h.elements.test.listeners.click();
+  await settle();
+  assert(
+    !h.elements.status.textContent.includes('Test notification sent'),
+    `the test button falsely reported success: ${h.elements.status.textContent}`,
+  );
+  assert(
+    h.elements.status.textContent.includes('cannot raise system notifications'),
+    `the test button did not report the failure: ${h.elements.status.textContent}`,
+  );
+  console.log('registration failure: test button does not falsely claim success');
 }
 
 console.log('VALIDATION OK');

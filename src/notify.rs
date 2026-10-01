@@ -608,5 +608,12 @@ mod tests {
         assert!(html.contains("notificationPermission"), "{html}");
         assert!(html.contains("getRegistrations()"), "{html}");
         assert!(html.contains("displayTest"), "{html}");
+        // A failed registration is the state the Android report showed, and
+        // `register()` swallows its error, so the report must carry it.
+        assert!(html.contains("serviceWorkerError"), "{html}");
+        assert!(
+            html.contains("serviceWorkerError = error.name + ': ' + error.message"),
+            "{html}"
+        );
     }
 }
