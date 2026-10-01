@@ -37,10 +37,10 @@ use crate::forge::ForgeMessage;
 const PAGE_SCRIPT: &str = include_str!("notifications.js");
 
 /// PNG used as the notification's large icon (and the web app/manifest icon).
-const NOTIFICATION_ICON: &[u8] = include_bytes!("notifications-icon.png");
+const NOTIFICATION_ICON: &[u8] = include_bytes!("../resource/notifications-icon.png");
 
 /// Monochrome PNG used as the Android notification badge (status-bar icon).
-const NOTIFICATION_BADGE: &[u8] = include_bytes!("notifications-badge.png");
+const NOTIFICATION_BADGE: &[u8] = include_bytes!("../resource/notifications-badge.png");
 
 /// One pending human notification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
