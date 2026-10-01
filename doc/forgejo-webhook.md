@@ -212,20 +212,22 @@ ignored. Events without a mention or supported automatic trigger are accepted
 The webhook's scope determines which repositories send events, and its event
 selection determines which automatic triggers run. Subscribe to
 `action_run_failure` for Forgejo Actions failures, and `pull_request` plus
-`push` for merge conflicts. These triggers start the default agent without a
-mention and require a configured Forgejo API token and webhook secret. The
-normal mention authorization policy continues to apply to mentions.
+`push` for merge conflicts. These triggers run without a mention and require a
+configured Forgejo API token and webhook secret. The normal mention
+authorization policy continues to apply to mentions.
 
 `action_run_failure` handles Forgejo Actions runs associated with a current
 open pull request. A run for an older PR head is ignored. `pull_request` events
 and pushes to a PR's base branch check the current PR API `mergeable` value and
-start an agent only when it is `false` and the PR is not a draft. Forgejo
-reports `mergeable = false` both for a real conflict and while its asynchronous
-conflict check is still running, so the bot re-checks a candidate for a short,
-bounded window before acting; a branch that merges cleanly settles to
-`mergeable = true` and is left alone. The bot remembers processed run IDs and
-head/base commit pairs in `auto-triggers.json` under the session directory,
-including across restarts.
+start an agent only when it is `false` and the PR is not a draft. An automatic
+trigger has no mention to select an adapter, so it continues the thread's
+conversation by reusing the adapter that last ran there; a thread with no
+history uses the registry default. Forgejo reports `mergeable = false` both for
+a real conflict and while its asynchronous conflict check is still running, so
+the bot re-checks a candidate for a short, bounded window before acting; a
+branch that merges cleanly settles to `mergeable = true` and is left alone.
+The bot remembers processed run IDs and head/base commit pairs in
+`auto-triggers.json` under the session directory, including across restarts.
 
 When a candidate still reports `mergeable = false` after that window, the bot
 asks Forgejo to merge the base branch into the head branch before starting an

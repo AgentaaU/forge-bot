@@ -198,6 +198,12 @@ async fn mock_pr_api_with_update(
             "/api/v1/repos/shylock/forge-bot/pulls",
             get(move || async move { Json(vec![list]) }),
         )
+        // A conversation comment on a PR is enriched by looking for a review
+        // thread; an empty page tells the adapter there is none.
+        .route(
+            "/api/v1/repos/shylock/forge-bot/pulls/7/reviews",
+            get(|| async { Json(Vec::<Value>::new()) }),
+        )
         .route(
             "/api/v1/repos/shylock/forge-bot/pulls/7/update",
             post(move || async move { update_status }),
@@ -221,6 +227,18 @@ async fn accepted(app: &Router, event: &str, payload: &str) -> usize {
     serde_json::from_slice::<Value>(&bytes).unwrap()["accepted"]
         .as_u64()
         .unwrap() as usize
+}
+
+/// Wait for every queued job to finish so a test can inspect the session
+/// records the runs produced.
+async fn wait_for_jobs(sessions: &SessionStore) {
+    for _ in 0..400 {
+        if sessions.pending_jobs().unwrap().is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("jobs did not drain");
 }
 
 #[tokio::test]
@@ -375,6 +393,65 @@ async fn auto_conflict_update_of_a_conflicting_branch_starts_the_agent() {
         "pull_request":{"number":7,"body":""}})
     .to_string();
     assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 1);
+    server.abort();
+}
+
+/// Issue #137: a signed forge event has no mention to choose an adapter, so it
+/// must continue the conversation with the agent the thread already used
+/// instead of snapping back to the registry default.
+#[tokio::test]
+async fn auto_trigger_reuses_the_threads_previous_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = mock_pr_api_with_update(false, StatusCode::CONFLICT).await;
+    let harness = harness_with(dir.path(), |config| {
+        config.agent_sequence = vec!["custom".into(), "other".into()];
+        config.agents.overrides.insert(
+            "other".into(),
+            AgentConfig {
+                command: Some("cat".into()),
+                ..Default::default()
+            },
+        );
+        config.forges.forgejo.as_mut().unwrap().base_url = url;
+        config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+    });
+    let key = "user:default:forgejo:shylock/forge-bot:pr:7";
+
+    // A human mention explicitly selects the non-default `other` adapter.
+    let mention = json!({
+        "action": "created",
+        "issue": {"number": 7, "title": "Fix it", "pull_request": {"url": "x"},
+                  "html_url": "http://forge.local:3000/shylock/forge-bot/pulls/7"},
+        "comment": {"id": 77, "body": "@shylock-bot --agent=other please do the thing",
+                    "user": {"login": "shylock"}},
+        "repository": {"full_name": "shylock/forge-bot"},
+        "sender": {"login": "shylock"}
+    })
+    .to_string();
+    assert_eq!(accepted(&harness.app, "issue_comment", &mention).await, 1);
+    wait_for_jobs(&harness.sessions).await;
+    assert_eq!(
+        harness
+            .sessions
+            .get(key)
+            .unwrap()
+            .runs
+            .last()
+            .unwrap()
+            .agent,
+        "other"
+    );
+
+    // The automatic conflict trigger has no mention but must keep using
+    // `other` for the same thread rather than falling back to `custom`.
+    let pr = json!({"action":"synchronized", "repository":{"full_name":"shylock/forge-bot"},
+        "pull_request":{"number":7,"body":""}})
+    .to_string();
+    assert_eq!(accepted(&harness.app, "pull_request", &pr).await, 1);
+    wait_for_jobs(&harness.sessions).await;
+    let session = harness.sessions.get(key).unwrap();
+    assert_eq!(session.agent, "other");
+    assert_eq!(session.runs.last().unwrap().agent, "other");
     server.abort();
 }
 

@@ -379,9 +379,10 @@ impl AutoTrigger {
             agent: None,
             message: instruction,
         };
-        let result = dispatcher
-            .submit_auto(message, mention, dispatcher.default_agent_name())
-            .await;
+        // An automatic trigger continues the thread's conversation, so it
+        // reuses the adapter the thread last ran instead of the default.
+        let agent = dispatcher.auto_trigger_agent(&message);
+        let result = dispatcher.submit_auto(message, mention, &agent).await;
         match result {
             Ok(_) => Ok(1),
             Err(error) => {

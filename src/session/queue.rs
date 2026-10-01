@@ -332,6 +332,25 @@ impl Dispatcher {
         self.inner.agents.default_name()
     }
 
+    /// Adapter to use for a signed forge event that has no user mention.
+    ///
+    /// An automatic trigger (a failed CI run or a merge conflict) continues the
+    /// conversation the thread already started, so it reuses the adapter that
+    /// most recently ran for that conversation instead of jumping back to the
+    /// registry default. The registry default is used for a thread with no
+    /// history and when the remembered adapter is no longer registered, so a
+    /// removed/renamed adapter cannot leave an automatic trigger unroutable.
+    pub fn auto_trigger_agent(&self, message: &ForgeMessage) -> String {
+        let user = self.inner.recipient_for(message);
+        let key = SessionStore::key(message, Some(&user.id));
+        self.inner
+            .sessions
+            .get(&key)
+            .map(|session| session.agent)
+            .filter(|agent| self.inner.agents.get(agent).is_ok())
+            .unwrap_or_else(|| self.inner.agents.default_name().to_owned())
+    }
+
     /// A snapshot of every conversation the bot is tracking, newest activity
     /// first within each state. Powers the `/status` page.
     pub fn threads(&self) -> Result<Vec<ThreadStatus>> {
@@ -1589,6 +1608,79 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dispatcher = dispatcher_for(test_config(dir.path()), dir.path());
         assert!(dispatcher.inner.user_for(None).is_err());
+    }
+
+    /// A signed forge event has no mention to select an adapter, so it must
+    /// continue the conversation's own agent instead of snapping back to the
+    /// registry default (issue #137).
+    #[tokio::test]
+    async fn auto_trigger_reuses_the_conversations_previous_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = explicit_config(dir.path());
+        let config = Arc::new(config);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(AgentRegistry::from_config(&config)),
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        let mut auto = message("o/r");
+        auto.body = "Investigate the failed CI run".into();
+        auto.author = crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into();
+
+        // A thread with no history still uses the registry default.
+        assert_eq!(
+            dispatcher.auto_trigger_agent(&auto),
+            dispatcher.default_agent_name()
+        );
+
+        // Seed the conversation with a run by a non-default adapter, as an
+        // earlier human mention with `--agent=custom` would have.
+        let user = dispatcher.inner.recipient_for(&auto);
+        let job = Job {
+            id: Uuid::new_v4(),
+            message: auto.clone(),
+            mention: Mention {
+                agent: None,
+                message: "resolve".into(),
+            },
+            agent: "custom".into(),
+            user_id: Some(user.id.clone()),
+            created_at: Utc::now(),
+            status_comment: None,
+            waiting: false,
+        };
+        sessions.begin(&job).unwrap();
+
+        assert_eq!(dispatcher.auto_trigger_agent(&auto), "custom");
+
+        // A remembered adapter that is no longer registered cannot strand the
+        // trigger; the default is used instead.
+        let mut removed = auto.clone();
+        removed.number = Some(2);
+        let user = dispatcher.inner.recipient_for(&removed);
+        let job = Job {
+            id: Uuid::new_v4(),
+            message: removed.clone(),
+            mention: Mention {
+                agent: None,
+                message: "resolve".into(),
+            },
+            agent: "ghost".into(),
+            user_id: Some(user.id.clone()),
+            created_at: Utc::now(),
+            status_comment: None,
+            waiting: false,
+        };
+        sessions.begin(&job).unwrap();
+        assert_eq!(
+            dispatcher.auto_trigger_agent(&removed),
+            dispatcher.default_agent_name()
+        );
     }
 
     #[tokio::test]
