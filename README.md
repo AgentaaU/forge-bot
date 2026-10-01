@@ -410,6 +410,13 @@ permission is per-origin:
 there and grant notification permission. Safari tabs cannot receive these
 notifications.
 
+If the page is served behind a **private CA**, mobile browsers refuse to
+register the service worker with an SSL certificate error until the device
+trusts that CA. Set `[notifications] ca_cert_path` to the CA certificate file
+and the page shows a **Download CA certificate** link
+(`/notifications/ca.crt`) so the device can install it; the link is only
+rendered when the file exists.
+
 On Android 13+ the site permission is separate from Chrome's own OS-level
 notification permission. If the page reports "Test notification sent." but no
 notification appears, enable Android **Settings → Apps → Chrome →

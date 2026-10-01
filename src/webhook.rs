@@ -83,6 +83,7 @@ pub fn router(state: AppState) -> Router {
             get(notifications_diagnostics).post(notifications_diagnostics_upload),
         )
         .route("/notifications/sw.js", get(notifications_service_worker))
+        .route("/notifications/ca.crt", get(notifications_ca_cert))
         .route("/notify", get(notifications_page))
         .route("/notify.json", get(notifications_json))
         .route("/webhooks/{forge}", post(receive))
@@ -190,7 +191,15 @@ async fn notifications_page(State(state): State<AppState>) -> Html<String> {
         .iter()
         .map(|human| human.login.clone())
         .collect();
-    Html(crate::notify::render_html(&humans))
+    // Only offer the download when the file is actually present, so the page
+    // never links to a 404.
+    let ca_cert = state
+        .config
+        .notifications
+        .ca_cert_path
+        .as_ref()
+        .is_some_and(|path| path.is_file());
+    Html(crate::notify::render_html(&humans, ca_cert))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -292,6 +301,39 @@ async fn notifications_diagnostics(State(state): State<AppState>) -> Response {
             Json(json!({ "error": "no diagnostics uploaded yet" })),
         )
             .into_response(),
+    }
+}
+
+/// The optional CA certificate offered as a download on the notification page,
+/// so a mobile device can install the private CA and register the notification
+/// service worker.
+async fn notifications_ca_cert(State(state): State<AppState>) -> Response {
+    let Some(path) = state.config.notifications.ca_cert_path.as_ref() else {
+        return (StatusCode::NOT_FOUND, "no CA certificate configured\n").into_response();
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => (
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/x-x509-ca-cert",
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"forge-bot-ca.crt\"",
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "failed to read CA certificate");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read CA certificate\n",
+            )
+                .into_response()
+        }
     }
 }
 

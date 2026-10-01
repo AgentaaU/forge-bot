@@ -42,6 +42,8 @@ pub struct Config {
     pub pi_rpc: PiRpcConfig,
     /// Forge polling ingester, used when webhooks cannot be configured.
     pub poller: PollerConfig,
+    /// Browser notification page options.
+    pub notifications: NotificationsConfig,
     /// Explicit agent users, keyed by a stable `user_id`.
     ///
     /// At least one entry is required; the bot no longer runs a single
@@ -65,6 +67,7 @@ impl Default for Config {
             capacity: CapacityConfig::default(),
             pi_rpc: PiRpcConfig::default(),
             poller: PollerConfig::default(),
+            notifications: NotificationsConfig::default(),
             users: BTreeMap::new(),
         }
     }
@@ -840,6 +843,17 @@ impl Default for PiRpcConfig {
     }
 }
 
+/// Options for the `/notifications` page.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Optional path to a CA certificate offered as a download on the
+    /// notification page (served at `/notifications/ca.crt`). Set this when
+    /// the page is served behind a private CA that a mobile device must trust
+    /// before it will register the notification service worker.
+    pub ca_cert_path: Option<PathBuf>,
+}
+
 /// Configuration for the polling ingester.
 ///
 /// Forge webhooks are the preferred trigger, but a bot account that is only a
@@ -924,6 +938,17 @@ mod tests {
     fn result_reply_can_be_enabled_explicitly() {
         let config: Config = toml::from_str("[reply]\nresult = true\n").unwrap();
         assert!(config.reply.result);
+    }
+
+    #[test]
+    fn parses_notifications_ca_cert_path() {
+        let config: Config =
+            toml::from_str("[notifications]\nca_cert_path = \"/etc/ssl/certs/ca.pem\"\n").unwrap();
+        assert_eq!(
+            config.notifications.ca_cert_path,
+            Some(PathBuf::from("/etc/ssl/certs/ca.pem"))
+        );
+        assert!(Config::default().notifications.ca_cert_path.is_none());
     }
 
     #[test]

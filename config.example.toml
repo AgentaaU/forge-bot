@@ -117,6 +117,14 @@ ack = true
 # Post the result when a job finishes. Enable if agents do not reply themselves.
 result = false
 
+[notifications]
+# Optional path to a CA certificate. When set, it is served at
+# `/notifications/ca.crt` and the notification page offers a "Download CA
+# certificate" link, so a phone can install a private CA. Mobile browsers
+# refuse to register the notification service worker until the device trusts
+# the certificate, so this is the first step to fixing an SSL error there.
+# ca_cert_path = "/etc/ssl/certs/forge-bot-ca.pem"
+
 [capacity]
 # When an agent fails, retry the job on the next available agent instead of
 # leaving the thread unanswered. An agent whose output looks like a quota,

@@ -259,8 +259,10 @@ pub(crate) fn delivery_key(message: &ForgeMessage) -> String {
 ///
 /// `humans` is every configured `human` login. The page asks for browser
 /// notification permission, then polls [`Notifier::since`] and raises a system
-/// notification for each new entry.
-pub fn render_html(humans: &[String]) -> String {
+/// notification for each new entry. `ca_cert` adds a download link for the
+/// private CA a mobile device must trust before it will register the service
+/// worker.
+pub fn render_html(humans: &[String], ca_cert: bool) -> String {
     let mut options = String::new();
     for (index, login) in humans.iter().enumerate() {
         let selected = if index == 0 { " selected" } else { "" };
@@ -271,6 +273,11 @@ pub fn render_html(humans: &[String]) -> String {
     let empty_hint = if humans.is_empty() {
         "No `human` users are configured. Add `[users.<id>] role = \"human\"` to \
          receive notifications."
+    } else {
+        ""
+    };
+    let ca_cert_button = if ca_cert {
+        r#"<a class="button" href="/notifications/ca.crt" download="forge-bot-ca.crt">Download CA certificate</a>"#
     } else {
         ""
     };
@@ -292,7 +299,8 @@ pub fn render_html(humans: &[String]) -> String {
 <style>
 body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 48rem; padding: 0 1rem; }}
 .row {{ display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }}
-select, button {{ font: inherit; padding: .4rem .6rem; }}
+select, button, .button {{ font: inherit; padding: .4rem .6rem; }}
+.button {{ border: 1px solid #767676; border-radius: 2px; background: #efefef; color: #000; text-decoration: none; }}
 #log {{ list-style: none; padding: 0; }}
 #log li {{ border: 1px solid #ddd; border-radius: .4rem; margin: .5rem 0; padding: .6rem; }}
 #log a {{ font-weight: 600; }}
@@ -315,6 +323,7 @@ state for debugging.</p>
 <button id="test">Send test notification</button>
 <button id="diagnostics-button">Run diagnostics</button>
 <button id="refresh">Refresh</button>
+{ca_cert_button}
 </div>
 <p><small id="status"></small></p>
 <pre id="diagnostics"></pre>
@@ -452,18 +461,18 @@ mod tests {
 
     #[test]
     fn page_renders_humans_and_empty_hint() {
-        let html = render_html(&["alice".into(), "bob".into()]);
+        let html = render_html(&["alice".into(), "bob".into()], false);
         assert!(html.contains("value=\"alice\""));
         assert!(html.contains("value=\"bob\""));
         assert!(html.contains("/notifications.json"));
 
-        let empty = render_html(&[]);
+        let empty = render_html(&[], false);
         assert!(empty.contains("No `human` users are configured"));
     }
 
     #[test]
     fn page_uses_a_service_worker_and_per_recipient_cursors() {
-        let html = render_html(&["alice".into(), "bob".into()]);
+        let html = render_html(&["alice".into(), "bob".into()], false);
         // Mobile browsers reject `new Notification`, so the supported path is
         // `ServiceWorkerRegistration.showNotification`.
         assert!(
@@ -497,7 +506,7 @@ mod tests {
 
     #[test]
     fn page_is_installable_as_a_standalone_web_app() {
-        let html = render_html(&["alice".into()]);
+        let html = render_html(&["alice".into()], false);
         // Without these declarations iOS saves a plain bookmark that reopens
         // in the default browser, where notifications are unavailable.
         assert!(html.contains("rel=\"manifest\""), "{html}");
@@ -527,7 +536,7 @@ mod tests {
 
     #[test]
     fn notification_options_include_an_icon_and_badge() {
-        let html = render_html(&["alice".into()]);
+        let html = render_html(&["alice".into()], false);
         assert!(html.contains("/notifications/icon.png"), "{html}");
         assert!(html.contains("/notifications/badge.png"), "{html}");
 
@@ -540,7 +549,7 @@ mod tests {
 
     #[test]
     fn page_waits_for_an_active_service_worker() {
-        let html = render_html(&["alice".into()]);
+        let html = render_html(&["alice".into()], false);
         assert!(html.contains("function activeRegistration"), "{html}");
         assert!(html.contains("await activeRegistration(pending)"), "{html}");
         assert!(
@@ -555,7 +564,7 @@ mod tests {
 
     #[test]
     fn page_only_consumes_a_notification_once_it_is_displayed() {
-        let html = render_html(&["alice".into()]);
+        let html = render_html(&["alice".into()], false);
         // A rejected display (for example permission not yet granted on a new
         // Android install) must not advance the cursor past the entry.
         assert!(
@@ -590,7 +599,7 @@ mod tests {
 
     #[test]
     fn page_can_upload_diagnostics() {
-        let html = render_html(&["alice".into()]);
+        let html = render_html(&["alice".into()], false);
         // The page can self-test the browser/OS notification path and upload
         // the report, because the Android failure is invisible to the server.
         assert!(html.contains("id=\"diagnostics-button\""), "{html}");
@@ -615,5 +624,17 @@ mod tests {
             html.contains("serviceWorkerError = error.name + ': ' + error.message"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn page_offers_the_ca_certificate_when_configured() {
+        // No configured CA: no download link, so the page never links to a 404.
+        let without = render_html(&["alice".into()], false);
+        assert!(!without.contains("/notifications/ca.crt"), "{without}");
+
+        let with = render_html(&["alice".into()], true);
+        assert!(with.contains("/notifications/ca.crt"), "{with}");
+        assert!(with.contains("Download CA certificate"), "{with}");
+        assert!(with.contains("download=\"forge-bot-ca.crt\""), "{with}");
     }
 }

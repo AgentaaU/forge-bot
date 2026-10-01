@@ -1586,6 +1586,66 @@ async fn notifications_serve_png_icon_and_badge() {
 }
 
 #[tokio::test]
+async fn notifications_serve_the_configured_ca_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+
+    // No CA configured: the route reports that rather than serving anything.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/notifications/ca.crt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // With a configured file, the bytes are served as a certificate download.
+    let cert = dir.path().join("ca.crt");
+    std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\n").unwrap();
+    let harness = harness_with(dir.path(), |config| {
+        config.notifications.ca_cert_path = Some(cert.clone());
+        with_human(config);
+    });
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/notifications/ca.crt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-x509-ca-cert")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"forge-bot-ca.crt\"")
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"-----BEGIN CERTIFICATE-----\n");
+}
+
+#[tokio::test]
 async fn notifications_store_and_return_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness_with(dir.path(), with_human);
