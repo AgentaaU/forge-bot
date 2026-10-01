@@ -42,6 +42,17 @@ impl UserRuntime {
         format!("@{}", self.login)
     }
 
+    /// Whether this user runs an agent. A human is a notification recipient
+    /// only and is never routed a run.
+    pub fn is_agent(&self) -> bool {
+        self.role.is_agent()
+    }
+
+    /// Whether this user is a human recipient.
+    pub fn is_human(&self) -> bool {
+        self.role == UserRole::Human
+    }
+
     /// Token to use for this user. A user's own token always wins; only the
     /// default user falls back to the global token, so a non-default user
     /// never acts as the default bot.
@@ -92,6 +103,30 @@ impl Identities {
             .find(|user| user.role == UserRole::Reviewer && !user.login.eq_ignore_ascii_case(login))
     }
 
+    /// Every configured human recipient, in configuration order.
+    pub fn humans(&self) -> Vec<&Arc<UserRuntime>> {
+        self.users.iter().filter(|user| user.is_human()).collect()
+    }
+
+    /// Select one human recipient in configuration order.
+    ///
+    /// An agent is told to mention this login when it needs a person to do
+    /// something it cannot (a privilege request, an account registration, ...).
+    pub fn human_for(&self) -> Option<&Arc<UserRuntime>> {
+        self.users.iter().find(|user| user.is_human())
+    }
+
+    /// Every configured human a comment body addresses, in configuration order.
+    ///
+    /// Used to deliver a notification when an agent mentions a person; humans
+    /// are never routed as agent runs.
+    pub fn human_mentions(&self, body: &str) -> Vec<&Arc<UserRuntime>> {
+        self.users
+            .iter()
+            .filter(|user| user.is_human() && user.is_mentioned(body))
+            .collect()
+    }
+
     pub fn by_login(&self, login: &str) -> Option<&Arc<UserRuntime>> {
         self.users
             .iter()
@@ -118,11 +153,13 @@ impl Identities {
         }
     }
 
-    /// Every configured user a comment body addresses, in configuration order.
+    /// Every configured *agent* user a comment body addresses, in
+    /// configuration order. Humans are excluded: addressing a human must not
+    /// start an agent run.
     pub fn matching_users(&self, body: &str) -> Vec<&Arc<UserRuntime>> {
         self.users
             .iter()
-            .filter(|user| user.is_mentioned(body))
+            .filter(|user| user.is_agent() && user.is_mentioned(body))
             .collect()
     }
 
@@ -284,6 +321,30 @@ mod tests {
                 .unwrap()
                 .reviewer_for("bot")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn humans_are_recipients_not_routed_agents() {
+        let config = config_with_users(&[
+            ("bot", UserRole::Default, "agent"),
+            ("reviewer", UserRole::Reviewer, "reviewer"),
+            ("alice", UserRole::Human, ""),
+        ]);
+        let identities = Identities::resolve(&config, &names()).unwrap();
+        assert_eq!(identities.humans().len(), 1);
+        assert_eq!(identities.human_for().unwrap().login, "alice");
+        assert!(identities.get("alice").unwrap().is_human());
+
+        // A human mention never routes an agent run...
+        assert!(identities.recipient("@alice please").is_err());
+        assert!(identities.matching_users("@alice please").is_empty());
+        // ... but it is discoverable for notification delivery.
+        assert_eq!(identities.human_mentions("@alice please").len(), 1);
+        // The human can still address an agent.
+        assert_eq!(
+            identities.recipient("@shylock-bot do it").unwrap().id,
+            "bot"
         );
     }
 

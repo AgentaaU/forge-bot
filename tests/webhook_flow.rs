@@ -1217,3 +1217,378 @@ async fn status_routes_report_storage_errors() {
         assert!(text.contains(marker), "{uri}: {text}");
     }
 }
+
+fn agent_payload(comment_id: u64, author: &str, body: &str) -> String {
+    json!({
+        "action": "created",
+        "issue": {
+            "number": 1,
+            "title": "initial plan",
+            "html_url": "http://forge.local:3000/shylock/forge-bot/issues/1"
+        },
+        "comment": {
+            "id": comment_id,
+            "body": body,
+            "html_url": format!(
+                "http://forge.local:3000/shylock/forge-bot/issues/1#issuecomment-{comment_id}"
+            ),
+            "user": {"login": author}
+        },
+        "repository": {"full_name": "shylock/forge-bot"},
+        "sender": {"login": author}
+    })
+    .to_string()
+}
+
+fn with_human(config: &mut Config) {
+    config.users.insert(
+        "alice".into(),
+        UserConfig {
+            role: UserRole::Human,
+            host_user: String::new(),
+            agent: None,
+            agent_model: None,
+            token: None,
+        },
+    );
+}
+
+async fn notification_json(harness: &Harness, recipient: &str) -> Value {
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/notifications.json?recipient={recipient}&after=0"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_str(&body_text(response).await).unwrap()
+}
+
+#[tokio::test]
+async fn agent_comment_mentioning_a_human_records_a_notification() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+
+    let payload = agent_payload(
+        99,
+        "shylock-bot",
+        "I need a human to register the service account. @alice please help.",
+    );
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", &payload))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let json = notification_json(&harness, "alice").await;
+    let notifications = json["notifications"].as_array().unwrap();
+    assert_eq!(notifications.len(), 1, "{json}");
+    assert_eq!(notifications[0]["author"], "shylock-bot");
+    assert_eq!(notifications[0]["recipient"], "alice");
+    assert_eq!(notifications[0]["repository"], "shylock/forge-bot");
+    assert!(
+        notifications[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("register the service account")
+    );
+
+    // The page lists the configured human.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/notifications")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("value=\"alice\""), "{html}");
+}
+
+#[tokio::test]
+async fn human_mention_from_a_non_agent_does_not_notify() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+
+    let payload = agent_payload(100, "shylock", "hey @alice please look at this");
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", &payload))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let json = notification_json(&harness, "alice").await;
+    assert!(
+        json["notifications"].as_array().unwrap().is_empty(),
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn notification_endpoint_rejects_a_missing_recipient() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/notifications.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn retried_agent_comment_notifies_a_human_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+    let payload = agent_payload(101, "shylock-bot", "@alice please approve the request");
+
+    for _ in 0..2 {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(signed_request("issue_comment", &payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    let json = notification_json(&harness, "alice").await;
+    assert_eq!(json["notifications"].as_array().unwrap().len(), 1, "{json}");
+}
+
+async fn get_json(harness: &Harness, uri: &str) -> Value {
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    serde_json::from_str(&body_text(response).await).unwrap()
+}
+
+#[tokio::test]
+async fn human_author_does_not_get_the_agent_policy_exemption() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), |config| {
+        config.policy.allow_all = false;
+        config.policy.allowed_users = vec!["someone-else".into()];
+        with_human(config);
+        config.users.insert(
+            "reviewer".into(),
+            UserConfig {
+                role: UserRole::Reviewer,
+                host_user: "reviewer".into(),
+                agent: None,
+                agent_model: None,
+                token: Some("reviewer-token".into()),
+            },
+        );
+    });
+
+    // A configured human is a notification recipient, not an agent, so it must
+    // clear the normal allow-list instead of inheriting the handoff exemption.
+    let payload = agent_payload(200, "alice", "@shylock-bot --agent=custom please do it");
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", &payload))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["accepted"], 0, "{body}");
+
+    // A genuine agent-to-peer handoff still uses the exemption.
+    let payload = agent_payload(201, "shylock-bot", "@reviewer --agent=custom please review");
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", &payload))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["accepted"], 1, "{body}");
+}
+
+#[tokio::test]
+async fn notifications_page_serves_a_service_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/notifications/sw.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(content_type.contains("javascript"), "{content_type}");
+    // The broad scope is what lets `navigator.serviceWorker.ready` resolve on
+    // both `/notifications` and `/notify`.
+    assert_eq!(
+        response
+            .headers()
+            .get("service-worker-allowed")
+            .and_then(|value| value.to_str().ok()),
+        Some("/")
+    );
+    let script = body_text(response).await;
+    assert!(script.contains("addEventListener"), "{script}");
+
+    // The page registers that worker and prefers `showNotification`, the only
+    // notification API available on Android and iOS browsers.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/notifications")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(
+        html.contains("navigator.serviceWorker.register('/notifications/sw.js', { scope: '/' })"),
+        "{html}"
+    );
+    assert!(html.contains("registration.showNotification"), "{html}");
+}
+
+#[tokio::test]
+async fn notifications_page_links_an_installable_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/notifications.webmanifest")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(content_type.contains("manifest"), "{content_type}");
+    let manifest: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(manifest["display"], "standalone", "{manifest}");
+    assert_eq!(manifest["start_url"], "/notifications", "{manifest}");
+
+    // Without a manifest and the Apple meta tag, an iOS Home Screen save is a
+    // bookmark that reopens in the default browser.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/notifications")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("rel=\"manifest\""), "{html}");
+    assert!(html.contains("/notifications.webmanifest"), "{html}");
+    assert!(
+        html.contains("name=\"apple-mobile-web-app-capable\" content=\"yes\""),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn notifications_json_resets_a_stale_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+    let payload = agent_payload(102, "shylock-bot", "@alice please rotate the key");
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", &payload))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let json = notification_json(&harness, "alice").await;
+    let generation = json["generation"].as_str().unwrap().to_owned();
+    let id = json["notifications"][0]["id"].as_u64().unwrap();
+
+    // The current generation keeps the cursor, so the entry is not redelivered.
+    let current = get_json(
+        &harness,
+        &format!("/notifications.json?recipient=alice&after={id}&generation={generation}"),
+    )
+    .await;
+    assert!(
+        current["notifications"].as_array().unwrap().is_empty(),
+        "{current}"
+    );
+
+    // A generation from a previous process resets the cursor, so a page left
+    // open across a restart does not skip the new entries.
+    let stale = get_json(
+        &harness,
+        &format!("/notifications.json?recipient=alice&after={id}&generation=previous-process"),
+    )
+    .await;
+    assert_eq!(
+        stale["notifications"].as_array().unwrap().len(),
+        1,
+        "{stale}"
+    );
+}

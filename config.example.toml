@@ -51,6 +51,13 @@ bot_username = "forge-bot"
 # backend conversations are namespaced by `user_id`, so users never share a
 # checkout or a conversation.
 #
+# A `role = "human"` user is a person, not an agent: it never runs a process,
+# needs no `host_user`, and is not ignored by the policy. Agents are told to
+# mention the first configured human when they need a privilege request, an
+# account registration, a secret or another human action. The `/notifications`
+# web page turns that mention into a browser system notification (service-worker
+# based, so it also works on Android and iOS over HTTPS).
+#
 # [users.forge-bot]
 # role = "default"
 # host_user = "agent"
@@ -62,6 +69,9 @@ bot_username = "forge-bot"
 # token = "change-me-reviewer"
 # agent = "codex"
 # agent_model = "gpt-fast"
+#
+# [users.alice]
+# role = "human"
 
 # --- process execution / account isolation -----------------------------------
 #

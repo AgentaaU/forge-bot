@@ -120,3 +120,58 @@ host_user = "ghost"
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn check_accepts_a_human_without_a_linux_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let passwd = dir.path().join("passwd");
+    write(
+        &passwd,
+        &format!(
+            "agent:x:1000:1000::{}:/bin/bash\n",
+            dir.path().join("home/agent").display()
+        ),
+    );
+    let cgroup_root = dir.path().join("cgroup");
+    std::fs::create_dir_all(&cgroup_root).unwrap();
+    write(&cgroup_root.join("cgroup.controllers"), "");
+    let config = dir.path().join("forge-bot.toml");
+    write(
+        &config,
+        &format!(
+            r#"
+[forgejo]
+base_url = "http://forge.example.com"
+bot_username = "forge-bot"
+
+[policy]
+allow_all = true
+
+[workspace]
+enabled = false
+
+[executor]
+cgroup_root = "{}"
+passwd_file = "{}"
+
+[users.forge-bot]
+role = "default"
+host_user = "agent"
+
+[users.alice]
+role = "human"
+"#,
+            cgroup_root.display(),
+            passwd.display()
+        ),
+    );
+
+    let output = check(&config);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("alice="), "{stdout}");
+}

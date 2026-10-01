@@ -22,6 +22,7 @@ pub mod forge_api;
 pub mod identity;
 pub mod location;
 pub mod mention;
+pub mod notify;
 pub mod policy;
 pub mod poller;
 pub mod session;

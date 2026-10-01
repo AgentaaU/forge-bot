@@ -259,6 +259,11 @@ impl Poller {
             let Some(message) = message_from_comment(repo, &comment) else {
                 continue;
             };
+            // Record human mentions before the routing ignore rules: a polled
+            // agent comment that mentions a human must reach `/notifications`
+            // even when the comment itself is skipped for routing. The shared
+            // recorder dedupes a comment also seen by the webhook ingester.
+            self.dispatcher.record_human_notifications(&message);
             if self.dispatcher.policy().is_ignored(&message.author) {
                 continue;
             }
@@ -1024,6 +1029,57 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|request| request.contains("/repos/o/r/issues/comments"))
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_records_human_mentions_before_routing_ignores() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(MockState::default());
+        state.comments.lock().unwrap().insert(
+            "o/r".into(),
+            MockReply::Json(json!([comment(
+                1,
+                "I need a person. @alice please help.",
+                "shylock-bot"
+            )])),
+        );
+        let base = start_mock(state).await;
+
+        let mut config = test_config(dir.path(), &base);
+        config.poller.repositories = vec!["o/r".into()];
+        // The agent author is ignored for routing; the human request must still
+        // be recorded before that check.
+        config.policy.ignored_users = vec!["shylock-bot".into()];
+        config.users.insert(
+            "alice".into(),
+            crate::config::UserConfig {
+                role: crate::config::UserRole::Human,
+                host_user: String::new(),
+                agent: None,
+                agent_model: None,
+                token: None,
+            },
+        );
+        let (poller, _sessions) = build_poller(config);
+
+        poller.tick().await.unwrap();
+
+        let recorded = poller.dispatcher.notifier().since("alice", 0, None);
+        assert_eq!(recorded.len(), 1, "polling must record the human mention");
+        assert_eq!(recorded[0].author, "shylock-bot");
+
+        // The webhook ingester shares the dispatcher's recorder and dedupe, so
+        // the same comment seen by both ingesters notifies only once.
+        let message = message_from_comment(
+            "o/r",
+            &comment(1, "I need a person. @alice please help.", "shylock-bot"),
+        )
+        .unwrap();
+        poller.dispatcher.record_human_notifications(&message);
+        assert_eq!(
+            poller.dispatcher.notifier().since("alice", 0, None).len(),
+            1
         );
     }
 }

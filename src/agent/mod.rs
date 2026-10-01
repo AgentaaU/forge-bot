@@ -54,6 +54,9 @@ pub struct AgentContext {
     pub reviewer: Option<String>,
     /// Whether this run belongs to an account with the reviewer role.
     pub is_reviewer: bool,
+    /// One configured human recipient the agent may mention when it needs a
+    /// person to act (a privilege request, an account registration, ...).
+    pub human: Option<String>,
     /// PR submitter resolved by the gateway, distinct from the comment author.
     pub pull_request_author: Option<String>,
     pub issue_number: Option<u64>,
@@ -316,6 +319,7 @@ mod tests {
             requester: "alice".into(),
             reviewer: None,
             is_reviewer: false,
+            human: None,
             pull_request_author: None,
             issue_number: Some(1),
             is_pull_request: false,

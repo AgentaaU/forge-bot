@@ -27,6 +27,7 @@ use crate::forge::ForgeMessage;
 use crate::forge_api::{ForgeApi, HttpForgeApi};
 use crate::identity::Identities;
 use crate::mention::{Mention, extract_mention};
+use crate::notify::{Notifier, RecentComments, delivery_key};
 use crate::policy::Policy;
 use crate::session::status::{self, ThreadStatus};
 use crate::session::{Job, SessionStore};
@@ -51,6 +52,12 @@ struct Inner {
     /// Per-user Forgejo API clients, keyed by user id, so a reply uses the
     /// addressed account's token.
     user_apis: HashMap<String, Arc<dyn ForgeApi>>,
+    /// In-memory log backing `/notifications`, shared by the webhook and poll
+    /// ingesters so both record the same human mentions.
+    notifier: Notifier,
+    /// Bounded set of delivery keys already notified, so a comment seen by both
+    /// ingesters (or redelivered) notifies a human only once.
+    notified: Mutex<RecentComments>,
     tx: mpsc::Sender<Job>,
     /// Conversation key -> agent currently running for it, so a follow-up can
     /// be delivered into the live run instead of queueing a second one.
@@ -148,6 +155,8 @@ impl Dispatcher {
             identities,
             executor,
             user_apis,
+            notifier: Notifier::new(),
+            notified: Mutex::new(RecentComments::new(1024)),
             tx,
             running: Mutex::new(HashMap::new()),
         });
@@ -196,7 +205,11 @@ impl Dispatcher {
         let author = (message.forge == crate::location::ForgeKind::Forgejo)
             .then(|| self.inner.identities.by_login(&message.author))
             .flatten();
-        if author.is_some() {
+        // Only a configured *agent* may hand work to a peer. A configured
+        // human is a notification recipient, not an agent, so it must clear
+        // the normal user allow-list like any other author.
+        let author_is_agent = author.as_ref().is_some_and(|user| user.is_agent());
+        if author_is_agent {
             let recipient = self.inner.identities.recipient(&message.body)?;
             if recipient.login.eq_ignore_ascii_case(&message.author) {
                 return Err(BotError::Unauthorized(
@@ -206,7 +219,7 @@ impl Dispatcher {
         }
         self.inner
             .policy
-            .authorize_with_agent(&message, author.is_some())?;
+            .authorize_with_agent(&message, author_is_agent)?;
         self.enqueue(message, mention, agent_name).await
     }
 
@@ -293,6 +306,59 @@ impl Dispatcher {
     /// The resolved user identities.
     pub fn identities(&self) -> &Identities {
         &self.inner.identities
+    }
+
+    /// The in-memory log of human notifications served by `/notifications`.
+    pub fn notifier(&self) -> &Notifier {
+        &self.inner.notifier
+    }
+
+    /// Record a web-page notification for every configured human an agent
+    /// comment mentions.
+    ///
+    /// Both the webhook receiver and the poller call this before their own
+    /// ignore rules, so an agent's request reaches `/notifications` even when
+    /// the comment is skipped for routing, and a comment seen by both
+    /// ingesters is recorded once. Only comments authored by a configured
+    /// agent user can notify, so a human mentioning another human does not.
+    pub fn record_human_notifications(&self, message: &ForgeMessage) {
+        let identities = &self.inner.identities;
+        let Some(author) = identities.by_login(&message.author) else {
+            return;
+        };
+        if !author.is_agent() {
+            return;
+        }
+        let mentions = identities.human_mentions(&message.body);
+        let base = delivery_key(message);
+        for human in mentions {
+            if human.login.eq_ignore_ascii_case(&message.author) {
+                continue;
+            }
+            let key = format!("{base}:{}", human.login.to_ascii_lowercase());
+            if self
+                .inner
+                .notified
+                .lock()
+                .expect("dedupe mutex poisoned")
+                .insert(&key)
+            {
+                continue;
+            }
+            let id = self.inner.notifier.record(
+                &human.login,
+                &message.author,
+                &message.repository,
+                message.location.as_str(),
+                &message.body,
+            );
+            tracing::info!(
+                notification = ?id,
+                recipient = %human.login,
+                author = %message.author,
+                "recorded human notification"
+            );
+        }
     }
     /// Resolve the mention and adapter for a message.
     ///
@@ -830,6 +896,7 @@ impl Inner {
                 .reviewer_for(&user.login)
                 .map(|reviewer| reviewer.login.clone()),
             is_reviewer: user.role == crate::config::UserRole::Reviewer,
+            human: self.identities.human_for().map(|human| human.login.clone()),
             pull_request_author,
         };
 

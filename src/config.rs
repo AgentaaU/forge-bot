@@ -178,17 +178,19 @@ impl Config {
                 .filter(|login| !login.is_empty())
                 .map(str::to_owned)
                 .unwrap_or_else(|| user_id.to_owned()),
-            UserRole::Reviewer => user_id.to_owned(),
+            UserRole::Reviewer | UserRole::Human => user_id.to_owned(),
         }
     }
 
-    /// Every effective bot login for the configured explicit users.
+    /// Every effective agent login for the configured explicit users.
     ///
     /// Used to extend the policy's ignore set so no agent user reacts to
-    /// another one's comments.
+    /// another one's comments. Human recipients are not agents: they must be
+    /// able to mention an agent, so they are deliberately not ignored.
     pub fn effective_logins(&self) -> Vec<String> {
         self.users
             .iter()
+            .filter(|(_, user)| user.role != UserRole::Human)
             .map(|(id, user)| self.effective_login(id, user.role))
             .collect()
     }
@@ -282,7 +284,9 @@ impl Config {
 pub struct UserConfig {
     /// Role of the user. Exactly one configured user must be the default.
     pub role: UserRole,
-    /// Real, non-root Linux account the agent runs as.
+    /// Real, non-root Linux account the agent runs as. Required for agent
+    /// roles; a `human` has no Linux account and may omit it.
+    #[serde(default)]
     pub host_user: String,
     /// Optional registered adapter. When omitted the existing selection and
     /// fallback rules apply.
@@ -307,6 +311,18 @@ pub enum UserRole {
     Default,
     /// Additional accounts that can be addressed by their own login.
     Reviewer,
+    /// A human recipient, not an agent. It never runs a process; an agent
+    /// mentions it when human action (a privilege request, an account
+    /// registration, ...) is required, and forge-bot notifies the web page.
+    Human,
+}
+
+impl UserRole {
+    /// Whether this role runs an agent. Humans are notification recipients
+    /// only, so they are excluded from routing and from the ignored logins.
+    pub fn is_agent(self) -> bool {
+        !matches!(self, UserRole::Human)
+    }
 }
 
 impl UserConfig {
@@ -320,19 +336,24 @@ impl UserConfig {
         }
         let account = self.host_user.trim();
         if account.is_empty() {
-            return Err(BotError::Config(format!(
-                "user `{user_id}` has an empty host_user"
-            )));
-        }
-        if account == "root" || account == "0" {
-            return Err(BotError::Config(format!(
-                "user `{user_id}` must not run as root"
-            )));
-        }
-        if !is_valid_user_identifier(account) {
-            return Err(BotError::Config(format!(
-                "user `{user_id}` has an invalid host_user `{account}`"
-            )));
+            // Only a human recipient may omit the Linux account; every agent
+            // role must run as a real, non-root account.
+            if self.role.is_agent() {
+                return Err(BotError::Config(format!(
+                    "user `{user_id}` has an empty host_user"
+                )));
+            }
+        } else {
+            if account == "root" || account == "0" {
+                return Err(BotError::Config(format!(
+                    "user `{user_id}` must not run as root"
+                )));
+            }
+            if !is_valid_user_identifier(account) {
+                return Err(BotError::Config(format!(
+                    "user `{user_id}` has an invalid host_user `{account}`"
+                )));
+            }
         }
         if let Some(agent) = &self.agent
             && (agent.trim().is_empty() || !is_valid_user_identifier(agent))
@@ -961,6 +982,45 @@ host_user = "reviewer"
         let mut logins = config.effective_logins();
         logins.sort();
         assert_eq!(logins, vec!["legacy-bot".to_owned(), "reviewer".to_owned()]);
+    }
+
+    #[test]
+    fn parses_human_role_without_a_linux_account() {
+        let raw = r#"
+[forgejo]
+bot_username = "legacy-bot"
+
+[users.primary]
+role = "default"
+host_user = "agent"
+
+[users.alice]
+role = "human"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        let human = config.users.get("alice").unwrap();
+        assert_eq!(human.role, UserRole::Human);
+        assert!(human.host_user.is_empty());
+        human.validate_name_and_account("alice").unwrap();
+        assert!(!human.role.is_agent());
+        // Humans are recipients, not bot logins, so they are never ignored.
+        assert_eq!(config.effective_logins(), vec!["legacy-bot".to_owned()]);
+    }
+
+    #[test]
+    fn rejects_an_agent_role_without_a_linux_account() {
+        let raw = r#"
+[users.primary]
+role = "default"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        let error = config
+            .users
+            .get("primary")
+            .unwrap()
+            .validate_name_and_account("primary")
+            .unwrap_err();
+        assert!(error.to_string().contains("empty host_user"));
     }
 
     #[test]

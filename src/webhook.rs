@@ -4,7 +4,6 @@
 //! parsing to the matching [`ForgeAdapter`], extracts `@agent` mentions, and
 //! hands actionable jobs to the [`Dispatcher`].
 
-use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -20,6 +19,7 @@ use crate::auto_trigger::AutoTrigger;
 use crate::config::Config;
 use crate::error::BotError;
 use crate::forge::ForgeAdapter;
+use crate::notify::{RecentComments, delivery_key};
 use crate::session::Dispatcher;
 use crate::session::status;
 
@@ -60,59 +60,6 @@ impl AppState {
     }
 }
 
-/// A small bounded set remembering recently handled comments.
-struct RecentComments {
-    order: VecDeque<String>,
-    set: HashSet<String>,
-    capacity: usize,
-}
-
-impl RecentComments {
-    fn new(capacity: usize) -> Self {
-        Self {
-            order: VecDeque::new(),
-            set: HashSet::new(),
-            capacity,
-        }
-    }
-
-    /// Returns true when the key was already present.
-    fn insert(&mut self, key: &str) -> bool {
-        if self.set.contains(key) {
-            return true;
-        }
-        self.set.insert(key.to_owned());
-        self.order.push_back(key.to_owned());
-        while self.order.len() > self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.set.remove(&old);
-            }
-        }
-        false
-    }
-}
-
-/// Stable key used to ignore duplicate deliveries. Comments use their id;
-/// description events use the issue number plus a hash of the body, so an edit
-/// that changes the text is treated as a new delivery but a re-delivery is not.
-fn delivery_key(message: &crate::forge::ForgeMessage) -> String {
-    match message.comment_id {
-        Some(id) => format!("{}:{}:c{id}", message.forge, message.repository),
-        None => {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(message.body.as_bytes());
-            let digest = hex::encode(hasher.finalize());
-            format!(
-                "{}:{}:d{}:{digest}",
-                message.forge,
-                message.repository,
-                message.number.unwrap_or_default()
-            )
-        }
-    }
-}
-
 /// Build the axum router.
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -121,6 +68,12 @@ pub fn router(state: AppState) -> Router {
         .route("/status", get(status_page))
         .route("/status/details", get(status_details))
         .route("/status.json", get(status_json))
+        .route("/notifications", get(notifications_page))
+        .route("/notifications.json", get(notifications_json))
+        .route("/notifications.webmanifest", get(notifications_manifest))
+        .route("/notifications/sw.js", get(notifications_service_worker))
+        .route("/notify", get(notifications_page))
+        .route("/notify.json", get(notifications_json))
         .route("/webhooks/{forge}", post(receive))
         .route("/webhook/{forge}", post(receive))
         .with_state(state)
@@ -134,6 +87,7 @@ async fn root(State(state): State<AppState>) -> impl IntoResponse {
         "agents": state.agents.names(),
         "mention": state.config.trigger(),
         "status": "/status",
+        "notifications": "/notifications",
     }))
 }
 
@@ -215,6 +169,85 @@ struct StatusQuery {
     q: Option<String>,
 }
 
+/// Human notification page: browser system notifications on desktop and on
+/// mobile over HTTPS through a service worker.
+async fn notifications_page(State(state): State<AppState>) -> Html<String> {
+    let humans: Vec<String> = state
+        .dispatcher
+        .identities()
+        .humans()
+        .iter()
+        .map(|human| human.login.clone())
+        .collect();
+    Html(crate::notify::render_html(&humans))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct NotificationsQuery {
+    recipient: String,
+    #[serde(default)]
+    after: u64,
+    /// Generation the page last saw. A mismatch means the server restarted and
+    /// ids began again, so the cursor must be reset.
+    #[serde(default)]
+    generation: Option<String>,
+}
+
+/// Notifications for one human newer than `after`.
+async fn notifications_json(
+    State(state): State<AppState>,
+    Query(query): Query<NotificationsQuery>,
+) -> Response {
+    if query.recipient.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing recipient" })),
+        )
+            .into_response();
+    }
+    let notifier = state.dispatcher.notifier();
+    let generation = notifier.generation();
+    let notifications = notifier.since(&query.recipient, query.after, query.generation.as_deref());
+    Json(json!({
+        "generation": generation,
+        "notifications": notifications,
+    }))
+    .into_response()
+}
+
+/// The web app manifest linked from the notification page, so an iOS or
+/// Android "Add to Home Screen" install is a standalone app rather than a
+/// bookmark.
+async fn notifications_manifest() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/manifest+json",
+        )],
+        crate::notify::manifest_json(),
+    )
+        .into_response()
+}
+
+/// The service worker the notification page registers so mobile browsers can
+/// use `ServiceWorkerRegistration.showNotification`.
+async fn notifications_service_worker() -> Response {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/javascript; charset=utf-8",
+            ),
+            (
+                axum::http::header::HeaderName::from_static("service-worker-allowed"),
+                "/",
+            ),
+        ],
+        crate::notify::service_worker_js(),
+    )
+        .into_response()
+}
+
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
@@ -267,6 +300,12 @@ async fn receive(
         "webhook received"
     );
     for message in messages {
+        // An agent that mentions a configured human is asking for help. Record
+        // a notification for the web page before the agent's own comment is
+        // ignored for routing. The poller shares this recorder and its dedupe,
+        // so a comment seen by both ingesters notifies only once.
+        state.dispatcher.record_human_notifications(&message);
+
         // Never react to our own comments.
         if state.dispatcher.policy().is_ignored(&message.author) {
             continue;

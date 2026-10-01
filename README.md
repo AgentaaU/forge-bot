@@ -131,6 +131,11 @@ Implemented:
   (running / queued / idle), the agent involved, the queued follow-ups and the
   last result, and searches by comment/issue URL;
   `/status.json` serves the same snapshot (and filter) for scripts
+- [x] Human notifications: a `role = "human"` account is a person, not an
+  agent. Agents are told to mention one when they need a privilege request,
+  an account registration or another human action; `/notifications` turns the
+  mention into a browser system notification (service-worker based, so it also
+  works on Android and iOS over HTTPS)
 
 Still open (see the issue's roadmap):
 
@@ -196,7 +201,7 @@ most important options:
 | `[session]` | Queue/state directory, worker count (the global cap on concurrent agent runs), recovery, and how long an idle thread keeps its status (`retention_secs`, `0` disables eviction). |
 | `[capacity]` | Capacity/quota detection: `fallback`, `cooldown_secs` (default 5 h), extra `markers` (`[quota]` is an alias). |
 | `[agents.<name>]` | Per-agent `command`, `args`, `prompt`, `timeout_secs`, `env`. |
-| `[users.<id>]` | Required agent users: `role` (`default` or `reviewer`), `host_user`, `token`, `agent`, `agent_model`. At least one table is required. |
+| `[users.<id>]` | Required agent users: `role` (`default` or `reviewer`), `host_user`, `token`, `agent`, `agent_model`. A `role = "human"` table is a notification recipient and needs no `host_user`. At least one table is required. |
 | `[executor]` | cgroup executor settings: `cgroup_root`, `passwd_file`. |
 
 Configuration is loaded from `FORGE_BOT_CONFIG` (or `--config`), falling back to
@@ -224,6 +229,9 @@ host_user = "forge-reviewer"
 token = "..."         # required for a non-default user to act as itself
 agent = "codex"        # optional adapter override
 agent_model = "gpt-fast"   # optional model passed to the agent
+
+[users.alice]
+role = "human"        # a person to notify, not an agent; no host_user needed
 ```
 
 When an agent submits or updates a PR, its prompt asks it to post a separate
@@ -239,6 +247,14 @@ Configured accounts can mention peers within the repository policy even when
 `allowed_users` lists only humans. Self-mentions, ambiguous mentions, and
 explicitly ignored authors remain blocked. Use a separate comment containing
 only the intended agent handle for each handoff.
+
+A `role = "human"` user is a person, not an agent. It is never routed a run,
+its `host_user` may be omitted, and it is not added to the policy's ignored
+logins, so a human can still trigger an agent. Agents are told to mention the
+first configured human when they need a person to do something they cannot (a
+privilege request, an account registration, a secret, ...). When an agent
+comment mentions a human, the bot records a notification for that human; see
+[Human notifications](#human-notifications).
 
 Each user is addressed by its own login (`@forge-reviewer`). The default user
 logs in as `forgejo.bot_username`, or its table key when that is unset; a
@@ -360,6 +376,42 @@ and then evicted from memory and disk, so a bot that runs for a long time does
 not accumulate status until it runs out of memory. A thread with a run in
 flight or a mention waiting is never evicted. Set `retention_secs = 0` to keep
 every thread forever.
+
+## Human notifications
+
+When a run needs something only a person can do, the agent is prompted to post
+a comment mentioning one configured `role = "human"` account (the first in
+configuration order) and to say exactly what it needs. The gateway records the
+mention as a notification without routing another agent run.
+
+`GET /notifications` is a small web page that turns those notifications into
+browser system notifications. Pick the human account, grant notification
+permission, and keep the page open; the page polls
+`GET /notifications.json?recipient=<login>&after=<id>` every five seconds and
+raises a system notification for each new entry.
+
+Desktop browsers use the page directly. Android and iOS browsers reject the
+`Notification` constructor and require
+`ServiceWorkerRegistration.showNotification`, so the page registers a small
+service worker (`/notifications/sw.js`, scope `/`) and prefers
+`showNotification` when it is available. The page also links a web app manifest
+(`/notifications.webmanifest`, `display: "standalone"`) and the
+`apple-mobile-web-app-capable` metadata, so "Add to Home Screen" installs a
+notification-capable app rather than a bookmark that reopens in the default
+browser. Service workers only run in a secure context, and notification
+permission is per-origin:
+
+- serve forge-bot over **HTTPS** (or `localhost` during development), and
+- on **iOS 16.4+**, add the page to the **Home Screen** first, then open it from
+there and grant notification permission. Safari tabs cannot receive these
+notifications.
+
+The cursors are kept per human account, so switching accounts does not hide a
+recipient's pending notifications, and a server restart is detected through a
+per-process generation that resets stale cursors instead of skipping the new
+entries. The notification log is in memory and bounded (the newest 1024
+entries); the forge comment that mentioned the human remains the durable
+record.
 
 ## Trigger syntax
 

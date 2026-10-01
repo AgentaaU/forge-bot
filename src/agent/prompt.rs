@@ -62,6 +62,15 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
         ));
     }
 
+    if let Some(human) = &context.human {
+        prompt.push_str(&format!(
+            "\nIf you need a human to do something you cannot (a privilege request, \
+             an account registration, a secret, ...), post a comment mentioning only \
+             @{human} and say exactly what you need and why. Continue with everything \
+             else that is not blocked rather than waiting for the human.\n"
+        ));
+    }
+
     if let ReplyTarget::ReviewComment(target) = &context.reply_target {
         prompt.push_str(&format!(
             "\nThis mention is an inline pull-request review comment. Post any reply in \
@@ -153,6 +162,18 @@ mod tests {
         assert!(prompt.contains("approve the final head"));
         assert!(prompt.contains("fast-forward only"));
         assert!(!prompt.contains("mentioning only @review-bot"));
+    }
+
+    #[test]
+    fn human_guidance_names_the_configured_human() {
+        let (request, mut context) = sample();
+        context.human = Some("alice".into());
+        let prompt = build_prompt(&request, &context);
+        assert!(prompt.contains("If you need a human"));
+        assert!(prompt.contains("mentioning only @alice"));
+
+        context.human = None;
+        assert!(!build_prompt(&request, &context).contains("If you need a human"));
     }
 
     #[test]
