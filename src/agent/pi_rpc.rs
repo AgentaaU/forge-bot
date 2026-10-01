@@ -7,11 +7,16 @@
 //! `[session] workers` count caps how many agents may live at once. Idle
 //! agents are evicted after a configurable TTL.
 //!
-//! By default a process is bound to one conversation: a request for a
-//! different conversation in the same workspace starts a new process so it
-//! resumes its own session instead of inheriting the process's earlier one.
-//! `session_per_conversation = false` restores workspace-level reuse, where an
-//! idle process is handed to any conversation and carries its session.
+//! An idle process is reused for any conversation in the same workspace,
+//! user and model, so the pool size tracks concurrency rather than the number
+//! of threads. When sessions are per-conversation (the default) the pool points
+//! the reused process at the new conversation's own session before prompting:
+//! it switches to the session file that conversation used earlier, or starts a
+//! fresh session (`new_session`) when it is a brand-new thread. This keeps a new
+//! thread from inheriting the previous thread's context while still allowing the
+//! process to be shared. `session_per_conversation = false` restores
+//! workspace-level reuse, where an idle process carries its earlier session into
+//! any conversation.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -104,30 +109,95 @@ impl PiRpcWriter {
     }
 }
 
+/// Backend session state reported by the live process.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SessionState {
+    /// Model selected by the agent, `provider/id` when the protocol names both.
+    pub model: Option<String>,
+    /// Exact session id the process is currently on.
+    pub id: Option<String>,
+    /// Session file backing the current conversation, used to switch back to it.
+    pub file: Option<String>,
+}
+
 impl PiRpcClient {
-    /// Ask the live agent for its selected model. A missing model is normal
-    /// before provider selection or with older RPC implementations.
-    pub async fn current_model(&mut self) -> Result<Option<String>> {
+    /// Send one JSON command and wait for its matching `response` record.
+    ///
+    /// `get_state`-style queries use this too; an explicit failure response is
+    /// reported as an agent error so callers cannot mistake it for success.
+    async fn command(&mut self, value: Value) -> Result<Value> {
         let request_id = self.next_request_id();
-        self.send(&json!({ "id": request_id, "type": "get_state" }))
-            .await?;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut value = value;
+        value["id"] = json!(request_id);
+        self.send(&value).await?;
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let record = self.next_record_before(Some(deadline)).await?;
             if record["type"] == "response" && record["id"].as_str() == Some(request_id.as_str()) {
-                if record["success"].as_bool() == Some(false) {
-                    return Ok(None);
+                if record["success"].as_bool() == Some(false)
+                    && record["data"]["cancelled"].as_bool() != Some(true)
+                {
+                    let reason = record["error"]
+                        .as_str()
+                        .unwrap_or("pi rejected the command")
+                        .to_owned();
+                    return Err(BotError::Agent {
+                        name: "pi-rpc".into(),
+                        reason,
+                    });
                 }
-                let model = &record["data"]["model"];
-                return Ok(match (model["provider"].as_str(), model["id"].as_str()) {
-                    (Some(provider), Some(id)) if !provider.is_empty() && !id.is_empty() => {
-                        Some(format!("{provider}/{id}"))
-                    }
-                    (_, Some(id)) if !id.is_empty() => Some(id.to_owned()),
-                    _ => None,
-                });
+                return Ok(record);
             }
         }
+    }
+
+    /// Read the live process's session state: the selected model, the exact
+    /// session id, and the file backing it.
+    pub async fn session_state(&mut self) -> Result<SessionState> {
+        let record = self.command(json!({ "type": "get_state" })).await?;
+        let data = &record["data"];
+        let model = &data["model"];
+        let model = match (model["provider"].as_str(), model["id"].as_str()) {
+            (Some(provider), Some(id)) if !provider.is_empty() && !id.is_empty() => {
+                Some(format!("{provider}/{id}"))
+            }
+            (_, Some(id)) if !id.is_empty() => Some(id.to_owned()),
+            _ => None,
+        };
+        Ok(SessionState {
+            model,
+            id: data["sessionId"].as_str().map(str::to_owned),
+            file: data["sessionFile"].as_str().map(str::to_owned),
+        })
+    }
+
+    /// Start a fresh session in this process, discarding the previous
+    /// conversation's context. Used when a new thread is assigned to an already
+    /// running pooled agent.
+    pub async fn new_session(&mut self) -> Result<()> {
+        let record = self.command(json!({ "type": "new_session" })).await?;
+        if record["data"]["cancelled"].as_bool() == Some(true) {
+            return Err(BotError::Agent {
+                name: "pi-rpc".into(),
+                reason: "pi canceled the new session".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Load `path` as the process's active session, restoring a conversation
+    /// that ran on an earlier process.
+    pub async fn switch_session(&mut self, path: &str) -> Result<()> {
+        let record = self
+            .command(json!({ "type": "switch_session", "sessionPath": path }))
+            .await?;
+        if record["data"]["cancelled"].as_bool() == Some(true) {
+            return Err(BotError::Agent {
+                name: "pi-rpc".into(),
+                reason: "pi canceled the session switch".into(),
+            });
+        }
+        Ok(())
     }
     /// Spawn a new RPC agent in `workspace`.
     ///
@@ -424,6 +494,9 @@ struct PoolState {
     /// Conversation (issue / pull request) key -> last agent id. Prefer that
     /// agent when idle, while allowing another one to handle a busy thread.
     conversations: HashMap<String, Uuid>,
+    /// Conversation -> backend session file, learned from the live process.
+    /// Lets a reused process switch back to a conversation's own session.
+    session_paths: HashMap<String, String>,
 }
 
 struct PoolEntry {
@@ -519,6 +592,10 @@ impl PoolInner {
     ) -> Result<PoolGuard> {
         let deadline = (self.config.timeout_secs != 0)
             .then(|| Instant::now() + Duration::from_secs(self.config.timeout_secs));
+        // The conversation's own persisted session, if it has run before. A
+        // brand-new conversation falls back to a stable deterministic id so a
+        // failed first attempt does not orphan the id it just created.
+        let stored_session = self.sessions.get("pi-rpc", key);
 
         loop {
             // Register before inspecting the pool so a release between the
@@ -531,45 +608,58 @@ impl PoolInner {
                 self.reap(&mut state);
 
                 let preferred = state.conversations.get(key).copied();
+                let reusable = |entry: &PoolEntry| {
+                    entry.workspace == workspace
+                        && entry.host_user.as_deref() == host_user
+                        && entry.model.as_deref() == model
+                        && !entry.busy
+                        && entry.client.is_some()
+                };
+                // A process may serve a different conversation only when the
+                // pool can point it at that conversation's own session first:
+                // either it has the session file, the conversation is brand
+                // new, or the operator opted out of per-conversation sessions.
+                let can_switch = |entry: &PoolEntry| {
+                    entry.key == key
+                        || !self.config.session_per_conversation
+                        || state.session_paths.contains_key(key)
+                        || stored_session.is_none()
+                };
                 let idle = state
                     .agents
                     .iter()
-                    .position(|entry| {
-                        Some(entry.id) == preferred
-                            && entry.workspace == workspace
-                            && entry.host_user.as_deref() == host_user
-                            && entry.model.as_deref() == model
-                            && !entry.busy
-                            && entry.client.is_some()
-                    })
+                    .position(|entry| Some(entry.id) == preferred && reusable(entry))
                     .or_else(|| {
-                        // A process that already holds another conversation's
-                        // session must not be handed to this one unless the
-                        // operator opted out of per-conversation sessions.
-                        if self.config.session_per_conversation {
-                            return None;
-                        }
-                        state.agents.iter().position(|entry| {
-                            entry.workspace == workspace
-                                && entry.host_user.as_deref() == host_user
-                                && entry.model.as_deref() == model
-                                && !entry.busy
-                                && entry.client.is_some()
-                        })
+                        state
+                            .agents
+                            .iter()
+                            .position(|entry| reusable(entry) && can_switch(entry))
                     });
                 if let Some(index) = idle {
+                    let previous_key = state.agents[index].key.clone();
                     let entry = &mut state.agents[index];
                     entry.busy = true;
                     entry.key = key.to_owned();
                     let id = entry.id;
                     let pid = entry.pid;
                     let client = entry.client.take();
+                    // This process now belongs to `key`; a stale mapping from
+                    // its previous conversation would make the pool hand it
+                    // back for the wrong session.
+                    state.conversations.retain(|_, value| *value != id);
                     state.conversations.insert(key.to_owned(), id);
-                    tracing::debug!(key, pid = ?pid, "reusing idle pi agent");
+                    let reset_session = self.config.session_per_conversation && previous_key != key;
+                    tracing::debug!(
+                        key,
+                        pid = ?pid,
+                        reset_session,
+                        "reusing idle pi agent"
+                    );
                     return Ok(PoolGuard {
                         inner: Arc::clone(self),
                         id,
                         client,
+                        reset_session,
                     });
                 }
 
@@ -588,8 +678,17 @@ impl PoolInner {
 
                 if state.agents.len() < self.max_agents {
                     let id = Uuid::new_v4();
-                    let session_id = (!self.config.no_session)
-                        .then(|| self.sessions.deterministic_id("pi-rpc", key));
+                    let session_id = if self.config.no_session {
+                        None
+                    } else {
+                        // Resume the exact session the conversation used last,
+                        // including a fresh one created by `new_session`.
+                        Some(
+                            stored_session
+                                .clone()
+                                .unwrap_or_else(|| self.sessions.deterministic_id("pi-rpc", key)),
+                        )
+                    };
                     let client = PiRpcClient::spawn(
                         &self.config,
                         workspace,
@@ -619,6 +718,7 @@ impl PoolInner {
                         inner: Arc::clone(self),
                         id,
                         client: Some(client),
+                        reset_session: false,
                     });
                 }
             }
@@ -650,6 +750,9 @@ pub struct PoolGuard {
     inner: Arc<PoolInner>,
     id: Uuid,
     client: Option<PiRpcClient>,
+    /// Set when an idle process was handed to a different conversation and
+    /// must be pointed at that conversation's own session before prompting.
+    reset_session: bool,
 }
 
 impl PoolGuard {
@@ -771,8 +874,50 @@ impl Agent for PiPoolAgent {
         let timeout = (self.inner.config.timeout_secs != 0)
             .then(|| Duration::from_secs(self.inner.config.timeout_secs));
 
-        let model = guard.client_mut()?.current_model().await.unwrap_or(None);
+        // A process reused for a different conversation starts that
+        // conversation's own session: switch back to the file it used before,
+        // or start fresh for a brand-new thread. This is what keeps a new
+        // thread from inheriting the previous thread's context while still
+        // letting the pool share one process.
+        if guard.reset_session {
+            let path = self
+                .inner
+                .state
+                .lock()
+                .expect("pi pool mutex poisoned")
+                .session_paths
+                .get(&key)
+                .cloned();
+            let switched = match path {
+                Some(path) => guard.client_mut()?.switch_session(&path).await.is_ok(),
+                None => false,
+            };
+            if !switched {
+                guard.client_mut()?.new_session().await?;
+            }
+        }
+
+        let state = guard
+            .client_mut()?
+            .session_state()
+            .await
+            .unwrap_or_default();
+        let model = state.model.clone();
         *context.reported_model.lock().expect("model mutex poisoned") = model.clone();
+        // Remember the exact session the conversation is on so a later process
+        // can resume it and a later reuse of this one can switch back to it.
+        if let Some(id) = &state.id {
+            self.inner.sessions.set("pi-rpc", &key, id);
+        }
+        if let Some(file) = &state.file {
+            self.inner
+                .state
+                .lock()
+                .expect("pi pool mutex poisoned")
+                .session_paths
+                .insert(key.clone(), file.clone());
+        }
+
         match guard
             .client_mut()?
             .prompt_with_output(&prompt, timeout, context.live_output.as_ref())
@@ -1123,10 +1268,12 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        // By default the freed process belongs to another conversation, so it
-        // is evicted and a fresh one is spawned for `second`.
-        assert_ne!(second.id, first_id);
+        // The freed process is reused for `second`; the new conversation's
+        // session is started in the agent (see `run`) rather than by spawning
+        // a second process.
+        assert_eq!(second.id, first_id);
         assert_eq!(agent.conversation_binding("first"), None);
+        assert_eq!(agent.conversation_binding("second"), Some(first_id));
         assert_eq!(agent.live_agents(), 1);
     }
 
@@ -1188,50 +1335,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn starts_a_new_process_for_a_new_conversation_by_default() {
+    async fn starts_a_new_session_for_a_new_conversation_by_default() {
         let dir = tempfile::tempdir().unwrap();
+        let command_log = dir.path().join("commands.log");
 
-        let config = PiRpcConfig {
+        let mut config = PiRpcConfig {
             command: fake_pi_command(),
             ..Default::default()
         };
         assert!(config.session_per_conversation);
+        config.env.insert(
+            "FAKE_PI_COMMAND_LOG".into(),
+            command_log.display().to_string(),
+        );
         let agent = PiPoolAgent::new(&config, store(), 3);
-        let workspace = dir.path();
 
-        let first = agent
-            .inner
-            .acquire(
-                "first",
-                workspace,
-                &[],
-                &crate::executor::Executor::direct(),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let first_id = first.id;
-        drop(first);
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let context = |number: u64| AgentContext {
+            workspace: dir.path().to_path_buf(),
+            forge: Some(ForgeKind::Forgejo),
+            repository: "o/r".into(),
+            issue_number: Some(number),
+            ..Default::default()
+        };
 
-        // The process bound to `first` is idle, but a different conversation
-        // must not inherit its session: a new process is spawned instead.
-        let second = agent
-            .inner
-            .acquire(
-                "second",
-                workspace,
-                &[],
-                &crate::executor::Executor::direct(),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_ne!(second.id, first_id);
-        assert_eq!(agent.live_agents(), 2);
-        assert_eq!(agent.conversation_binding("first"), Some(first_id));
-        assert_eq!(agent.conversation_binding("second"), Some(second.id));
+        assert!(agent.run(&request, &context(1)).await.unwrap().success);
+        assert_eq!(agent.live_agents(), 1);
+        let bound = agent
+            .conversation_binding(&conversation_key(&context(1)))
+            .expect("first conversation should bind its process");
+
+        // A different conversation reuses the process rather than spawning a
+        // new one, but must start a fresh session instead of inheriting the
+        // first conversation's context.
+        assert!(agent.run(&request, &context(2)).await.unwrap().success);
+        assert_eq!(agent.live_agents(), 1);
+        assert_eq!(
+            agent.conversation_binding(&conversation_key(&context(2))),
+            Some(bound)
+        );
+        assert_eq!(
+            agent.conversation_binding(&conversation_key(&context(1))),
+            None
+        );
+        let logged = std::fs::read_to_string(&command_log).unwrap();
+        assert!(logged.contains("new_session"), "{logged}");
+        assert!(!logged.contains("switch_session"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn switches_back_to_a_conversations_own_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let command_log = dir.path().join("commands.log");
+
+        let mut config = PiRpcConfig {
+            command: fake_pi_command(),
+            ..Default::default()
+        };
+        config.env.insert(
+            "FAKE_PI_COMMAND_LOG".into(),
+            command_log.display().to_string(),
+        );
+        config.env.insert(
+            "FAKE_PI_SESSION_ID".into(),
+            "aaaaaaaa-1111-5111-8111-111111111111".into(),
+        );
+        let agent = PiPoolAgent::new(&config, store(), 3);
+
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let context = |number: u64| AgentContext {
+            workspace: dir.path().to_path_buf(),
+            forge: Some(ForgeKind::Forgejo),
+            repository: "o/r".into(),
+            issue_number: Some(number),
+            ..Default::default()
+        };
+
+        assert!(agent.run(&request, &context(1)).await.unwrap().success);
+        // A different conversation takes over the idle process and starts a
+        // fresh session.
+        assert!(agent.run(&request, &context(2)).await.unwrap().success);
+        // The first conversation returns to the same process; the pool must
+        // switch it back to that conversation's own session file.
+        assert!(agent.run(&request, &context(1)).await.unwrap().success);
+        assert_eq!(agent.live_agents(), 1);
+        let logged = std::fs::read_to_string(&command_log).unwrap();
+        assert!(logged.contains("switch_session"), "{logged}");
+        assert!(
+            logged.contains("aaaaaaaa-1111-5111-8111-111111111111"),
+            "{logged}"
+        );
     }
 
     #[tokio::test]

@@ -96,12 +96,14 @@ Implemented:
   checks and pi trusts project files by default (`dangerously_skip_permissions = false`
   opts agy, claude, and pi out)
 - [x] Long-lived Pi RPC agent pool (`pi-rpc`), the default Pi backend: reuses an
-  idle agent, spawns one when all are busy, and persists a deterministic
-  `--session-id` so an evicted process resumes its conversation. The pool has
-  no separate size knob: `[session] workers` is the single total agent count. A
-  new conversation starts a new session by default (`session_per_conversation`).
-  The one-shot `pi` adapter is kept but disabled by default
-  (`[agents.pi] enabled = true`)
+  idle agent for any conversation in the same workspace/user/model, and persists
+  each conversation's `--session-id` so an evicted process resumes it. The pool
+  has no separate size knob: `[session] workers` is the single total agent
+  count. By default a reused process starts the new conversation's own session
+  (`new_session` for a brand-new thread, or a switch back to the session file it
+  used before), so a new conversation never inherits another one's context
+  (`session_per_conversation`). The one-shot `pi` adapter is kept but disabled
+  by default (`[agents.pi] enabled = true`)
 - [x] Per-thread agent sessions: one conversation per `owner/repo` issue or PR,
   resumed by `pi-rpc` and the one-shot `codex`/`pi`/`claude` adapters, so the
   model context (and its prompt cache) is reused across comments

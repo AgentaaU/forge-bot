@@ -224,11 +224,13 @@ no_session = false
 # that would otherwise never settle. One-shot CLIs (codex, agy, claude, kimi)
 # have no live stdin channel, so their follow-ups are still queued and run as a
 # separate next turn.
-# Start a new session for a new conversation. When true (default) a pooled
-# process only serves the conversation it is bound to; a different conversation
-# in the same workspace spawns a fresh process rather than inheriting that
-# session. Set to false to let an idle process serve any conversation in the
-# workspace and carry its earlier session.
+# Keep one session per conversation. When true (default) an idle process may
+# serve a different conversation in the same workspace, but the pool first
+# points it at that conversation's own session: it switches back to the session
+# file the conversation used earlier or starts a fresh session (`new_session`)
+# for a brand-new thread. A new thread therefore never inherits the previous
+# thread's context. Set to false to reuse idle processes across conversations
+# in the workspace and carry their earlier session.
 session_per_conversation = true
 # args = []
 
