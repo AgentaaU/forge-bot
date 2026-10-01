@@ -57,7 +57,7 @@ export BOT_URL=http://127.0.0.1:8080/webhooks/forgejo
 export HOOK_BODY='{
   "type": "forgejo",
   "active": true,
-  "events": ["issue_comment", "pull_request_comment", "pull_request_review_comment", "issues", "pull_request", "action_run_failure", "push"],
+  "events": ["issue_comment", "pull_request_comment", "pull_request_review_comment", "pull_request_review_approved", "pull_request_review_rejected", "issues", "pull_request", "action_run_failure", "push"],
   "config": {
     "url": "'"$BOT_URL"'",
     "content_type": "json",
@@ -182,16 +182,24 @@ ones that can carry a mention:
 | Event | Payload | forge-bot status |
 | --- | --- | --- |
 | `issue_comment` | issue + PR conversation comments | handled |
-| `pull_request_comment` | submitted reviews (body + inline comments) | handled |
-| `pull_request_review_comment` | inline review comments (older Forgejo) | handled |
+| `pull_request_comment` | PR conversation comments | handled |
+| `pull_request_review_comment` | a submitted review with no verdict (body + inline comments) | handled |
+| `pull_request_review_approved` | an approving review (body + inline comments) | handled |
+| `pull_request_review_rejected` | a requesting-changes review (body + inline comments) | handled |
 | `issues` | issue opened/edited (description) | handled |
 | `pull_request` | PR opened/edited (description) | handled |
 
-Forgejo's `pull_request_comment` payload only carries the review body; it does
-not inline the individual review comments. When the bot sees a review it
-fetches the newest review's comments through the API to find mentions in them,
-so the token needs read access to the repository. `pull_request_review_comment`
-is kept for Forgejo versions that inline the comment.
+A submitted review is delivered under one of the three
+`pull_request_review_*` subscription names, chosen by the review verdict
+(plain, approved or requesting changes). Forgejo then renames the event in the
+`X-Forgejo-Event` header to `pull_request_comment`, `pull_request_approved` or
+`pull_request_rejected`. Subscribe to all three so a mention in any review is
+delivered; forge-bot handles each name.
+
+Forgejo's review payload only carries the review body; it does not inline the
+individual review comments. When the bot sees a review it fetches the newest
+review's comments through the API to find mentions in them, so the token needs
+read access to the repository.
 
 A mention in an inline review comment is answered **in the same thread**: the
 bot posts the acknowledgement and the agent's summary back as review comments

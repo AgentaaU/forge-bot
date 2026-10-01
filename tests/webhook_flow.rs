@@ -651,6 +651,23 @@ const REVIEW_PAYLOAD: &str = r#"{
     "sender": {"login": "shylock"}
 }"#;
 
+// A rejecting review is delivered under `pull_request_rejected` with
+// `review.type = pull_request_review_rejected`. It is a distinct event from a
+// plain review comment, so it must be handled explicitly.
+const REJECTED_REVIEW_PAYLOAD: &str = r#"{
+    "action": "reviewed",
+    "number": 17,
+    "pull_request": {
+        "number": 17,
+        "title": "feat: something else",
+        "body": "This closes #6.",
+        "html_url": "http://forge.local:3000/shylock/forge-bot/pulls/17"
+    },
+    "review": {"type": "pull_request_review_rejected", "content": "@shylock-bot --agent=custom fix the review finding"},
+    "repository": {"full_name": "shylock/forge-bot"},
+    "sender": {"login": "shylock"}
+}"#;
+
 #[tokio::test]
 async fn handles_pull_request_review_events() {
     let dir = tempfile::tempdir().unwrap();
@@ -683,6 +700,44 @@ async fn handles_pull_request_review_events() {
             .as_deref()
             .unwrap()
             .contains("review this please")
+    );
+}
+
+#[tokio::test]
+async fn handles_rejected_review_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(signed_request(
+            "pull_request_rejected",
+            REJECTED_REVIEW_PAYLOAD,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    for _ in 0..200 {
+        if harness.sessions.pending_jobs().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let session = harness
+        .sessions
+        .get("user:default:forgejo:shylock/forge-bot:pr:17")
+        .expect("rejected-review session should exist");
+    assert_eq!(session.runs.len(), 1);
+    assert_eq!(session.runs[0].success, Some(true));
+    assert!(
+        session.runs[0]
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("fix the review finding")
     );
 }
 

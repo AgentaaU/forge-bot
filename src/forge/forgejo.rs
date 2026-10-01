@@ -12,6 +12,24 @@ use crate::forge::{
 };
 use crate::location::ForgeKind;
 
+/// The `X-Forgejo-Event` values that carry a submitted pull-request review.
+///
+/// Forgejo folds an approving, rejecting and plain review into three distinct
+/// event names. All three put the review body in `review.content` and its
+/// inline comments behind the review API.
+const REVIEW_EVENTS: [&str; 3] = [
+    "pull_request_comment",
+    "pull_request_approved",
+    "pull_request_rejected",
+];
+
+/// The `review.type` values that accompany [`REVIEW_EVENTS`].
+const REVIEW_TYPES: [&str; 3] = [
+    "pull_request_review_comment",
+    "pull_request_review_approved",
+    "pull_request_review_rejected",
+];
+
 /// Forgejo webhook adapter.
 #[derive(Debug, Clone)]
 pub struct ForgejoAdapter {
@@ -103,9 +121,12 @@ impl ForgeAdapter for ForgejoAdapter {
                 apply_review_reply_target(&mut messages, body);
                 Ok(messages)
             }
-            // Forgejo signals reviews with `pull_request_comment` but does not
-            // inline the comments; `enrich` fetches them from the API.
-            "pull_request_comment" => Ok(Vec::new()),
+            // Forgejo signals a submitted review with one of three event names
+            // but does not inline the comments; `enrich` reads the review body
+            // and fetches the inline comments from the API.
+            "pull_request_comment" | "pull_request_approved" | "pull_request_rejected" => {
+                Ok(Vec::new())
+            }
             // Mentions in an issue or pull-request description.
             "issues" | "pull_request" => {
                 parse_description_payload(ForgeKind::Forgejo, &self.base_url, body, &event)
@@ -120,7 +141,7 @@ impl ForgeAdapter for ForgejoAdapter {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<()> {
-        if self.event(headers) != "pull_request_comment" {
+        if !REVIEW_EVENTS.contains(&self.event(headers).as_str()) {
             // Forgejo sends replies to inline review comments as issue_comment
             // events, often without the review id, path, or position. Resolve
             // the comment id through the review API before dispatching it.
@@ -141,7 +162,11 @@ impl ForgeAdapter for ForgejoAdapter {
         let Some(review) = payload.get("review") else {
             return Ok(());
         };
-        if review.get("type").and_then(Value::as_str) != Some("pull_request_review_comment") {
+        if !review
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| REVIEW_TYPES.contains(&kind))
+        {
             return Ok(());
         }
 
@@ -695,12 +720,20 @@ mod tests {
     }
 
     fn review_headers() -> HeaderMap {
+        review_headers_of("pull_request_comment")
+    }
+
+    fn review_headers_of(event: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert("x-forgejo-event", "pull_request_comment".parse().unwrap());
+        h.insert("x-forgejo-event", event.parse().unwrap());
         h
     }
 
     fn review_payload(content: &str) -> Vec<u8> {
+        review_payload_of("pull_request_review_comment", content)
+    }
+
+    fn review_payload_of(kind: &str, content: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "action": "reviewed",
             "number": 16,
@@ -710,7 +743,7 @@ mod tests {
                 "body": "This fixes #5.",
                 "html_url": "http://forge.local:3000/a/b/pulls/16"
             },
-            "review": {"type": "pull_request_review_comment", "content": content},
+            "review": {"type": kind, "content": content},
             "repository": {"full_name": "a/b"},
             "sender": {"login": "shylock"}
         }))
@@ -723,6 +756,37 @@ mod tests {
         let body = review_payload("");
         let h = review_headers();
         assert!(a.parse(&h, &body).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enriches_approved_and_rejected_review_bodies() {
+        // Forgejo maps an approving and a rejecting review onto their own
+        // `X-Forgejo-Event` names. Both carry the review body, so a mention in
+        // either must trigger exactly like a plain review comment.
+        for (event, kind) in [
+            ("pull_request_approved", "pull_request_review_approved"),
+            ("pull_request_rejected", "pull_request_review_rejected"),
+        ] {
+            let a = adapter();
+            let body = review_payload_of(kind, "@agent please address this review");
+            assert!(
+                a.parse(&review_headers_of(event), &body)
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let mut messages = Vec::new();
+            a.enrich(&mut messages, &review_headers_of(event), &body)
+                .await
+                .unwrap();
+
+            assert_eq!(messages.len(), 1, "event {event} must yield one message");
+            assert_eq!(messages[0].body, "@agent please address this review");
+            assert_eq!(messages[0].author, "shylock");
+            assert_eq!(messages[0].number, Some(16));
+            assert!(messages[0].is_pull_request);
+            assert_eq!(messages[0].reply_target, ReplyTarget::Conversation);
+        }
     }
 
     #[tokio::test]
