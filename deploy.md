@@ -54,11 +54,14 @@ The important fields:
   lists empty denies everyone;
 * `[pi_rpc]` TTL, timeout, model/provider, and
   `no_session = false` to persist conversations. The pool has no size limit of
-  its own; `[session] workers` is the single total agent count. By default
-  `session_per_conversation = true` keeps one session per conversation: a new
-  conversation starts a fresh process instead of inheriting another
-  conversation's session; set it to `false` to reuse idle processes across
-  conversations in a workspace;
+  its own; `[session] workers` is the single total agent count. An idle process
+  is reused for any conversation in the same workspace/user/model. By default
+  `session_per_conversation = true` keeps one session per conversation: before
+  prompting, a reused process is switched back to the session file that
+  conversation used earlier, or starts a fresh session (`new_session`) for a
+  brand-new thread, so a new thread never inherits another conversation's
+  context; set it to `false` to reuse idle processes across conversations in a
+  workspace and carry their earlier session;
 * `[poller]` `enabled = true` for the webhook-less fallback. With an empty
   `repositories` list the bot polls **every repository visible to its token**
   and refreshes that list every `discover_interval_secs`, so repositories

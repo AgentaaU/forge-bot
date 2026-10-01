@@ -788,13 +788,13 @@ pub struct PiRpcConfig {
     pub no_session: bool,
     /// Keep one backend session per conversation.
     ///
-    /// When `true` (the default), a pooled process only serves the
-    /// conversation it is currently bound to: reusing it for a different
-    /// conversation in the same workspace would make that conversation inherit
-    /// the earlier session, so the pool starts a new process instead (which
-    /// resumes the new conversation's own deterministic session). Set to
-    /// `false` to let an idle process be reused for any conversation in the
-    /// workspace, carrying its earlier session.
+    /// When `true` (the default), an idle process may serve a different
+    /// conversation in the same workspace, but the pool points it at that
+    /// conversation's own session first: it switches to the session file the
+    /// conversation used earlier, or starts a fresh session (`new_session`)
+    /// for a brand-new thread. A new thread therefore never inherits the
+    /// previous thread's context. Set to `false` to let an idle process serve
+    /// any conversation in the workspace and carry its earlier session.
     pub session_per_conversation: bool,
     /// Extra environment variables for the spawned agents.
     pub env: BTreeMap<String, String>,
@@ -811,8 +811,8 @@ impl Default for PiRpcConfig {
             // Persist the backend session so an evicted/restarted process can
             // resume the same conversation instead of cold-starting.
             no_session: false,
-            // Start a new session for a new conversation by default instead of
-            // handing it a process that already carries another conversation.
+            // Start the conversation's own session before prompting instead of
+            // letting a reused process inherit another conversation's context.
             session_per_conversation: true,
             env: BTreeMap::new(),
         }

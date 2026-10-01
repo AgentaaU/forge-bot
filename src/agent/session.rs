@@ -71,6 +71,11 @@ impl SessionStore {
     }
 
     fn persist(&self, ids: &HashMap<String, String>) {
+        // A store built with `Default` (tests, diagnostics) has no backing
+        // file; never scatter a relative `.json.tmp` into the working dir.
+        if self.path.as_os_str().is_empty() {
+            return;
+        }
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
