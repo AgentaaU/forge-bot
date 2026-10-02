@@ -10,7 +10,7 @@ use forge_bot::config::Config;
 #[derive(Debug, Parser)]
 #[command(
     name = "forge-bot",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("FORGE_BOT_COMMIT"), ")"),
     about = "Route forge @agent mentions to coding agents"
 )]
 struct Cli {

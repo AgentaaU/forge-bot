@@ -148,6 +148,10 @@ Push a `v*` tag to build a Linux release on the self-hosted runner. The release
 contains a `forge-bot-<tag>-linux-<architecture>.tar.gz` archive and a
 `SHA256SUMS` file.
 
+Run `forge-bot --version` (or `-V`) to show the package version and the full
+Git commit ID embedded at build time, for example `forge-bot 0.1.0 (<commit>)`.
+Builds without Git or repository metadata show `unknown` for the commit ID.
+
 ## Quick start
 
 ```bash

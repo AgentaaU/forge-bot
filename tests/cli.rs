@@ -1,9 +1,33 @@
-//! End-to-end checks of the `forge-bot` binary's `check` command.
+//! End-to-end checks of the `forge-bot` binary's CLI.
 //!
 //! These exercise `src/main.rs` (which unit tests cannot reach) and the
 //! startup validation an operator sees before the service runs.
 
 use std::process::Command;
+
+#[test]
+fn version_reports_the_build_commit_without_config_or_runtime_git() {
+    let dir = tempfile::tempdir().unwrap();
+    for flag in ["--version", "-V"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_forge-bot"))
+            .arg(flag)
+            .current_dir(dir.path())
+            .env("PATH", "")
+            .env("FORGE_BOT_CONFIG", dir.path().join("missing.toml"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "forge-bot {} ({})\n",
+                env!("CARGO_PKG_VERSION"),
+                env!("FORGE_BOT_COMMIT")
+            )
+        );
+    }
+}
 
 fn write(path: &std::path::Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
