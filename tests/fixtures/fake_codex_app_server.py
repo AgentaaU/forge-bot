@@ -100,10 +100,10 @@ for line in sys.stdin:
         respond(request_id, {"codexHome": "/tmp/codex", "platformFamily": "unix",
                              "platformOs": "linux", "userAgent": "fake"})
     elif method == "thread/start":
-        respond(request_id, {"thread": {"id": "thread-1"}})
+        respond(request_id, {"thread": {"id": "thread-1"}, "model": params.get("model", "codex-default")})
     elif method == "thread/resume":
         if params.get("threadId") == "thread-1":
-            respond(request_id, {"thread": {"id": "thread-1"}})
+            respond(request_id, {"thread": {"id": "thread-1"}, "model": params.get("model", "codex-default")})
         else:
             send({"id": request_id, "error": {"code": -32600, "message": "unknown thread"}})
     elif method == "turn/start":

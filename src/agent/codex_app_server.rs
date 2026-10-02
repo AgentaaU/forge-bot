@@ -533,8 +533,11 @@ mod tests {
         let log = dir.path().join("log.jsonl");
         let sessions = Arc::new(SessionStore::load(dir.path()));
         let agent = agent(base_config(&log), Arc::clone(&sessions));
-        let outcome = agent.run(&request(), &context(dir.path())).await.unwrap();
+        let ctx = context(dir.path());
+        let outcome = agent.run(&request(), &ctx).await.unwrap();
         assert!(outcome.success, "{outcome:?}");
+        assert_eq!(outcome.model, None);
+        assert_eq!(*ctx.reported_model.lock().unwrap(), None);
         assert_eq!(outcome.summary, "CODEX-REPLY");
         let usage = outcome.usage.expect("usage");
         assert_eq!(usage.prompt_tokens, 1_000);
@@ -588,6 +591,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(active, "codex turn should be active");
+        assert_eq!(*ctx.reported_model.lock().unwrap(), None);
+        assert!(!run.is_finished());
 
         let receipt = agent
             .follow_up(
@@ -604,6 +609,7 @@ mod tests {
 
         let outcome = run.await.unwrap().unwrap();
         assert!(outcome.success, "{outcome:?}");
+        assert_eq!(outcome.model, None);
         assert!(
             outcome.summary.contains("also run the linter"),
             "{outcome:?}"
@@ -613,7 +619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resumes_a_thread_and_passes_the_model() {
+    async fn resumes_a_thread_and_passes_the_model_without_reporting_it() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log.jsonl");
         let sessions = Arc::new(SessionStore::load(dir.path()));
@@ -621,8 +627,12 @@ mod tests {
         let mut ctx = context(dir.path());
         ctx.model = Some("gpt-fast".into());
 
-        assert!(agent.run(&request(), &ctx).await.unwrap().success);
-        assert!(agent.run(&request(), &ctx).await.unwrap().success);
+        for _ in 0..2 {
+            let outcome = agent.run(&request(), &ctx).await.unwrap();
+            assert!(outcome.success);
+            assert_eq!(outcome.model, None);
+            assert_eq!(*ctx.reported_model.lock().unwrap(), None);
+        }
 
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(logged.contains("thread/start"), "{logged}");

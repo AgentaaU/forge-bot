@@ -365,9 +365,12 @@ kept in memory (up to 1 MiB per run) and disappears when the run finishes;
 the final result summary remains in the run history.
 
 The Model column shows the model known for the current or most recent run.
-Pi RPC reads the live model through `get_state`; Codex and Claude read their
-session records after a run. Antigravity and Kimi read the selected model from
-their CLI arguments or configuration. A dash means no model was available.
+Codex app-server leaves the model unknown in live status and completed history,
+even when a thread start/resume reply includes it or the invocation explicitly
+selects a model. Pi RPC reads the live model through `get_state`; the Codex exec
+fallback and Claude read their session records after a run. Antigravity and Kimi
+read the selected model from their CLI arguments or configuration. A dash means
+no model was available.
 The JSON snapshot includes `model` as a nullable field.
 
 The page has a search box: paste a comment or issue/pull-request URL (for
