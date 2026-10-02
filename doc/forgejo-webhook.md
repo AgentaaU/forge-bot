@@ -286,6 +286,15 @@ instead.
    You should see `job queued`, `spawned pi agent`, and a reply comment on the
    issue/PR.
 
+At info level, each delivery logs its event and delivery ID, the extracted
+message count, author/repository/PR coordinates, routing skips, and the final
+accepted count. Match `delivery_id` to Forgejo's delivery history when a review
+returns `202` with `accepted: 0`. Look for `ignored_author`,
+`no_configured_recipient`, `duplicate`, or an authorization/routing reason.
+Review extraction also reports missing reviews, unsupported review types, and
+empty bodies or missing coordinates. Payload bodies, signatures, tokens and
+models are not included in these diagnostics.
+
 Requests with a missing or wrong `X-Forgejo-Signature` get `401 Unauthorized`.
 
 ---

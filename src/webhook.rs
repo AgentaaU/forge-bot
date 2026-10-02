@@ -361,6 +361,7 @@ async fn healthz() -> impl IntoResponse {
 }
 
 /// Handle a webhook delivery.
+#[tracing::instrument(skip_all, fields(forge = %forge, event = tracing::field::Empty, delivery_id = tracing::field::Empty))]
 async fn receive(
     State(state): State<AppState>,
     Path(forge): Path<String>,
@@ -373,6 +374,16 @@ async fn receive(
             Json(json!({ "error": format!("unknown forge `{forge}`") })),
         );
     };
+
+    let event = adapter.event(&headers);
+    let delivery_id = headers
+        .get("x-forgejo-delivery")
+        .or_else(|| headers.get("x-gitea-delivery"))
+        .or_else(|| headers.get("x-github-delivery"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    tracing::Span::current().record("event", &event);
+    tracing::Span::current().record("delivery_id", delivery_id);
 
     // Verify and parse.
     let mut messages = match adapter.handle(&headers, &body) {
@@ -401,13 +412,16 @@ async fn receive(
     }
 
     let mut accepted = 0usize;
-    tracing::debug!(
-        forge = %forge,
-        event = %adapter.event(&headers),
-        messages = messages.len(),
-        "webhook received"
-    );
+    let extracted = messages.len();
+    tracing::info!(messages = extracted, "webhook messages extracted");
     for message in messages {
+        tracing::info!(
+            author = %message.author,
+            repository = %message.repository,
+            number = ?message.number,
+            comment_id = ?message.comment_id,
+            "processing webhook message"
+        );
         // An agent that mentions a configured human is asking for help. Record
         // a notification for the web page before the agent's own comment is
         // ignored for routing. The poller shares this recorder and its dedupe,
@@ -416,6 +430,7 @@ async fn receive(
 
         // Never react to our own comments.
         if state.dispatcher.policy().is_ignored(&message.author) {
+            tracing::info!(author = %message.author, reason = "ignored_author", "webhook message skipped");
             continue;
         }
 
@@ -423,7 +438,10 @@ async fn receive(
         // global trigger. An ambiguous mention is ignored before any ack.
         let (mention, agent_name) = match state.dispatcher.route(&message) {
             Ok(Some(routed)) => routed,
-            Ok(None) => continue,
+            Ok(None) => {
+                tracing::info!(author = %message.author, reason = "no_configured_recipient", "webhook message skipped");
+                continue;
+            }
             Err(BotError::Unauthorized(reason)) => {
                 tracing::info!(%reason, "ignored unroutable trigger");
                 continue;
@@ -436,7 +454,7 @@ async fn receive(
 
         let dedupe_key = delivery_key(&message);
         if state.seen(&dedupe_key) {
-            tracing::debug!(%dedupe_key, "ignoring duplicate webhook delivery");
+            tracing::info!(%dedupe_key, reason = "duplicate", "webhook message skipped");
             continue;
         }
 
@@ -484,6 +502,11 @@ async fn receive(
         }
     }
 
+    tracing::info!(
+        messages = extracted,
+        accepted,
+        "webhook processing completed"
+    );
     (StatusCode::ACCEPTED, Json(json!({ "accepted": accepted })))
 }
 

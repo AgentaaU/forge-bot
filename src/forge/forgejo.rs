@@ -160,6 +160,10 @@ impl ForgeAdapter for ForgejoAdapter {
 
         let payload: Value = serde_json::from_slice(body)?;
         let Some(review) = payload.get("review") else {
+            tracing::warn!(
+                reason = "missing_review",
+                "review webhook produced no review body"
+            );
             return Ok(());
         };
         if !review
@@ -167,6 +171,7 @@ impl ForgeAdapter for ForgejoAdapter {
             .and_then(Value::as_str)
             .is_some_and(|kind| REVIEW_TYPES.contains(&kind))
         {
+            tracing::warn!(review_type = ?review.get("type").and_then(|value| value.as_str()), reason = "unsupported_review_type", "review webhook produced no review body");
             return Ok(());
         }
 
@@ -176,6 +181,11 @@ impl ForgeAdapter for ForgejoAdapter {
             && let Some(message) = review_message(&payload, None, content)
         {
             messages.push(message);
+        } else {
+            tracing::info!(
+                reason = "empty_body_or_missing_coordinates",
+                "review webhook produced no review body"
+            );
         }
 
         // Inline comments are absent from the payload; look them up.
