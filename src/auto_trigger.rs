@@ -12,6 +12,7 @@ use crate::error::{BotError, Result};
 use crate::forge::{ForgeMessage, ReplyTarget, linked_issue_ref};
 use crate::location::ForgeKind;
 use crate::mention::Mention;
+use crate::policy::Policy;
 use crate::session::Dispatcher;
 
 const MAX_SEEN: usize = 4096;
@@ -107,12 +108,18 @@ impl AutoTrigger {
         if repo.is_empty() {
             return Ok(0);
         }
+        if Policy::new(&config.policy)
+            .authorize_auto_repo(repo)
+            .is_err()
+        {
+            return Ok(0);
+        }
         let Some(forgejo) = config.forges.forgejo.as_ref() else {
             return Ok(0);
         };
         // Mentionless execution requires an authenticated delivery, and the
         // default user owns automatic CI/conflict work.
-        if forgejo.webhook_secret.is_none() {
+        if forgejo.webhook_secret.as_deref().is_none_or(str::is_empty) {
             return Ok(0);
         }
         let global_token = forgejo.token.as_deref();
@@ -173,6 +180,9 @@ impl AutoTrigger {
         let mut accepted = 0;
         for number in candidates {
             let pr = self.get_pr(base, token, repo, number).await?;
+            if !dispatcher.auto_authorized(repo, pr_author(&pr)) {
+                continue;
+            }
             if pr.get("state").and_then(Value::as_str) != Some("open") {
                 continue;
             }
@@ -193,7 +203,9 @@ impl AutoTrigger {
             );
             let message =
                 auto_message(base, repo, number, &pr, "action_run_failure", &instruction)?;
-            accepted += self.submit(dispatcher, key, message, instruction).await?;
+            accepted += self
+                .submit(dispatcher, key, message, instruction, pr_author(&pr))
+                .await?;
         }
         Ok(accepted)
     }
@@ -247,6 +259,9 @@ impl AutoTrigger {
         let mut pending: Vec<(u64, Value)> = Vec::new();
         for number in candidates {
             let pr = self.get_pr(base, token, repo, number).await?;
+            if !dispatcher.auto_authorized(repo, pr_author(&pr)) {
+                continue;
+            }
             if !is_open_conflicting_candidate(&pr) {
                 continue;
             }
@@ -263,6 +278,9 @@ impl AutoTrigger {
             let mut next = Vec::with_capacity(pending.len());
             for (number, _) in pending {
                 let pr = self.get_pr(base, token, repo, number).await?;
+                if !dispatcher.auto_authorized(repo, pr_author(&pr)) {
+                    continue;
+                }
                 if is_open_conflicting_candidate(&pr) {
                     next.push((number, pr));
                 }
@@ -294,7 +312,9 @@ impl AutoTrigger {
             }
             let instruction = "Resolve the merge conflict between this pull request and its base branch. Verify the result and update the pull request branch.".to_owned();
             let message = auto_message(base, repo, number, &pr, "merge_conflict", &instruction)?;
-            accepted += self.submit(dispatcher, key, message, instruction).await?;
+            accepted += self
+                .submit(dispatcher, key, message, instruction, pr_author(&pr))
+                .await?;
         }
         Ok(accepted)
     }
@@ -371,6 +391,7 @@ impl AutoTrigger {
         key: String,
         message: ForgeMessage,
         instruction: String,
+        pr_author: &str,
     ) -> Result<usize> {
         if !self.remember(&key)? {
             return Ok(0);
@@ -382,7 +403,9 @@ impl AutoTrigger {
         // An automatic trigger continues the thread's conversation, so it
         // reuses the adapter the thread last ran instead of the default.
         let agent = dispatcher.auto_trigger_agent(&message);
-        let result = dispatcher.submit_auto(message, mention, &agent).await;
+        let result = dispatcher
+            .submit_auto(message, mention, &agent, pr_author)
+            .await;
         match result {
             Ok(_) => Ok(1),
             Err(error) => {
@@ -443,6 +466,12 @@ enum BranchUpdate {
     /// The conflict could not be confirmed (permission error, transient
     /// failure, or an older Forgejo without the endpoint).
     Unavailable,
+}
+
+fn pr_author(pr: &Value) -> &str {
+    pr.pointer("/user/login")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 /// Whether the pull request is a candidate for automatic conflict

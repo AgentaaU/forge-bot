@@ -74,7 +74,7 @@ fn print_summary(config: &Config) -> anyhow::Result<()> {
     if let Some(forgejo) = &config.forges.forgejo
         && forgejo.webhook_secret.is_none()
     {
-        eprintln!("warning: forgejo webhook secret is not set; signatures will not be verified");
+        eprintln!("warning: forgejo webhook secret is not set; webhooks will be rejected");
     }
 
     // Resolve the explicit users and validate their Linux accounts, so a typo

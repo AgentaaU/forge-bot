@@ -72,9 +72,10 @@ impl ForgeAdapter for ForgejoAdapter {
     }
 
     fn verify(&self, headers: &HeaderMap, body: &[u8]) -> Result<()> {
-        let Some(secret) = self.secret.as_ref() else {
-            tracing::warn!("forgejo: no webhook secret configured; skipping verification");
-            return Ok(());
+        let Some(secret) = self.secret.as_ref().filter(|secret| !secret.is_empty()) else {
+            return Err(BotError::Verification(
+                "webhook secret is absent or empty".into(),
+            ));
         };
 
         let signature = headers
@@ -495,6 +496,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_secret_rejects_even_an_empty_key_signature() {
+        let adapter = ForgejoAdapter::new(&ForgejoConfig {
+            webhook_secret: Some(String::new()),
+            ..Default::default()
+        });
+        let mut headers = HeaderMap::new();
+        let signature = crate::forge::hmac_sha256_hex(b"", b"body");
+        headers.insert("x-forgejo-signature", signature.parse().unwrap());
+        headers.insert(
+            "x-hub-signature-256",
+            format!("sha256={signature}").parse().unwrap(),
+        );
+        headers.insert("x-gitlab-token", "".parse().unwrap());
+        assert!(adapter.verify(&headers, b"body").is_err());
+    }
+
+    #[test]
     fn metadata_and_signature_handling() {
         let with_secret = adapter();
         assert_eq!(with_secret.base_url(), "http://forge.local:3000");
@@ -518,13 +536,13 @@ mod tests {
         bad.insert("x-forgejo-signature", sig.parse().unwrap());
         assert!(with_secret.verify(&bad, b"body").is_ok());
 
-        // No configured secret skips verification.
+        // No configured secret rejects verification.
         let no_secret = ForgejoAdapter::new(&ForgejoConfig {
             base_url: "http://x/".into(),
             ..Default::default()
         });
         assert_eq!(no_secret.base_url(), "http://x");
-        assert!(no_secret.verify(&HeaderMap::new(), b"body").is_ok());
+        assert!(no_secret.verify(&HeaderMap::new(), b"body").is_err());
     }
 
     const PAYLOAD: &str = r#"{

@@ -29,7 +29,7 @@ base_url = "http://forgejo.example.com:3000"
 # when it differs from `base_url`, for example when API traffic goes over
 # loopback. Defaults to `base_url`.
 # web_url = "https://forgejo.example.com"
-# webhook_secret = "change-me"
+# webhook_secret = "change-me" # Required for serve; poll mode needs no secret.
 # token = "change-me"
 bot_username = "forge-bot"
 
@@ -90,6 +90,11 @@ bot_username = "forge-bot"
 # passwd_file = "/etc/passwd"
 
 [policy]
+# Automatic CI/conflict work is denied by default, including with allow_all.
+# Both lists are required; only trust PR authors whose code may run with bot credentials.
+# allowed_repos restrictions also apply to automatic work.
+auto_allowed_repos = []
+auto_allowed_pr_authors = []
 # `allow_all = true` disables authorization entirely. Use only for local
 # testing.
 allow_all = false

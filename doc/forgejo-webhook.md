@@ -218,7 +218,11 @@ ignored. Events without a mention or supported automatic trigger are accepted
 ## Automatic CI and conflict triggers
 
 The webhook's scope determines which repositories send events, and its event
-selection determines which automatic triggers run. Subscribe to
+selection determines which automatic triggers are delivered. Execution also requires
+explicit `[policy].auto_allowed_repos` and `auto_allowed_pr_authors` allow-lists;
+both default to empty (deny). `allow_all` does not enable automatic work, and
+`allowed_repos` restrictions still apply. Only allow PR authors whose code you
+trust with the bot credentials, including authors of fork PRs. Subscribe to
 `action_run_failure` for Forgejo Actions failures, and `pull_request` plus
 `push` for merge conflicts. These triggers run without a mention and require a
 configured Forgejo API token and webhook secret. The normal mention

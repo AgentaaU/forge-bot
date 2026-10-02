@@ -17,12 +17,24 @@ pub struct Policy {
     allowed_users: HashSet<String>,
     allowed_repos: HashSet<String>,
     ignored_users: HashSet<String>,
+    auto_allowed_repos: HashSet<String>,
+    auto_allowed_pr_authors: HashSet<String>,
 }
 
 impl Policy {
     pub fn new(config: &PolicyConfig) -> Self {
         Self {
             allow_all: config.allow_all,
+            auto_allowed_repos: config
+                .auto_allowed_repos
+                .iter()
+                .map(|r| r.to_lowercase())
+                .collect(),
+            auto_allowed_pr_authors: config
+                .auto_allowed_pr_authors
+                .iter()
+                .map(|u| u.to_lowercase())
+                .collect(),
             allowed_users: config
                 .allowed_users
                 .iter()
@@ -38,6 +50,37 @@ impl Policy {
                 .iter()
                 .map(|u| u.to_lowercase())
                 .collect(),
+        }
+    }
+
+    /// Check scope before any automatic-trigger API access or branch mutation.
+    /// `allow_all` never grants permission for automatic work.
+    pub(crate) fn authorize_auto_repo(&self, repo: &str) -> Result<()> {
+        let repo = repo.to_lowercase();
+        if self.auto_allowed_repos.contains(&repo)
+            && (self.allowed_repos.is_empty() || self.allowed_repos.contains(&repo))
+        {
+            Ok(())
+        } else {
+            Err(BotError::Unauthorized(
+                "repository is not allowed for automatic work".into(),
+            ))
+        }
+    }
+
+    pub(crate) fn authorize_auto(&self, repo: &str, author: &str) -> Result<()> {
+        self.authorize_auto_repo(repo)?;
+        if !author.is_empty()
+            && !self.is_ignored(author)
+            && self
+                .auto_allowed_pr_authors
+                .contains(&author.to_lowercase())
+        {
+            Ok(())
+        } else {
+            Err(BotError::Unauthorized(
+                "PR author is not trusted for automatic work".into(),
+            ))
         }
     }
 
@@ -123,6 +166,46 @@ mod tests {
             event: "issue_comment".into(),
             title: None,
             reply_target: Default::default(),
+        }
+    }
+
+    #[test]
+    fn automatic_policy_requires_explicit_scope_and_trusted_author() {
+        for allow_all in [false, true] {
+            let mut config = PolicyConfig {
+                allow_all,
+                ..Default::default()
+            };
+            assert!(
+                Policy::new(&config)
+                    .authorize_auto("o/r", "trusted")
+                    .is_err()
+            );
+            config.auto_allowed_repos = vec!["O/R".into()];
+            assert!(
+                Policy::new(&config)
+                    .authorize_auto("o/r", "trusted")
+                    .is_err()
+            );
+            config.auto_allowed_pr_authors = vec!["Trusted".into()];
+            let policy = Policy::new(&config);
+            assert!(policy.authorize_auto("o/r", "trusted").is_ok());
+            assert!(policy.authorize_auto("o/other", "trusted").is_err());
+            assert!(policy.authorize_auto("o/r", "untrusted").is_err());
+            assert!(policy.authorize_auto("o/r", "").is_err());
+            config.allowed_repos = vec!["other/repo".into()];
+            assert!(
+                Policy::new(&config)
+                    .authorize_auto("o/r", "trusted")
+                    .is_err()
+            );
+            config.allowed_repos.clear();
+            config.ignored_users = vec!["trusted".into()];
+            assert!(
+                Policy::new(&config)
+                    .authorize_auto("o/r", "trusted")
+                    .is_err()
+            );
         }
     }
 

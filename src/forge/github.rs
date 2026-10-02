@@ -58,9 +58,10 @@ impl ForgeAdapter for GithubAdapter {
     }
 
     fn verify(&self, headers: &HeaderMap, body: &[u8]) -> Result<()> {
-        let Some(secret) = self.secret.as_ref() else {
-            tracing::warn!("github: no webhook secret configured; skipping verification");
-            return Ok(());
+        let Some(secret) = self.secret.as_ref().filter(|secret| !secret.is_empty()) else {
+            return Err(BotError::Verification(
+                "webhook secret is absent or empty".into(),
+            ));
         };
 
         let signature = headers
@@ -96,6 +97,23 @@ impl ForgeAdapter for GithubAdapter {
 mod tests {
     use super::*;
     use crate::forge::hmac_sha256_hex;
+
+    #[test]
+    fn empty_secret_rejects_even_an_empty_key_signature() {
+        let adapter = GithubAdapter::new(&GithubConfig {
+            webhook_secret: Some(String::new()),
+            ..Default::default()
+        });
+        let mut headers = HeaderMap::new();
+        let signature = crate::forge::hmac_sha256_hex(b"", b"body");
+        headers.insert("x-forgejo-signature", signature.parse().unwrap());
+        headers.insert(
+            "x-hub-signature-256",
+            format!("sha256={signature}").parse().unwrap(),
+        );
+        headers.insert("x-gitlab-token", "".parse().unwrap());
+        assert!(adapter.verify(&headers, b"body").is_err());
+    }
 
     #[test]
     fn parses_github_issue_comment() {
@@ -139,8 +157,8 @@ mod tests {
         assert_eq!(a.bot_username(), Some("bot"));
         assert_eq!(a.kind(), ForgeKind::GitHub);
         assert_eq!(a.slug(), "github");
-        // No secret configured: verification is skipped.
-        assert!(a.verify(&HeaderMap::new(), b"body").is_ok());
+        // No secret configured: verification is rejected.
+        assert!(a.verify(&HeaderMap::new(), b"body").is_err());
 
         let signed = GithubAdapter::new(&GithubConfig {
             base_url: "https://github.example.com/".into(),

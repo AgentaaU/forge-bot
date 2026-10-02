@@ -118,6 +118,7 @@ pub fn build_app(config: Config) -> Result<AppState> {
 
 /// Run the webhook server until the process is stopped.
 pub async fn serve(config: Config) -> Result<()> {
+    config.validate_webhook_secrets()?;
     let bind = config.bind.clone();
     let poller_enabled = config.poller.enabled;
     let app = build_app(config)?;

@@ -59,9 +59,10 @@ impl ForgeAdapter for GitlabAdapter {
     }
 
     fn verify(&self, headers: &HeaderMap, _body: &[u8]) -> Result<()> {
-        let Some(secret) = self.secret.as_ref() else {
-            tracing::warn!("gitlab: no webhook secret configured; skipping verification");
-            return Ok(());
+        let Some(secret) = self.secret.as_ref().filter(|secret| !secret.is_empty()) else {
+            return Err(BotError::Verification(
+                "webhook secret is absent or empty".into(),
+            ));
         };
 
         let provided = headers
@@ -220,6 +221,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_secret_rejects_even_an_empty_key_signature() {
+        let adapter = GitlabAdapter::new(&GitlabConfig {
+            webhook_secret: Some(String::new()),
+            ..Default::default()
+        });
+        let mut headers = HeaderMap::new();
+        let signature = crate::forge::hmac_sha256_hex(b"", b"body");
+        headers.insert("x-forgejo-signature", signature.parse().unwrap());
+        headers.insert(
+            "x-hub-signature-256",
+            format!("sha256={signature}").parse().unwrap(),
+        );
+        headers.insert("x-gitlab-token", "".parse().unwrap());
+        assert!(adapter.verify(&headers, b"body").is_err());
+    }
+
+    #[test]
     fn verifies_token() {
         let a = adapter();
         let mut h = HeaderMap::new();
@@ -303,7 +321,7 @@ mod tests {
         assert_eq!(no_secret.bot_username(), Some("bot"));
         assert_eq!(no_secret.kind(), ForgeKind::GitLab);
         assert_eq!(no_secret.slug(), "gitlab");
-        assert!(no_secret.verify(&HeaderMap::new(), b"").is_ok());
+        assert!(no_secret.verify(&HeaderMap::new(), b"").is_err());
 
         let with_secret = adapter();
         let error = with_secret.verify(&HeaderMap::new(), b"").unwrap_err();

@@ -223,14 +223,21 @@ impl Dispatcher {
         self.enqueue(message, mention, agent_name).await
     }
 
-    /// Queue a signed Forgejo event selected by the webhook subscription.
-    /// The event has no human author to evaluate with the mention policy.
+    pub(crate) fn auto_authorized(&self, repo: &str, pr_author: &str) -> bool {
+        self.inner.policy.authorize_auto(repo, pr_author).is_ok()
+    }
+
+    /// Recheck automatic policy at the queue boundary using the API's PR author.
     pub(crate) async fn submit_auto(
         &self,
         message: ForgeMessage,
         mention: Mention,
         agent_name: &str,
+        pr_author: &str,
     ) -> Result<Uuid> {
+        self.inner
+            .policy
+            .authorize_auto(&message.repository, pr_author)?;
         self.enqueue(message, mention, agent_name).await
     }
 
@@ -2306,6 +2313,8 @@ mod tests {
         config.reply.ack = true;
         config.policy.allow_all = true;
         config.agent_sequence = vec!["steering".into()];
+        config.policy.auto_allowed_repos = vec!["o/r".into()];
+        config.policy.auto_allowed_pr_authors = vec!["trusted".into()];
         let config = Arc::new(config);
 
         let steering = Arc::new(SteeringAgent::new());
@@ -2361,6 +2370,7 @@ mod tests {
                     message: "resolve".into(),
                 },
                 "steering",
+                "trusted",
             )
             .await
             .unwrap();
@@ -4027,6 +4037,8 @@ echo "end:$token" >> "$AGENT_LOG"
         let dir = tempfile::tempdir().unwrap();
         let (mut config, log, release) = gated_config(dir.path(), 1);
         config.reply.ack = true;
+        config.policy.auto_allowed_repos = vec!["o/r".into()];
+        config.policy.auto_allowed_pr_authors = vec!["trusted".into()];
         let config = Arc::new(config);
         let registry = isolated_registry(&config, &["gate"]);
         let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
@@ -4040,6 +4052,25 @@ echo "end:$token" >> "$AGENT_LOG"
         )
         .unwrap();
 
+        // The queue boundary must reject denied authors and repository scope
+        // even if a caller bypasses the webhook's automatic-trigger handler.
+        for (repo, author) in [("o/r", "untrusted"), ("o/other", "trusted")] {
+            let result = dispatcher
+                .submit_auto(
+                    message_at(repo, 9),
+                    Mention {
+                        agent: None,
+                        message: "denied".into(),
+                    },
+                    "gate",
+                    author,
+                )
+                .await;
+            assert!(matches!(result, Err(BotError::Unauthorized(_))));
+        }
+        assert!(sessions.pending_jobs().unwrap().is_empty());
+        assert!(api.comments().is_empty());
+
         let mut message = message_at("o/r", 9);
         message.author = crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into();
         message.event = "action_run_failure".into();
@@ -4052,6 +4083,7 @@ echo "end:$token" >> "$AGENT_LOG"
                     message: "TOKEN_A".into(),
                 },
                 "gate",
+                "trusted",
             )
             .await
             .unwrap();
@@ -4078,6 +4110,8 @@ echo "end:$token" >> "$AGENT_LOG"
         let dir = tempfile::tempdir().unwrap();
         let (mut config, log, release) = gated_config(dir.path(), 1);
         config.reply.ack = true;
+        config.policy.auto_allowed_repos = vec!["o/r".into()];
+        config.policy.auto_allowed_pr_authors = vec!["trusted".into()];
         let config = Arc::new(config);
         let registry = isolated_registry(&config, &["gate"]);
         let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
@@ -4107,6 +4141,7 @@ echo "end:$token" >> "$AGENT_LOG"
                     message: "TOKEN_B".into(),
                 },
                 "gate",
+                "trusted",
             )
             .await
             .unwrap();

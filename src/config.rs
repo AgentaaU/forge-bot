@@ -74,6 +74,41 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Serving webhook endpoints requires a nonempty secret for every configured forge.
+    /// Poll-only mode deliberately does not call this validation.
+    pub fn validate_webhook_secrets(&self) -> Result<()> {
+        for (name, secret) in [
+            (
+                "forgejo",
+                self.forges
+                    .forgejo
+                    .as_ref()
+                    .map(|f| f.webhook_secret.as_deref()),
+            ),
+            (
+                "github",
+                self.forges
+                    .github
+                    .as_ref()
+                    .map(|f| f.webhook_secret.as_deref()),
+            ),
+            (
+                "gitlab",
+                self.forges
+                    .gitlab
+                    .as_ref()
+                    .map(|f| f.webhook_secret.as_deref()),
+            ),
+        ] {
+            if secret.is_some_and(|s| s.is_none_or(str::is_empty)) {
+                return Err(BotError::Config(format!(
+                    "{name}: webhook server requires a nonempty webhook_secret; use poll mode without webhooks"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Load configuration from the given path (or the `FORGE_BOT_CONFIG`
     /// environment variable) and apply environment overrides.
     pub fn load(path: Option<&Path>) -> Result<Self> {
@@ -471,6 +506,10 @@ pub struct PolicyConfig {
     pub allow_all: bool,
     pub allowed_users: Vec<String>,
     pub allowed_repos: Vec<String>,
+    /// Automatic work is disabled unless both lists explicitly allow it.
+    pub auto_allowed_repos: Vec<String>,
+    /// Trusted PR authors, including authors of fork PRs. Signing alone is insufficient.
+    pub auto_allowed_pr_authors: Vec<String>,
     /// Users whose comments are always ignored (normally the bot itself).
     pub ignored_users: Vec<String>,
 }
@@ -918,6 +957,40 @@ fn dirs_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_serving_requires_nonempty_secrets_for_each_configured_forge() {
+        assert!(Config::default().validate_webhook_secrets().is_ok());
+        for secret in [None, Some(String::new()), Some("secret".into())] {
+            let mut config = Config::default();
+            config.forges.forgejo = Some(ForgejoConfig {
+                webhook_secret: secret.clone(),
+                ..Default::default()
+            });
+            assert_eq!(
+                config.validate_webhook_secrets().is_ok(),
+                secret.as_ref().is_some_and(|s| !s.is_empty())
+            );
+            config.forges.forgejo = None;
+            config.forges.github = Some(GithubConfig {
+                webhook_secret: secret.clone(),
+                ..Default::default()
+            });
+            assert_eq!(
+                config.validate_webhook_secrets().is_ok(),
+                secret.as_ref().is_some_and(|s| !s.is_empty())
+            );
+            config.forges.github = None;
+            config.forges.gitlab = Some(GitlabConfig {
+                webhook_secret: secret.clone(),
+                ..Default::default()
+            });
+            assert_eq!(
+                config.validate_webhook_secrets().is_ok(),
+                secret.as_ref().is_some_and(|s| !s.is_empty())
+            );
+        }
+    }
 
     #[test]
     fn defaults_are_sane() {

@@ -361,12 +361,18 @@ pub(crate) fn parse_description_payload(
         })?;
 
     let is_pull_request = payload.get("pull_request").is_some() || event.contains("pull_request");
-    let author = object
-        .get("user")
-        .or_else(|| payload.get("sender"))
+    let actor = if action == "edited" {
+        payload.get("sender")
+    } else {
+        object.get("user").or_else(|| payload.get("sender"))
+    };
+    let author = actor
         .and_then(|u| u.get("login"))
         .and_then(Value::as_str)
-        .unwrap_or_default()
+        .filter(|login| !login.trim().is_empty())
+        .ok_or_else(|| {
+            crate::error::BotError::InvalidPayload("missing description event actor".into())
+        })?
         .to_owned();
     let number = object.get("number").and_then(Value::as_u64);
     let title = object
@@ -568,6 +574,56 @@ fn build_location(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn description_edits_authorize_editor_and_require_identity() {
+        let policy = crate::policy::Policy::new(&crate::config::PolicyConfig {
+            allowed_users: vec!["trusted".into()],
+            ..Default::default()
+        });
+        for (key, event) in [("issue", "issues"), ("pull_request", "pull_request")] {
+            let mut payload = serde_json::json!({
+                "action": "edited", "sender": {"login": "untrusted-editor"},
+                "repository": {"full_name": "o/r"},
+                key: {"number": 1, "body": "@agent do work", "user": {"login": "trusted"}}
+            });
+            let messages = parse_description_payload(
+                ForgeKind::Forgejo,
+                "https://forge.test",
+                &serde_json::to_vec(&payload).unwrap(),
+                event,
+            )
+            .unwrap();
+            assert_eq!(messages[0].author, "untrusted-editor");
+            assert!(policy.authorize(&messages[0]).is_err());
+            for sender in [
+                serde_json::Value::Null,
+                serde_json::json!({}),
+                serde_json::json!({"login": ""}),
+            ] {
+                payload["sender"] = sender;
+                assert!(
+                    parse_description_payload(
+                        ForgeKind::Forgejo,
+                        "https://forge.test",
+                        &serde_json::to_vec(&payload).unwrap(),
+                        event
+                    )
+                    .is_err()
+                );
+            }
+            payload["sender"] = serde_json::json!({"login": "trusted"});
+            payload[key]["user"]["login"] = serde_json::json!("untrusted-author");
+            let messages = parse_description_payload(
+                ForgeKind::Forgejo,
+                "https://forge.test",
+                &serde_json::to_vec(&payload).unwrap(),
+                event,
+            )
+            .unwrap();
+            assert!(policy.authorize(&messages[0]).is_ok());
+        }
+    }
 
     #[test]
     fn hmac_matches_known_vector() {
@@ -824,6 +880,7 @@ mod tests {
         // An issue description uses the issues resource.
         let body = comment_body(serde_json::json!({
             "action": "edited",
+            "sender": {"login": "editor"},
             "issue": {"number": 7, "body": "hello", "html_url": "http://f/a/b/issues/7"},
             "repository": {"full_name": "a/b"}
         }));

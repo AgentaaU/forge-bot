@@ -81,6 +81,8 @@ fn harness_with(dir: &std::path::Path, configure: impl FnOnce(&mut Config)) -> H
         bot_username: Some("shylock-bot".into()),
         ..Default::default()
     });
+    config.policy.auto_allowed_repos = vec!["shylock/forge-bot".into()];
+    config.policy.auto_allowed_pr_authors = vec!["shylock".into()];
     // Every run belongs to a configured user.
     config.users.insert(
         "default".into(),
@@ -139,6 +141,7 @@ fn signed_request(event: &str, payload: &str) -> Request<Body> {
 fn pr_payload(mergeable: bool) -> Value {
     json!({
         "number": 7, "state": "open", "title": "Fix it", "body": "",
+        "user": {"login": "shylock"},
         "mergeable": mergeable,
         "head": {"sha": "head123"},
         "base": {"sha": "base123", "ref": "main"}
@@ -258,10 +261,13 @@ async fn auto_ci_failure_requires_secret_and_current_pr_and_dedupes() {
         config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
         config.forges.forgejo.as_mut().unwrap().webhook_secret = None;
     });
-    assert_eq!(
-        accepted(&disabled.app, "action_run_failure", &payload).await,
-        0
-    );
+    let response = disabled
+        .app
+        .clone()
+        .oneshot(signed_request("action_run_failure", &payload))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     let dir2 = tempfile::tempdir().unwrap();
     let enabled = harness_with(dir2.path(), |config| {
@@ -1870,4 +1876,81 @@ async fn notifications_json_resets_a_stale_generation() {
         1,
         "{stale}"
     );
+}
+
+#[tokio::test]
+async fn automatic_policy_denies_before_api_access() {
+    for mode in ["empty", "excluded", "scope"] {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = harness_with(dir.path(), |config| {
+            // No token and an unreachable API: denied scope must return before either is used.
+            config.forges.forgejo.as_mut().unwrap().base_url = "http://127.0.0.1:1".into();
+            match mode {
+                "empty" => config.policy.auto_allowed_repos.clear(),
+                "excluded" => config.policy.allowed_repos = vec!["other/repo".into()],
+                _ => config.policy.auto_allowed_repos = vec!["other/repo".into()],
+            }
+        });
+        for (event, payload) in [
+            (
+                "action_run_failure",
+                json!({"run": {"repository": {"full_name": "shylock/forge-bot"}}}),
+            ),
+            (
+                "push",
+                json!({"repository": {"full_name": "shylock/forge-bot"}, "ref": "refs/heads/main"}),
+            ),
+            (
+                "pull_request",
+                json!({"action": "synchronized", "repository": {"full_name": "shylock/forge-bot"}, "pull_request": {"number": 7}}),
+            ),
+        ] {
+            assert_eq!(accepted(&harness.app, event, &payload.to_string()).await, 0);
+        }
+        assert!(harness.sessions.pending_jobs().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn automatic_work_rejects_untrusted_or_missing_pr_author_before_mutation() {
+    for author in [Some("untrusted"), None] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pr = pr_payload(false);
+        pr["user"] = author.map(|a| json!({"login": a})).unwrap_or(Value::Null);
+        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = mutations.clone();
+        let api = Router::new()
+            .route(
+                "/api/v1/repos/shylock/forge-bot/pulls/7",
+                get(move || {
+                    let pr = pr.clone();
+                    async move { Json(pr) }
+                }),
+            )
+            .route(
+                "/api/v1/repos/shylock/forge-bot/pulls/7/update",
+                post(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        StatusCode::CONFLICT
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+        let harness = harness_with(dir.path(), |config| {
+            config.forges.forgejo.as_mut().unwrap().base_url = url;
+            config.forges.forgejo.as_mut().unwrap().token = Some("test".into());
+        });
+        let conflict = json!({"action": "synchronized", "repository": {"full_name": "shylock/forge-bot"}, "pull_request": {"number": 7}});
+        let ci = json!({"run": {"id": 88, "commit_sha": "head123", "repository": {"full_name": "shylock/forge-bot"}, "event_payload": "{\"pull_request\":{\"number\":7}}"}});
+        for (event, payload) in [("pull_request", conflict), ("action_run_failure", ci)] {
+            assert_eq!(accepted(&harness.app, event, &payload.to_string()).await, 0);
+        }
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(harness.sessions.pending_jobs().unwrap().is_empty());
+        server.abort();
+    }
 }

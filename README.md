@@ -482,8 +482,14 @@ The mention is matched case-insensitively and only at a word boundary, so
 
 ## Security
 
-- Every webhook is signature-verified when a secret is configured. Never run
-  without one in production.
+- Webhook serving requires a nonempty secret for every configured forge. Missing
+  or empty secrets reject deliveries. Use `forge-bot poll` for polling without a
+  webhook listener.
+- Automatic CI/conflict work is disabled by default, even with `allow_all`.
+  Set both `[policy].auto_allowed_repos` and `auto_allowed_pr_authors` to opt in.
+  Repository restrictions in `allowed_repos` still apply; PR authors (including
+  fork PR authors) must be explicitly trusted before branch updates or agent runs.
+- Description edits authorize the event sender, and missing edit actors are rejected.
 - Authorization is separate from authentication. With no allow-list and no
   `allow_all`, the bot rejects everything.
 - Unconfigured forge bot logins are ignored automatically; configured accounts
@@ -496,9 +502,10 @@ The mention is matched case-insensitively and only at a word boundary, so
   helpers are disabled for these commands, and errors redact token values.
 - `workspace.enabled = false` runs agents in an empty directory and lets them
   access the forge themselves.
-- The status pages have no authentication: they list thread URLs and show
-  agent requests and result summaries. Keep the listener on an
-  internal interface or put it behind a reverse proxy with access control.
+- Status pages, details/live output, and notification APIs have no authentication.
+  Protect all non-webhook routes with reverse proxy authentication or keep the
+  listener internal. Requests and agent output can contain sensitive data;
+  webhook signatures do not protect these routes.
 
 ## Project layout
 
