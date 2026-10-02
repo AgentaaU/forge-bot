@@ -198,11 +198,17 @@ mentions reuse it while it is idle.
   configured `[users.*].host_user`.
 * Binary: `/usr/local/bin/forge-bot`; config: `/etc/forge-bot/forge-bot.toml`
   (mode `0600`); state: `/var/lib/forge-bot/state/`.
-* `shylock-bot` is only a collaborator, so the webhook cannot be created by the
-  bot; `[poller] enabled = true` is used, with an empty `repositories` list so
-  every repository visible to the bot is watched (new repositories included).
-  Register the hook as `shylock` (or another admin) if you want push delivery,
-  then disable the poller.
+* `shylock-bot` is only a collaborator, so it cannot administer repository
+  webhooks. The deployed configuration uses `[poller] enabled = false`;
+  submitted review mentions require an owner-managed hook subscribed to
+  `pull_request_review_comment`, `pull_request_review_approved` and
+  `pull_request_review_rejected`.
+* If polling is enabled as a fallback, it reads conversation comments and
+  submitted review bodies across its configured repositories. Review bodies
+  are absent from Forgejo’s issue-comments API and require a separate reviews
+  query. The review cursor uses `updated_at`: `submitted_at` is the creation
+  time and stays unchanged when a pending review is submitted. Pending reviews
+  and review requests are skipped. Inline review comments require webhooks.
 * A mention can only be answered on repositories where the bot can read the
   comments and post a reply; inaccessible repositories are skipped.
 * Keep the token in the process environment only.

@@ -742,6 +742,62 @@ async fn handles_rejected_review_bodies() {
 }
 
 #[tokio::test]
+async fn rejected_review_peer_handoff_works_with_polling_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), |config| {
+        config.poller.enabled = false;
+        config.policy.allow_all = false;
+        config.policy.allowed_users = vec!["shylock".into()];
+        config.policy.allowed_repos = vec!["shylock/forge-bot".into()];
+        config.users.insert(
+            "shylock-reviewer".into(),
+            UserConfig {
+                role: UserRole::Reviewer,
+                host_user: "reviewer".into(),
+                agent: None,
+                agent_model: None,
+                token: None,
+            },
+        );
+    });
+    let payload = REJECTED_REVIEW_PAYLOAD.replace(
+        "\"sender\": {\"login\": \"shylock\"}",
+        "\"sender\": {\"login\": \"shylock-reviewer\"}",
+    );
+    assert_eq!(
+        accepted(&harness.app, "pull_request_rejected", &payload).await,
+        1
+    );
+    for _ in 0..200 {
+        if harness
+            .sessions
+            .get("user:default:forgejo:shylock/forge-bot:pr:17")
+            .is_some_and(|s| s.runs.len() == 1 && s.runs[0].success == Some(true))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let session = harness
+        .sessions
+        .get("user:default:forgejo:shylock/forge-bot:pr:17")
+        .unwrap();
+    assert_eq!(session.runs.len(), 1);
+    assert_eq!(session.runs[0].success, Some(true));
+    assert!(
+        session.runs[0]
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("fix the review finding")
+    );
+    assert_eq!(
+        accepted(&harness.app, "pull_request_rejected", &payload).await,
+        0
+    );
+}
+
+#[tokio::test]
 async fn rejects_bad_signature() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(dir.path());

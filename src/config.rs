@@ -877,7 +877,7 @@ pub struct PollerConfig {
     pub discover_interval_secs: u64,
     /// How far back to look for a repository the first time it is seen.
     pub lookback_secs: u64,
-    /// Page size for the comments and repository search endpoints.
+    /// Page size for the comments, PR discovery, reviews and repository search endpoints.
     pub page_limit: usize,
 }
 

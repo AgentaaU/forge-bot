@@ -1,8 +1,8 @@
 //! Polling ingester.
 //!
 //! A repository collaborator without admin rights cannot create a Forgejo
-//! webhook. Polling the issue-comments API is a drop-in alternative: it feeds
-//! the exact same [`Dispatcher`] pipeline the webhook handler uses, so all the
+//! webhook. Polling conversation comments and submitted review bodies feeds
+//! the same [`Dispatcher`] pipeline the webhook handler uses, so all the
 //! mention detection, authorization, agent selection and reply logic is
 //! shared.
 
@@ -27,6 +27,8 @@ use crate::session::Dispatcher;
 struct Cursor {
     last_id: i64,
     last_time: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    seen_reviews: HashMap<i64, String>,
 }
 
 /// Cached list of repositories to poll.
@@ -113,6 +115,9 @@ impl Poller {
         for repo in self.repositories(&base, token.as_deref()).await? {
             if let Err(error) = self.poll_repo(&base, token.as_deref(), &repo).await {
                 tracing::warn!(repo = %repo, %error, "failed to poll repository");
+            }
+            if let Err(error) = self.poll_reviews(&base, token.as_deref(), &repo).await {
+                tracing::warn!(repo = %repo, %error, "failed to poll reviews");
             }
         }
 
@@ -259,38 +264,149 @@ impl Poller {
             let Some(message) = message_from_comment(repo, &comment) else {
                 continue;
             };
-            // Record human mentions before the routing ignore rules: a polled
-            // agent comment that mentions a human must reach `/notifications`
-            // even when the comment itself is skipped for routing. The shared
-            // recorder dedupes a comment also seen by the webhook ingester.
-            self.dispatcher.record_human_notifications(&message);
-            if self.dispatcher.policy().is_ignored(&message.author) {
-                continue;
-            }
-            let (mention, agent_name) = match self.dispatcher.route(&message) {
-                Ok(Some(routed)) => routed,
-                Ok(None) => continue,
-                Err(BotError::Unauthorized(reason)) => {
-                    tracing::info!(%reason, repo, "ignored unroutable polled trigger");
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, repo, "failed to route polled trigger");
-                    continue;
-                }
-            };
-
-            match self.dispatcher.submit(message, mention, &agent_name).await {
-                Ok(job_id) => tracing::info!(%job_id, repo, "accepted polled trigger"),
-                Err(BotError::Unauthorized(reason)) => {
-                    tracing::info!(%reason, repo, "ignored unauthorized trigger");
-                }
-                Err(error) => tracing::warn!(%error, repo, "failed to enqueue polled trigger"),
-            }
+            self.dispatch_message(message).await;
         }
 
         self.set_cursor(repo, cursor);
         Ok(())
+    }
+
+    async fn dispatch_message(&self, message: ForgeMessage) {
+        let repo = message.repository.clone();
+        // Record human mentions before the routing ignore rules: a polled
+        // agent comment that mentions a human must reach `/notifications`
+        // even when the comment itself is skipped for routing. The shared
+        // recorder dedupes a comment also seen by the webhook ingester.
+        self.dispatcher.record_human_notifications(&message);
+        if self.dispatcher.policy().is_ignored(&message.author) {
+            return;
+        }
+        let (mention, agent_name) = match self.dispatcher.route(&message) {
+            Ok(Some(routed)) => routed,
+            Ok(None) => return,
+            Err(BotError::Unauthorized(reason)) => {
+                tracing::info!(%reason, repo, "ignored unroutable polled trigger");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, repo, "failed to route polled trigger");
+                return;
+            }
+        };
+
+        match self.dispatcher.submit(message, mention, &agent_name).await {
+            Ok(job_id) => tracing::info!(%job_id, repo, "accepted polled trigger"),
+            Err(BotError::Unauthorized(reason)) => {
+                tracing::info!(%reason, repo, "ignored unauthorized trigger");
+            }
+            Err(error) => tracing::warn!(%error, repo, "failed to enqueue polled trigger"),
+        }
+    }
+
+    /// Review bodies are deliberately absent from Forgejo's issue-comments API.
+    /// Find updated PRs, then read their submitted reviews with a separate cursor.
+    async fn poll_reviews(&self, base: &str, token: Option<&str>, repo: &str) -> Result<()> {
+        let key = format!("{repo}:reviews");
+        let since = self.since_for(&key);
+        // Keep a one-second overlap for API timestamps with second precision.
+        let next_since =
+            (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let mut cursor = self.cursor(&key);
+        let pulls_url = format!("{base}/api/v1/repos/{repo}/issues");
+        let Some(pulls) = self
+            .fetch_pages(
+                &pulls_url,
+                token,
+                &[("type", "pulls"), ("state", "all"), ("since", &since)],
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        for pull in pulls {
+            let Some(number) = pull["number"].as_u64() else {
+                continue;
+            };
+            let url = format!("{base}/api/v1/repos/{repo}/pulls/{number}/reviews");
+            let reviews = self
+                .fetch_pages(&url, token, &[])
+                .await?
+                .ok_or_else(|| BotError::ForgeApi("reviews query is inaccessible".into()))?;
+            for review in reviews {
+                if !matches!(
+                    review["state"].as_str(),
+                    Some("APPROVED" | "REQUEST_CHANGES" | "COMMENT")
+                ) {
+                    continue;
+                }
+                let (Some(id), Some(updated)) = (
+                    review["id"].as_i64(),
+                    review["updated_at"]
+                        .as_str()
+                        .or_else(|| review["submitted_at"].as_str()),
+                ) else {
+                    continue;
+                };
+                let updated = normalize_time(updated);
+                // Forgejo submitted_at is the creation time, even after a pending
+                // review is submitted. Its updated_at tracks that transition.
+                if updated < since
+                    || cursor
+                        .seen_reviews
+                        .get(&id)
+                        .is_some_and(|seen| seen >= &updated)
+                {
+                    continue;
+                }
+                if let Some(message) = message_from_review(repo, &pull, &review) {
+                    self.dispatch_message(message).await;
+                }
+                cursor.seen_reviews.insert(id, updated);
+                self.set_cursor(&key, cursor.clone());
+            }
+        }
+        cursor
+            .seen_reviews
+            .retain(|_, updated| *updated >= next_since);
+        cursor.last_time = Some(next_since);
+        self.set_cursor(&key, cursor);
+        Ok(())
+    }
+
+    async fn fetch_pages(
+        &self,
+        url: &str,
+        token: Option<&str>,
+        query: &[(&str, &str)],
+    ) -> Result<Option<Vec<Value>>> {
+        let limit = self.config.poller.page_limit.max(1);
+        let mut items = Vec::new();
+        for page in 1.. {
+            let mut request = self
+                .client
+                .get(url)
+                .query(query)
+                .query(&[("limit", limit), ("page", page)]);
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("token {token}"));
+            }
+            let response = request.send().await?;
+            if matches!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED
+                    | reqwest::StatusCode::FORBIDDEN
+                    | reqwest::StatusCode::NOT_FOUND
+            ) {
+                return Ok(None);
+            }
+            let batch: Vec<Value> = response.error_for_status()?.json().await?;
+            let done = batch.len() < limit;
+            items.extend(batch);
+            if done {
+                break;
+            }
+        }
+        Ok(Some(items))
     }
 
     fn cursor(&self, repo: &str) -> Cursor {
@@ -393,6 +509,32 @@ fn message_from_comment(repo: &str, comment: &Value) -> Option<ForgeMessage> {
         linked_issue: None,
         event: "issue_comment".into(),
         title: None,
+        reply_target: Default::default(),
+    })
+}
+
+/// Reviews have their own IDs; do not use them as issue-comment IDs.
+fn message_from_review(repo: &str, pull: &Value, review: &Value) -> Option<ForgeMessage> {
+    let event = match review["state"].as_str()? {
+        "APPROVED" => "pull_request_approved",
+        "REQUEST_CHANGES" => "pull_request_rejected",
+        "COMMENT" => "pull_request_comment",
+        _ => return None,
+    };
+    Some(ForgeMessage {
+        forge: ForgeKind::Forgejo,
+        location: Url::parse(review["html_url"].as_str()?).ok()?,
+        body: review["body"].as_str()?.to_owned(),
+        author: review["user"]["login"].as_str()?.to_owned(),
+        repository: repo.to_owned(),
+        comment_id: None,
+        number: pull["number"].as_u64(),
+        is_pull_request: true,
+        linked_issue: pull["body"]
+            .as_str()
+            .and_then(crate::forge::linked_issue_ref),
+        event: event.into(),
+        title: pull["title"].as_str().map(str::to_owned),
         reply_target: Default::default(),
     })
 }
@@ -528,6 +670,7 @@ mod tests {
         search_status: Mutex<Option<u16>>,
         comments: Mutex<HashMap<String, MockReply>>,
         requests: Mutex<Vec<String>>,
+        pages: Mutex<HashMap<String, MockReply>>,
     }
 
     async fn mock_handler(
@@ -543,6 +686,25 @@ mod tests {
             .unwrap()
             .push(format!("{method} {uri}"));
         let path = uri.path().to_owned();
+
+        let page_key = format!(
+            "{}?page={}",
+            path,
+            uri.query()
+                .and_then(|query| query.split('&').find_map(|pair| pair.strip_prefix("page=")))
+                .unwrap_or("1")
+        );
+        if let Some(reply) = state.pages.lock().unwrap().get(&page_key).cloned() {
+            return match reply {
+                MockReply::Json(value) => axum::response::Json(value).into_response(),
+                MockReply::Status(code) => axum::http::StatusCode::from_u16(code)
+                    .unwrap()
+                    .into_response(),
+            };
+        }
+        if path.ends_with("/issues") || path.ends_with("/reviews") {
+            return axum::response::Json(json!([])).into_response();
+        }
 
         if path == "/api/v1/repos/search" {
             if let Some(code) = *state.search_status.lock().unwrap() {
@@ -670,6 +832,243 @@ mod tests {
         })
     }
 
+    fn review(id: i64, state: &str, submitted: &str) -> Value {
+        json!({
+            "id": id, "state": state, "submitted_at": submitted, "updated_at": submitted,
+            "body": "@shylock-bot fix the blocking review finding",
+            "user": {"login": "shylock-reviewer"},
+            "html_url": format!("http://forge.local:3000/o/r/pulls/159#issuecomment-{}", id + 13000)
+        })
+    }
+
+    #[tokio::test]
+    async fn polls_review_bodies_with_pagination_and_restart_dedupe() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(MockState::default());
+        let submitted = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        state.pages.lock().unwrap().extend([
+            (
+                "/api/v1/repos/o/r/issues?page=1".into(),
+                MockReply::Json(json!([
+                    {"number": 159, "title": "test PR", "body": "Fixes #156"}
+                ])),
+            ),
+            (
+                "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+                MockReply::Json(json!([review(397, "PENDING", &submitted)])),
+            ),
+            (
+                "/api/v1/repos/o/r/pulls/159/reviews?page=2".into(),
+                MockReply::Json(json!([review(398, "REQUEST_CHANGES", &submitted)])),
+            ),
+        ]);
+        let base = start_mock(state.clone()).await;
+        let mut config = test_config(dir.path(), &base);
+        config.poller.repositories = vec!["o/r".into()];
+        config.poller.page_limit = 1;
+        // Match the peer handoff in the reported failure.
+        let mut reviewer = config.users["default"].clone();
+        reviewer.role = crate::config::UserRole::Reviewer;
+        config.users.insert("shylock-reviewer".into(), reviewer);
+        let (poller, sessions) = build_poller(config.clone());
+        poller.tick().await.unwrap();
+        for _ in 0..200 {
+            if sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .is_some_and(|s| s.runs.len() == 1 && s.runs[0].success == Some(true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let session = sessions.get("user:default:forgejo:o/r:pr:159").unwrap();
+        assert_eq!(session.runs.len(), 1);
+        assert!(
+            session.runs[0]
+                .summary
+                .as_deref()
+                .unwrap()
+                .contains("blocking review finding")
+        );
+        assert_eq!(session.runs[0].success, Some(true));
+        let requests = state.requests.lock().unwrap().clone();
+        assert!(
+            requests.iter().any(|r| r.contains("type=pulls")
+                && r.contains("state=all")
+                && r.contains("since="))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.contains("reviews?limit=1&page=3"))
+        );
+
+        let restarted = Poller::new(Arc::new(config), poller.dispatcher.clone()).unwrap();
+        restarted.tick().await.unwrap();
+        assert_eq!(
+            sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .unwrap()
+                .runs
+                .len(),
+            1
+        );
+        assert!(sessions.pending_jobs().unwrap().is_empty());
+
+        // Submitting a pending review preserves its creation timestamp.
+        let mut late_review = review(397, "COMMENT", &submitted);
+        late_review["updated_at"] = json!(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+        state.pages.lock().unwrap().insert(
+            "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+            MockReply::Json(json!([late_review])),
+        );
+        restarted.tick().await.unwrap();
+        for _ in 0..200 {
+            if sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .unwrap()
+                .runs
+                .len()
+                == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .unwrap()
+                .runs
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn late_pending_review_uses_updated_time_and_dispatches_once_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(MockState::default());
+        let created =
+            (Utc::now() - chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let mut pending = review(397, "PENDING", &created);
+        pending["updated_at"] = json!(created);
+        state.pages.lock().unwrap().extend([
+            (
+                "/api/v1/repos/o/r/issues?page=1".into(),
+                MockReply::Json(json!([{"number": 159}])),
+            ),
+            (
+                "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+                MockReply::Json(json!([pending])),
+            ),
+        ]);
+        let base = start_mock(state.clone()).await;
+        let mut config = test_config(dir.path(), &base);
+        config.poller.repositories = vec!["o/r".into()];
+        let mut reviewer = config.users["default"].clone();
+        reviewer.role = crate::config::UserRole::Reviewer;
+        config.users.insert("shylock-reviewer".into(), reviewer);
+        let (poller, sessions) = build_poller(config.clone());
+        poller.tick().await.unwrap();
+        assert!(sessions.get("user:default:forgejo:o/r:pr:159").is_none());
+        assert!(created < poller.cursor("o/r:reviews").last_time.unwrap());
+
+        // Forgejo preserves CreatedUnix/submitted_at when submitting a pending
+        // review; only its state, content and UpdatedUnix/updated_at advance.
+        let updated = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        assert!(updated > poller.cursor("o/r:reviews").last_time.unwrap());
+        let mut submitted = review(397, "REQUEST_CHANGES", &created);
+        submitted["updated_at"] = json!(updated);
+        state.pages.lock().unwrap().insert(
+            "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+            MockReply::Json(json!([submitted])),
+        );
+        poller.tick().await.unwrap();
+        for _ in 0..200 {
+            if sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .is_some_and(|s| s.runs.len() == 1 && s.runs[0].success == Some(true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let session = sessions
+            .get("user:default:forgejo:o/r:pr:159")
+            .expect("the old pending review must dispatch on submission");
+        assert_eq!(session.runs.len(), 1);
+        assert_eq!(session.runs[0].success, Some(true));
+        assert!(
+            session.runs[0]
+                .summary
+                .as_deref()
+                .unwrap()
+                .contains("blocking review finding")
+        );
+
+        poller.tick().await.unwrap();
+        let restarted = Poller::new(Arc::new(config), poller.dispatcher.clone()).unwrap();
+        restarted.tick().await.unwrap();
+        restarted.tick().await.unwrap();
+        assert!(sessions.pending_jobs().unwrap().is_empty());
+        assert_eq!(
+            sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .unwrap()
+                .runs
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn review_api_failure_keeps_cursor_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(MockState::default());
+        state.pages.lock().unwrap().extend([
+            (
+                "/api/v1/repos/o/r/issues?page=1".into(),
+                MockReply::Json(json!([{"number": 159}])),
+            ),
+            (
+                "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+                MockReply::Status(500),
+            ),
+        ]);
+        let base = start_mock(state).await;
+        let (poller, _) = build_poller(test_config(dir.path(), &base));
+        assert!(
+            poller
+                .poll_reviews(&base, Some("tok"), "o/r")
+                .await
+                .is_err()
+        );
+        assert!(poller.cursor("o/r:reviews").last_time.is_none());
+    }
+
+    #[test]
+    fn review_messages_preserve_author_and_pr_context() {
+        let pull = json!({"number": 159, "title": "test", "body": "Fixes #156"});
+        for (state, event) in [
+            ("APPROVED", "pull_request_approved"),
+            ("COMMENT", "pull_request_comment"),
+            ("REQUEST_CHANGES", "pull_request_rejected"),
+        ] {
+            let message =
+                message_from_review("o/r", &pull, &review(398, state, "2026-10-01T15:52:36Z"))
+                    .unwrap();
+            assert_eq!(message.author, "shylock-reviewer");
+            assert_eq!(message.number, Some(159));
+            assert_eq!(message.comment_id, None);
+            assert_eq!(message.event, event);
+            assert_eq!(message.title.as_deref(), Some("test"));
+            assert_eq!(message.linked_issue.unwrap().number, 156);
+            assert!(message.is_pull_request);
+        }
+        assert!(message_from_review("o/r", &pull, &review(1, "PENDING", "")).is_none());
+    }
+
     #[tokio::test]
     async fn polls_explicit_repositories_and_persists_cursor() {
         let dir = tempfile::tempdir().unwrap();
@@ -723,6 +1122,7 @@ mod tests {
             Cursor {
                 last_id: 7,
                 last_time: Some("2026-09-24T12:00:00Z".into()),
+                ..Default::default()
             },
         );
 
