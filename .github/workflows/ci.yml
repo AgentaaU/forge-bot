@@ -17,6 +17,19 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
+      - name: Set up pinned Rust toolchain
+        run: |
+          # Each job gets fresh homes, avoiding concurrent writes and stale installs.
+          rust_home=$(mktemp -d "$RUNNER_TEMP/forge-bot-rust.XXXXXX")
+          export CARGO_HOME="$rust_home/cargo"
+          export RUSTUP_HOME="$rust_home/rustup"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
+          export PATH="$CARGO_HOME/bin:$PATH"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          rustup install --no-self-update
+          rustup show active-toolchain
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -26,19 +39,38 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
+      - name: Set up pinned Rust toolchain
+        run: |
+          # Each job gets fresh homes, avoiding concurrent writes and stale installs.
+          rust_home=$(mktemp -d "$RUNNER_TEMP/forge-bot-rust.XXXXXX")
+          export CARGO_HOME="$rust_home/cargo"
+          export RUSTUP_HOME="$rust_home/rustup"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
+          export PATH="$CARGO_HOME/bin:$PATH"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          rustup install --no-self-update
+          rustup show active-toolchain
       - name: Install cargo-llvm-cov
         run: |
           if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
-            mkdir -p "$HOME/.cargo/bin"
-            curl -sSL https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz | tar -xz -C "$HOME/.cargo/bin"
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            mkdir -p "$CARGO_HOME/bin"
+            curl -sSL https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz | tar -xz -C "$CARGO_HOME/bin"
+            echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
           fi
       # `cargo llvm-cov` runs the whole suite under instrumentation, so it
       # validates the tests *and* produces the coverage report in a single pass.
       # A separate `cargo test --all` step compiled and ran the suite a second
       # time, roughly doubling the job's wall-clock time without adding signal.
       - name: Test with coverage
-        run: ./contrib/coverage.sh --locked --json --summary-only --output-path coverage.json --fail-under-lines 95
+        run: |
+          # Use LLVM tools from the pinned compiler for compatible coverage data.
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          llvm_bin="$(rustc --print sysroot)/lib/rustlib/$host/bin"
+          export LLVM_COV="$llvm_bin/llvm-cov"
+          export LLVM_PROFDATA="$llvm_bin/llvm-profdata"
+          ./contrib/coverage.sh --locked --json --summary-only --output-path coverage.json --fail-under-lines 95
       - name: Post coverage report
         if: ${{ always() }}
         env:
