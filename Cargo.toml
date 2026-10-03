@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
+base64 = "0.22"
 axum = "0.8.9"
 chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10.4"
@@ -26,6 +27,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.26.1", features = ["v4", "v5", "serde"] }
+web-push = { version = "0.11", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27.0"

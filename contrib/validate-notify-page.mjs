@@ -39,9 +39,50 @@ async function settle() {
   await tick();
 }
 
-function notification(id, recipient, message) {
+// Run the actual worker behind the page's MessageChannel protocol. Cache state
+// can be shared by replacement worker instances to exercise durable receipts.
+function workerHarness(registration, records = new Map()) {
+  const handlers = {};
+  const cache = {
+    async match(key) { return records.get(key); },
+    async put(key, value) { records.set(key, value); },
+    async keys() { return Array.from(records.keys()); },
+    async delete(key) { return records.delete(key); },
+  };
+  const self = {
+    location: { origin: 'https://forge.example' }, registration,
+    caches: { async open() { return cache; } },
+    addEventListener(type, handler) { handlers[type] = handler; },
+    skipWaiting() {}, clients: { async claim() {}, async openWindow() {} },
+  };
+  vm.runInNewContext(readFileSync(join(root, 'src', 'notifications-sw.js'), 'utf8'), { self, URL, Response });
+  return {
+    handlers, records,
+    message(data, ports) {
+      let pending;
+      handlers.message({ data, ports, waitUntil(value) { pending = value; } });
+      return pending;
+    },
+    push(entry) {
+      let pending;
+      handlers.push({ data: { json: () => entry }, waitUntil(value) { pending = value; } });
+      return pending;
+    },
+  };
+}
+class TestMessageChannel {
+  constructor() {
+    this.port1 = { close() {} };
+    this.port2 = { close() {}, postMessage: (data) => {
+      Promise.resolve().then(() => this.port1.onmessage({ data }));
+    } };
+  }
+}
+
+function notification(id, recipient, message, generation = 'gen-1') {
   return {
     id,
+    generation,
     recipient,
     author: 'shylock-bot',
     repository: 'shylock/forge-bot',
@@ -56,7 +97,12 @@ function notification(id, recipient, message) {
 // receives the entry, the per-entry attempt count and the options; it may
 // resolve, reject (to simulate a failed display) or return a promise the test
 // resolves later (to hold a display in flight).
-function createHarness({ permission, entries = [], onShow, registrationError } = {}) {
+function createHarness({ permission, entries = [], onShow, registrationError, push = false, existingPush = false, failPush = false } = {}) {
+  const pushRequests = [];
+  let subscription = existingPush ? makeSubscription() : null;
+  function makeSubscription() {
+    return { endpoint: "https://fcm.googleapis.com/test", toJSON() { return { endpoint: this.endpoint, keys: {} }; }, async unsubscribe() { subscription = null; return true; } };
+  }
   const requests = [];
   const shown = [];
   const attempts = new Map();
@@ -97,6 +143,7 @@ function createHarness({ permission, entries = [], onShow, registrationError } =
     log: element(),
     recipient: element(),
     enable: element(),
+    'disable-push': element(),
     test: element(),
     diagnostics: element(),
     'diagnostics-button': element(),
@@ -118,6 +165,14 @@ function createHarness({ permission, entries = [], onShow, registrationError } =
   }
 
   const registration = {
+    pushManager: push ? {
+      async getSubscription() { return subscription; },
+      async subscribe(options) {
+        assert(options.userVisibleOnly && options.applicationServerKey.length === 65, 'invalid push subscription options');
+        subscription = makeSubscription();
+        return subscription;
+      },
+    } : undefined,
     active: null,
     installing: null,
     showNotification(title, options) {
@@ -133,7 +188,13 @@ function createHarness({ permission, entries = [], onShow, registrationError } =
     },
   };
 
+  const background = workerHarness(registration);
+
   const sandbox = {
+    window: { Notification, isSecureContext: true },
+    atob: (value) => Buffer.from(value, "base64").toString("binary"),
+    Uint8Array,
+    MessageChannel: TestMessageChannel,
     console,
     Promise,
     Object,
@@ -160,6 +221,7 @@ function createHarness({ permission, entries = [], onShow, registrationError } =
           }
           worker = {
             state: 'installing',
+            postMessage: (data, ports) => background.message(data, ports),
             listeners: {},
             addEventListener(type, handler) {
               this.listeners[type] = handler;
@@ -179,7 +241,13 @@ function createHarness({ permission, entries = [], onShow, registrationError } =
       },
     },
     Notification,
-    fetch(url) {
+    fetch(url, options) {
+      if (url === '/notifications/push') {
+        if (options) { pushRequests.push({ method: options.method, body: JSON.parse(options.body) }); }
+        return Promise.resolve({ ok: !options || !failPush, status: failPush ? 500 : 200, json: async () => (push
+          ? { transport: 'web_push', public_key: Buffer.alloc(65, 1).toString('base64url') }
+          : { transport: 'polling' }) });
+      }
       requests.push(url);
       const recipient = /[?&]recipient=([^&]+)/.exec(url);
       const after = /[?&]after=(\d+)/.exec(url);
@@ -203,6 +271,9 @@ function createHarness({ permission, entries = [], onShow, registrationError } =
 
   return {
     elements,
+    pushRequests,
+    push: (entry) => background.push(entry),
+    expireSubscription: () => { subscription = null; },
     requests,
     shown,
     attempts,
@@ -392,7 +463,7 @@ function createHarness({ permission, entries = [], onShow, registrationError } =
 
   // The server restarts: ids begin again and the generation changes.
   h.entries.length = 0;
-  h.entries.push(notification(1, 'alice', 'new-one'));
+  h.entries.push(notification(1, 'alice', 'new-one', 'gen-2'));
   h.setGeneration('gen-2');
   await h.poll();
   await settle();
@@ -439,4 +510,151 @@ function createHarness({ permission, entries = [], onShow, registrationError } =
   console.log('registration failure: test button does not falsely claim success');
 }
 
+// Push: a fresh browser requires an explicit click; restored subscriptions are rebound.
+{
+  const h = createHarness({ permission: 'granted', push: true });
+  h.activate();
+  await settle();
+  assert(h.pushRequests.length === 0, 'startup subscribed without an explicit enable click');
+  await h.elements.enable.listeners.click();
+  await settle();
+  assert(h.pushRequests[0].body.recipient === 'alice', 'enable did not bind Alice');
+  const pushed = notification(1, 'alice', 'pushed');
+  h.entries.push(pushed);
+  await h.push(pushed);
+  await h.poll();
+  assert(h.shown.length === 1, 'polling duplicated a push notification');
+  h.elements.recipient.value = 'bob';
+  h.elements.recipient.listeners.change();
+  await settle();
+  assert(h.pushRequests.at(-1).body.recipient === 'bob', 'recipient switch did not rebind');
+  h.elements['disable-push'].listeners.click();
+  await settle();
+  assert(h.pushRequests.at(-1).method === 'DELETE', 'disable did not remove the server subscription');
+  h.entries.push(notification(2, 'bob', 'poll after disable'));
+  await h.poll();
+  assert(h.shown.some((entry) => entry.id === 2), 'disable did not restore polling notifications');
+}
+{
+  const h = createHarness({ permission: 'granted', push: true, existingPush: true });
+  h.activate();
+  await settle();
+  assert(h.pushRequests.length === 1 && h.pushRequests[0].method === 'POST', 'existing subscription was not restored');
+}
+{
+  const h = createHarness({ permission: 'granted', push: true, existingPush: true, failPush: true,
+    entries: [notification(1, 'alice', 'fallback')] });
+  h.activate();
+  await settle();
+  assert(h.shown.length === 1, 'failed registration did not fall back to polling');
+}
+
+// A request predating subscription must survive enabling and be displayed.
+{
+  const h = createHarness({ permission: 'default', push: true,
+    entries: [notification(1, 'alice', 'pending before subscribe')] });
+  h.activate();
+  await settle();
+  assert(h.shown.length === 0, 'pending entry displayed before permission');
+  assert(h.requests.at(-1).includes('after=0'), 'pending entry consumed before enable');
+  await h.elements.enable.listeners.click();
+  await settle();
+  assert(h.shown.length === 1, 'subscribing lost the pending entry');
+  await h.poll();
+  assert(h.requests.at(-1).includes('after=1'), 'successful display did not commit the cursor');
+  assert(h.shown.length === 1, 'pending entry displayed twice');
+}
+// No push reaches the browser for overflow, provider failure, or expiration.
+// Registration is deliberately successful; it must never suppress fallback.
+for (const failure of ['queue overflow', 'network/provider failure', '404/410 cleanup']) {
+  const h = createHarness({ permission: 'granted', push: true, existingPush: true });
+  h.activate();
+  await settle();
+  if (failure === '404/410 cleanup') { h.expireSubscription(); }
+  const entry = notification(1, 'alice', failure);
+  h.entries.push(entry);
+  await h.poll();
+  assert(h.shown.length === 1, failure + ': polling did not recover the missing push');
+  await h.push(entry); // A delayed successful push must not duplicate recovery.
+  await h.poll();
+  assert(h.shown.length === 1, failure + ': late push duplicated polling');
+  assert(h.requests.at(-1).includes('after=1'), failure + ': cursor did not follow display');
+  assert(!h.elements.status.textContent.includes('Web push enabled'), 'status claimed unverified push delivery');
+}
+// A failed worker display must not create a receipt or advance the cursor.
+{
+  let fail = true;
+  const entry = notification(1, 'alice', 'retry display');
+  const h = createHarness({ permission: 'granted', push: true, existingPush: true,
+    onShow: () => { if (fail) { throw new Error('display rejected'); } } });
+  h.activate();
+  await settle();
+  h.entries.push(entry);
+  await h.poll();
+  await h.poll();
+  assert(h.requests.at(-1).includes('after=0') && h.shown.length === 0, 'failed display consumed entry');
+  fail = false;
+  await h.push(entry);
+  await h.poll();
+  assert(h.shown.length === 1, 'retry was suppressed by a failed-display receipt');
+}
+// Concurrent polling/push and a dismissed notification across worker restart.
+{
+  let count = 0;
+  const registration = { async showNotification() { count++; }, async getNotifications() { return []; } };
+  const worker = workerHarness(registration);
+  const entry = notification(1, 'alice', 'concurrent display');
+  let response;
+  await Promise.all([
+    worker.push(entry),
+    worker.message({ type: 'display-notification', notification: entry }, [{ postMessage(value) { response = value; }, close() {} }]),
+  ]);
+  assert(count === 1 && response.displayed, 'concurrent transports did not share one successful display');
+  const replacement = workerHarness(registration, worker.records);
+  await replacement.push(entry);
+  assert(count === 1, 'dismissed notification was redisplayed after worker restart');
+}
+
+// Storage failures still allow delivery, and receipt storage stays bounded.
+{
+  let count = 0;
+  const registration = { async showNotification() { count++; }, async getNotifications() { return []; } };
+  const records = new Map();
+  for (let index = 0; index < 2050; index++) { records.set('old-' + index, {}); }
+  const worker = workerHarness(registration, records);
+  await worker.push(notification(3, 'alice', 'bounded receipts'));
+  assert(records.size === 2048 && !records.has('old-0'), 'persistent receipt cache grew beyond its bound');
+  const unavailable = { async match() { throw new Error('storage blocked'); }, async put() { throw new Error('storage blocked'); } };
+  const degraded = workerHarness(registration, unavailable);
+  const entry = notification(4, 'alice', 'storage unavailable');
+  await degraded.push(entry);
+  await degraded.push(entry);
+  assert(count === 2, 'storage failure prevented display or in-memory deduplication');
+}
+
+// Exercise the real worker while no page is running.
+{
+  const handlers = {};
+  const shown = [];
+  const opened = [];
+  const worker = { location: { origin: 'https://bot.example' },
+    addEventListener: (type, handler) => { handlers[type] = handler; },
+    skipWaiting() {},
+    registration: { showNotification: async (title, options) => { shown.push({ title, options }); } },
+    clients: { claim: async () => {}, openWindow: async (url) => { opened.push(url); } },
+  };
+  vm.runInNewContext(readFileSync(join(root, 'src', 'notifications-sw.js'), 'utf8'), { self: worker, URL });
+  let pending;
+  const entry = notification(7, 'alice', 'background message');
+  handlers.push({ data: { json: () => entry }, waitUntil: (value) => { pending = value; } });
+  await pending;
+  assert(shown[0].options.body === entry.message, 'worker did not show pushed payload');
+  assert(shown[0].options.icon && shown[0].options.badge, 'worker omitted mobile icons');
+  let closed = false;
+  handlers.notificationclick({ notification: { data: entry.location, close: () => { closed = true; } }, waitUntil: (value) => { pending = value; } });
+  await pending;
+  assert(closed && opened[0] === entry.location, 'click did not open the forge comment');
+  handlers.notificationclick({ notification: { data: 'javascript:alert(1)', close() {} }, waitUntil() { throw new Error('unsafe URL opened'); } });
+}
+console.log('web push: subscription lifecycle, polling fallback, background display and click validated');
 console.log('VALIDATION OK');

@@ -1,7 +1,66 @@
 const status = document.getElementById('status');
 const log = document.getElementById('log');
 const recipientSelect = document.getElementById('recipient');
+try {
+  const saved = window.localStorage.getItem('forge-bot-recipient');
+  if (saved && Array.from(recipientSelect.options).some(function (option) { return option.value === saved; })) {
+    recipientSelect.value = saved;
+  }
+} catch (_) { /* Storage may be disabled. */ }
 let registration = null;
+let pushConfig = null;
+let pushUpdates = Promise.resolve();
+
+async function loadPushConfig() {
+  try {
+    const response = await fetch('/notifications/push');
+    if (response.ok) { pushConfig = await response.json(); }
+  } catch (_) { /* Polling remains available. */ }
+}
+
+function syncPush(disable = false, create = false) {
+  // Serialize selection changes so the final server binding matches the UI.
+  pushUpdates = pushUpdates.catch(function () {}).then(async function () {
+    if (!registration || !registration.pushManager) { return; }
+    let subscription = await registration.pushManager.getSubscription();
+    if (disable) {
+      if (subscription) {
+        const response = await fetch('/notifications/push', {
+          method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ endpoint: subscription.endpoint }),
+        });
+        if (!response.ok) { throw new Error('Could not remove push subscription'); }
+        await subscription.unsubscribe();
+      }
+      setStatus('Web push disabled. Polling while this page is open.');
+      return;
+    }
+    if (!pushConfig || pushConfig.transport !== 'web_push' ||
+        typeof Notification === 'undefined' || Notification.permission !== 'granted') { return; }
+    const recipient = recipientSelect.value;
+    if (!recipient) { return; }
+    if (!subscription && !create) { return; }
+    if (!subscription) {
+      const encoded = pushConfig.public_key.replace(/-/g, '+').replace(/_/g, '/');
+      const bytes = Uint8Array.from(atob(encoded), function (character) { return character.charCodeAt(0); });
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true, applicationServerKey: bytes,
+      });
+    }
+    const response = await fetch('/notifications/push', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recipient: recipient, subscription: subscription.toJSON() }),
+    });
+    if (!response.ok) { throw new Error('Push subscription returned ' + response.status); }
+    if (recipientSelect.value === recipient) {
+      setStatus('Browser subscribed for ' + recipient + '; polling also verifies delivery while open.');
+    }
+  }).catch(function (error) {
+    setStatus('Web push failed: ' + error.message + '. Polling while this page is open.');
+  });
+  return pushUpdates;
+}
+
 // Why the service worker registration failed, if it did. `register()` rejects
 // for environment-specific reasons (site data blocked, insecure context, a
 // transient network error) that the page otherwise swallows, and the Android
@@ -90,7 +149,7 @@ async function enable() {
   // Permission often arrives after earlier polls already fetched the batch;
   // poll again now so those entries are delivered instead of waiting five
   // seconds (or being lost if the cursor had advanced).
-  if (permission === 'granted') { poll(); }
+  if (permission === 'granted') { await syncPush(false, true); poll(); }
 }
 
 // Deliver a synthetic notification on demand. This lets a person confirm that
@@ -240,6 +299,31 @@ async function runDiagnostics() {
   }
 }
 
+// Both transports use the worker's receipt store. Only a display acknowledgement
+// (or a receipt from an earlier successful display) lets polling consume an entry.
+function displayThroughWorker(notification) {
+  return new Promise(function (resolve, reject) {
+    const channel = new MessageChannel();
+    const timeout = setTimeout(function () {
+      channel.port1.close();
+      reject(new Error('Service worker display acknowledgement timed out'));
+    }, 10000);
+    channel.port1.onmessage = function (event) {
+      clearTimeout(timeout);
+      channel.port1.close();
+      if (event.data && event.data.displayed === true) { resolve(); }
+      else { reject(new Error(event.data && event.data.error || 'Service worker display failed')); }
+    };
+    try {
+      registration.active.postMessage({ type: 'display-notification', notification: notification }, [channel.port2]);
+    } catch (error) {
+      clearTimeout(timeout);
+      channel.port1.close();
+      reject(error);
+    }
+  });
+}
+
 // Display one entry. Resolves to `{ handled, raised }`: `handled` means the
 // entry may be consumed (shown, blocked, or impossible to show) so the cursor
 // can advance, while `raised` means the OS was actually asked to show it.
@@ -261,13 +345,19 @@ async function display(notification) {
   // both.
   const options = {
     body: notification.message,
+    tag: 'forge-bot-' + (notification.generation || notification.created_at) + '-' + notification.id,
     data: notification.location,
     icon: '/notifications/icon.png',
     badge: '/notifications/badge.png',
   };
   if (registration && typeof registration.showNotification === 'function') {
     try {
-      await registration.showNotification(title, options);
+      if (registration.active && typeof registration.active.postMessage === 'function' &&
+          typeof MessageChannel !== 'undefined') {
+        await displayThroughWorker(notification);
+      } else {
+        await registration.showNotification(title, options);
+      }
       return { handled: true, raised: true };
     } catch (error) {
       // Android rejects `new Notification` and can reject `showNotification`
@@ -416,11 +506,13 @@ async function poll() {
 recipientSelect.addEventListener('change', function () {
   // Abandon an in-flight response for the previous recipient, then show only
   // this recipient's log with its own cursor.
+  try { window.localStorage.setItem('forge-bot-recipient', recipientSelect.value); } catch (_) {}
   requestSeq++;
   log.textContent = '';
   rendered.clear();
-  poll();
+  syncPush().then(poll);
 });
+document.getElementById('disable-push').addEventListener('click', function () { syncPush(true); });
 document.getElementById('enable').addEventListener('click', enable);
 document.getElementById('test').addEventListener('click', testNotification);
 document.getElementById('diagnostics-button').addEventListener('click', runDiagnostics);
@@ -436,7 +528,9 @@ if (navigator.permissions && navigator.permissions.query) {
 }
 // Wait for an active worker before the first poll so mobile browsers never
 // fall back to the unsupported `Notification` constructor on initial load.
-setupServiceWorker().then(function () {
+setupServiceWorker().then(async function () {
+  await loadPushConfig();
+  await syncPush();
   poll();
   setInterval(poll, 5000);
 });

@@ -83,6 +83,12 @@ pub fn router(state: AppState) -> Router {
             get(notifications_diagnostics).post(notifications_diagnostics_upload),
         )
         .route("/notifications/sw.js", get(notifications_service_worker))
+        .route(
+            "/notifications/push",
+            get(push_config)
+                .post(push_subscribe)
+                .delete(push_unsubscribe),
+        )
         .route("/notifications/ca.crt", get(notifications_ca_cert))
         .route("/notify", get(notifications_page))
         .route("/notify.json", get(notifications_json))
@@ -508,6 +514,56 @@ async fn receive(
         "webhook processing completed"
     );
     (StatusCode::ACCEPTED, Json(json!({ "accepted": accepted })))
+}
+
+async fn push_config(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(match state.dispatcher.push() {
+        Some(push) => json!({"transport": "web_push", "public_key": push.public_key}),
+        None => json!({"transport": "polling"}),
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct PushSubscriptionRequest {
+    recipient: String,
+    subscription: web_push::SubscriptionInfo,
+}
+
+async fn push_subscribe(
+    State(state): State<AppState>,
+    Json(request): Json<PushSubscriptionRequest>,
+) -> Response {
+    let Some(push) = state.dispatcher.push() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if !state.dispatcher.identities().users().iter().any(|user| {
+        user.role == crate::config::UserRole::Human
+            && user.login.eq_ignore_ascii_case(&request.recipient)
+    }) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match push.subscribe(&request.recipient, request.subscription) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => (StatusCode::BAD_REQUEST, "invalid push subscription").into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PushUnsubscribeRequest {
+    endpoint: String,
+}
+
+async fn push_unsubscribe(
+    State(state): State<AppState>,
+    Json(request): Json<PushUnsubscribeRequest>,
+) -> Response {
+    let Some(push) = state.dispatcher.push() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match push.unsubscribe(&request.endpoint) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 #[cfg(test)]

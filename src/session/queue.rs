@@ -55,6 +55,7 @@ struct Inner {
     /// In-memory log backing `/notifications`, shared by the webhook and poll
     /// ingesters so both record the same human mentions.
     notifier: Notifier,
+    push: Option<Arc<crate::web_push::PushService>>,
     /// Bounded set of delivery keys already notified, so a comment seen by both
     /// ingesters (or redelivered) notifies a human only once.
     notified: Mutex<RecentComments>,
@@ -156,6 +157,7 @@ impl Dispatcher {
             executor,
             user_apis,
             notifier: Notifier::new(),
+            push: crate::web_push::PushService::new(&config)?,
             notified: Mutex::new(RecentComments::new(1024)),
             tx,
             running: Mutex::new(HashMap::new()),
@@ -320,6 +322,10 @@ impl Dispatcher {
         &self.inner.notifier
     }
 
+    pub fn push(&self) -> Option<&Arc<crate::web_push::PushService>> {
+        self.inner.push.as_ref()
+    }
+
     /// Record a web-page notification for every configured human an agent
     /// comment mentions.
     ///
@@ -359,6 +365,16 @@ impl Dispatcher {
                 message.location.as_str(),
                 &message.body,
             );
+            if let (Some(id), Some(push)) = (id, &self.inner.push)
+                && let Some(notification) = self
+                    .inner
+                    .notifier
+                    .since(&human.login, id - 1, None)
+                    .into_iter()
+                    .find(|n| n.id == id)
+            {
+                push.enqueue(notification);
+            }
             tracing::info!(
                 notification = ?id,
                 recipient = %human.login,

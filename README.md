@@ -393,9 +393,51 @@ mention as a notification without routing another agent run.
 
 `GET /notifications` is a small web page that turns those notifications into
 browser system notifications. Pick the human account, grant notification
-permission, and keep the page open; the page polls
-`GET /notifications.json?recipient=<login>&after=<id>` every five seconds and
-raises a system notification for each new entry.
+permission, and click **Enable notifications**. Web push is the default
+transport preference. Configure a stable VAPID key and contact URI to enable it:
+
+```sh
+umask 077
+openssl ecparam -name prime256v1 -genkey -noout -out vapid.pem
+```
+
+```toml
+[notifications]
+transport = "web_push" # default; use "polling" for page-only delivery
+vapid_private_key_path = "/etc/forge-bot/vapid.pem"
+vapid_subject = "mailto:operator@example.com"
+```
+
+Keep the key private, readable by the bot, and stable across restarts. The public
+key is derived automatically; no push-service account registration is needed.
+A subscribed browser receives encrypted notifications through its push service
+even when the page is closed. The worker opens the forge comment on click.
+Subscriptions are stored with mode `0600` in
+`[session].dir/push-subscriptions.json`; persist that directory across deployments.
+Changing the selected human rebinds that browser subscription. **Disable web
+push** removes it from the server and browser; **Enable notifications** subscribes
+again. After replacing the VAPID key, disable and re-enable existing subscriptions.
+
+Without a configured key, with `transport = "polling"`, or when the browser
+cannot subscribe, keep the page open. It polls
+`GET /notifications.json?recipient=<login>&after=<id>` every five seconds.
+Polling continues to verify delivery even after subscribing. Both transports
+use the service worker's display receipts, written only after `showNotification`
+succeeds, to avoid duplicate system notifications. Receipts persist in browser
+Cache Storage (bounded to 2048 entries), so dismissed notifications and worker
+restarts do not cause a second display. If browser storage is unavailable,
+deduplication uses in-memory receipts and still-visible notifications. Pending
+entries from before subscription and failed/dropped pushes are displayed by
+polling while the page is open. Push delivery uses a bounded queue and a one-day TTL;
+failed sends remain in the polling log, and expired (404/410) subscriptions are
+removed. Pending push sends are not durable across server restarts.
+
+Only the exact hosts `fcm.googleapis.com`, `updates.push.services.mozilla.com`,
+and `web.push.apple.com` are accepted by default; `[notifications] push_hosts`
+can replace that allowlist for another trusted service. Redirects are disabled.
+The notification APIs, including subscription registration, follow the existing
+unauthenticated notification-page access model: restrict them to trusted users
+with your reverse proxy before exposing the page publicly.
 
 Desktop browsers use the page directly. Android and iOS browsers reject the
 `Notification` constructor and require
@@ -439,7 +481,7 @@ can be inspected without a remote debugger.
 The cursors are kept per human account, so switching accounts does not hide a
 recipient's pending notifications, and a server restart is detected through a
 per-process generation that resets stale cursors instead of skipping the new
-entries. A cursor only advances once an entry has actually been handed to the
+entries. In polling mode, a cursor only advances once an entry has actually been handed to the
 browser (`showNotification` resolved) — a missing permission or a rejected
 display keeps it pending and retried, instead of consuming it silently. The
 page shows the current permission/error state and a **Send test notification**

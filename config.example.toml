@@ -123,6 +123,14 @@ ack = true
 result = false
 
 [notifications]
+# Prefer background delivery; set "polling" for the page-only transport.
+transport = "web_push"
+# Generate a stable key: openssl ecparam -name prime256v1 -genkey -noout -out vapid.pem
+# Keep the key private and readable by the bot. Without a key, polling is used.
+# vapid_private_key_path = "/etc/forge-bot/vapid.pem"
+# vapid_subject = "mailto:operator@example.com"
+# Optional exact host allowlist for another trusted push service. Default:
+# push_hosts = ["fcm.googleapis.com", "updates.push.services.mozilla.com", "web.push.apple.com"]
 # Optional path to a CA certificate. When set, it is served at
 # `/notifications/ca.crt` and the notification page offers a "Download CA
 # certificate" link, so a phone can install a private CA. Mobile browsers

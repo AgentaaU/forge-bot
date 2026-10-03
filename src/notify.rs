@@ -3,8 +3,8 @@
 //! An agent mentions a configured `human` login when it needs something only a
 //! person can do: a privilege request, an account registration, a secret, and
 //! so on. forge-bot records that mention as a [`Notification`]. The
-//! `/notifications` web page polls the bounded log and raises a browser system
-//! notification.
+//! `/notifications` registers a persistent Web Push subscription when configured;
+//! a polling transport remains available for browsers without push support.
 //!
 //! Desktop browsers use the [`Notification`] constructor, but Android and iOS
 //! browsers reject it and require
@@ -47,6 +47,8 @@ const NOTIFICATION_BADGE: &[u8] = include_bytes!("../resource/notifications-badg
 pub struct Notification {
     /// Monotonic id used by the web page as a `since` cursor.
     pub id: u64,
+    /// Process generation shared by push and polling for display deduplication.
+    pub generation: String,
     /// Configured human login the notification is addressed to.
     pub recipient: String,
     /// Login of the agent that asked for help.
@@ -140,8 +142,10 @@ impl Notifier {
         let mut state = self.state.lock().expect("notifier mutex poisoned");
         state.next_id += 1;
         let id = state.next_id;
+        let generation = state.generation.clone();
         state.log.push_back(Notification {
             id,
+            generation,
             recipient: recipient.to_owned(),
             author: author.to_owned(),
             repository: repository.to_owned(),
@@ -310,7 +314,7 @@ small {{ color: #666; }}
 </head>
 <body>
 <h1>forge-bot notifications</h1>
-<p>Pick your human account, enable browser notifications, and keep this page open.
+<p>Pick your human account and enable browser notifications. Web push can deliver even when this page is closed; polling requires keeping it open.
 Desktop browsers use the page directly. Mobile browsers require HTTPS and a
 service worker; on iOS 16.4+ add this page to the Home Screen first, then grant
 notification permission. Use <em>Send test notification</em> to confirm the
@@ -320,6 +324,7 @@ state for debugging.</p>
 <div class="row">
 <label>Human <select id="recipient">{options}</select></label>
 <button id="enable">Enable notifications</button>
+<button id="disable-push">Disable web push</button>
 <button id="test">Send test notification</button>
 <button id="diagnostics-button">Run diagnostics</button>
 <button id="refresh">Refresh</button>
@@ -339,17 +344,9 @@ state for debugging.</p>
 
 /// The service worker backing `/notifications`.
 ///
-/// It has no fetch handler; mobile browsers only need a registered worker so
-/// the page can call `ServiceWorkerRegistration.showNotification`.
+/// Handles background pushes and opens the forge location on notification clicks.
 pub fn service_worker_js() -> &'static str {
-    r#"// Minimal service worker: mobile browsers require a registration before the
-// page may call `showNotification`, which is the only notification API on
-// Android and iOS.
-self.addEventListener('install', function () { self.skipWaiting(); });
-self.addEventListener('activate', function (event) {
-  event.waitUntil(self.clients.claim());
-});
-"#
+    include_str!("notifications-sw.js")
 }
 
 /// Web app manifest so "Add to Home Screen" installs a notification-capable
@@ -483,7 +480,7 @@ mod tests {
         assert!(html.contains("registration.showNotification"));
         // The worker must be active before the first poll so mobile browsers do
         // not fall back to the unsupported constructor on initial load.
-        assert!(html.contains("setupServiceWorker().then(function () {"));
+        assert!(html.contains("setupServiceWorker().then(async function () {"));
         // Cursors are per recipient and reset when the process generation
         // changes.
         assert!(html.contains("const cursors = {}"));
@@ -580,7 +577,7 @@ mod tests {
         assert!(html.contains("Click \"Enable notifications\""), "{html}");
         // Granting permission re-polls immediately instead of losing the batch.
         assert!(
-            html.contains("if (permission === 'granted') { poll(); }"),
+            html.contains("if (permission === 'granted') { await syncPush(false, true); poll(); }"),
             "{html}"
         );
         // Only a contiguous handled prefix may advance the cursor, so a later

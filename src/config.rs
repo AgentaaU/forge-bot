@@ -886,11 +886,28 @@ impl Default for PiRpcConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationsConfig {
+    /// Preferred browser transport; web push works while the page is closed.
+    pub transport: NotificationTransport,
+    /// Stable P-256 PEM private key. Missing key leaves polling available.
+    pub vapid_private_key_path: Option<PathBuf>,
+    /// VAPID contact URI (mailto: or HTTPS).
+    pub vapid_subject: Option<String>,
+    /// Exact trusted push-service hosts; prevents arbitrary outbound requests.
+    pub push_hosts: Vec<String>,
     /// Optional path to a CA certificate offered as a download on the
     /// notification page (served at `/notifications/ca.crt`). Set this when
     /// the page is served behind a private CA that a mobile device must trust
     /// before it will register the notification service worker.
     pub ca_cert_path: Option<PathBuf>,
+}
+
+/// Browser notification transport preference.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationTransport {
+    #[default]
+    WebPush,
+    Polling,
 }
 
 /// Configuration for the polling ingester.

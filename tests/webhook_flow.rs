@@ -1410,6 +1410,7 @@ async fn agent_comment_mentioning_a_human_records_a_notification() {
     assert_eq!(notifications.len(), 1, "{json}");
     assert_eq!(notifications[0]["author"], "shylock-bot");
     assert_eq!(notifications[0]["recipient"], "alice");
+    assert_eq!(notifications[0]["generation"], json["generation"]);
     assert_eq!(notifications[0]["repository"], "shylock/forge-bot");
     assert!(
         notifications[0]["message"]
@@ -1953,4 +1954,131 @@ async fn automatic_work_rejects_untrusted_or_missing_pr_author_before_mutation()
         assert!(harness.sessions.pending_jobs().unwrap().is_empty());
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn push_api_registers_humans_and_rejects_invalid_subscriptions() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("vapid.pem");
+    std::fs::write(&key, include_bytes!("fixtures/vapid-test.pem")).unwrap();
+    let harness = harness_with(dir.path(), |config| {
+        with_human(config);
+        config.notifications.vapid_private_key_path = Some(key);
+        config.notifications.vapid_subject = Some("mailto:operator@example.com".into());
+    });
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/notifications/push")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let data: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(data["transport"], "web_push");
+    assert_eq!(data["public_key"].as_str().unwrap().len(), 87);
+    assert!(data.get("private_key").is_none());
+    let mut body = serde_json::json!({
+        "recipient": "alice",
+        "subscription": {
+            "endpoint": "https://fcm.googleapis.com/test",
+            "expirationTime": null,
+            "keys": {
+                "p256dh": "BGa4N1PI79lboMR_YrwCiCsgp35DRvedt7opHcf0yM3iOBTSoQYqQLwWxAfRKE6tsDnReWmhsImkhDF_DBdkNSU",
+                "auth": "EvcWjEgzr4rbvhfi3yds0A"
+            }
+        }
+    });
+    for (recipient, expected) in [
+        ("alice", StatusCode::NO_CONTENT),
+        ("ALICE", StatusCode::NO_CONTENT),
+        ("shylock-bot", StatusCode::BAD_REQUEST),
+        ("unknown", StatusCode::BAD_REQUEST),
+    ] {
+        body["recipient"] = recipient.into();
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/notifications/push")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    body["recipient"] = "alice".into();
+    body["subscription"]["endpoint"] = "https://localhost/private".into();
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/notifications/push")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/notifications/push")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"endpoint":"https://fcm.googleapis.com/test"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn push_api_falls_back_when_not_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), with_human);
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/notifications/push")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let data: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(data, serde_json::json!({"transport": "polling"}));
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/notifications/push")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"endpoint":"https://fcm.googleapis.com/test"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
