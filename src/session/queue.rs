@@ -441,6 +441,21 @@ impl Dispatcher {
                 }
             }
         }
+        let running = self
+            .inner
+            .running
+            .lock()
+            .expect("running agent mutex poisoned");
+        for thread in &mut threads {
+            if let Some(entry) = running.get(&thread.key) {
+                thread.model = entry
+                    .context
+                    .reported_model
+                    .lock()
+                    .expect("model mutex poisoned")
+                    .clone();
+            }
+        }
         Ok(threads)
     }
 

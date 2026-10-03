@@ -26,6 +26,8 @@ pub struct RunRecord {
     pub finished_at: Option<DateTime<Utc>>,
     pub success: Option<bool>,
     pub summary: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
     /// Provider prompt-cache accounting, when the adapter reported it.
     #[serde(default)]
     pub cache: Option<TokenUsage>,
@@ -181,6 +183,7 @@ impl SessionStore {
             finished_at: None,
             success: None,
             summary: None,
+            model: None,
             cache: None,
         });
 
@@ -211,6 +214,7 @@ impl SessionStore {
             run.finished_at = Some(Utc::now());
             run.success = Some(outcome.success);
             run.summary = Some(outcome.summary.clone());
+            run.model = outcome.model.clone();
             run.cache = outcome.usage;
         }
         session.agent = agent.to_owned();
@@ -465,30 +469,11 @@ mod tests {
         assert_eq!(stored.runs[0].success, Some(true));
         assert_eq!(stored.runs[0].agent, "pi");
         assert_eq!(stored.runs[0].summary.as_deref(), Some("done"));
-        assert!(
-            serde_json::to_value(&stored.runs[0])
-                .unwrap()
-                .get("model")
-                .is_none()
-        );
+        assert_eq!(stored.runs[0].model.as_deref(), Some("test/example"));
         assert_eq!(stored.runs[0].cache, outcome.usage);
         let reopened = SessionStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.get(&key).unwrap().runs[0].model, outcome.model);
         assert_eq!(reopened.get(&key).unwrap().runs[0].cache, outcome.usage);
-    }
-
-    #[test]
-    fn legacy_model_metadata_is_ignored_on_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SessionStore::open(dir.path()).unwrap();
-        let session = store.begin(&job()).unwrap();
-        let mut legacy = serde_json::to_value(&session).unwrap();
-        legacy["runs"][0]["model"] = serde_json::json!("legacy-model");
-        let loaded: Session = serde_json::from_value(legacy).unwrap();
-        assert!(
-            serde_json::to_value(&loaded).unwrap()["runs"][0]
-                .get("model")
-                .is_none()
-        );
     }
 
     #[test]
