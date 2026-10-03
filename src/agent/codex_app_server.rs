@@ -163,7 +163,7 @@ impl CodexAppServerAgent {
             .expect("codex live mutex poisoned")
             .insert(map_key.clone(), Arc::clone(&live));
 
-        let result = self
+        let mut result = self
             .run_turn(&process, &live, &prompt, &key, context, started)
             .await;
 
@@ -172,6 +172,13 @@ impl CodexAppServerAgent {
             .expect("codex live mutex poisoned")
             .remove(&map_key);
         process.kill();
+        if let Ok(outcome) = &mut result {
+            outcome.model = context
+                .reported_model
+                .lock()
+                .expect("model mutex poisoned")
+                .clone();
+        }
         result
     }
 
@@ -357,6 +364,7 @@ impl CodexAppServerAgent {
                     if let Some(thread) = result["thread"]["id"].as_str() {
                         *live.thread_id.lock().expect("codex thread mutex poisoned") =
                             Some(thread.to_owned());
+                        report_model(context, &result);
                         return Ok(thread.to_owned());
                     }
                 }
@@ -382,6 +390,7 @@ impl CodexAppServerAgent {
             .as_str()
             .ok_or_else(|| wire::unsupported("codex", "thread/start returned no thread id"))?
             .to_owned();
+        report_model(context, &result);
         self.sessions.set("codex", key, &thread);
         *live.thread_id.lock().expect("codex thread mutex poisoned") = Some(thread.clone());
         Ok(thread)
@@ -461,6 +470,14 @@ impl CodexAppServerAgent {
     }
 }
 
+/// Observe the server's effective model without selecting or guessing one.
+fn report_model(context: &AgentContext, response: &Value) {
+    *context.reported_model.lock().expect("model mutex poisoned") = response["model"]
+        .as_str()
+        .filter(|model| !model.trim().is_empty())
+        .map(str::to_owned);
+}
+
 fn append_live(live_output: &Option<LiveOutput>, text: &str) {
     if let Some(live_output) = live_output {
         live_output.append(text.as_bytes());
@@ -527,8 +544,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_reports_a_nonempty_model_returned_by_the_server() {
+        let ctx = AgentContext {
+            model: Some("requested".into()),
+            ..Default::default()
+        };
+        for response in [json!({}), json!({"model": null}), json!({"model": "  "})] {
+            report_model(&ctx, &json!({"model": "previous"}));
+            report_model(&ctx, &response);
+            assert_eq!(*ctx.reported_model.lock().unwrap(), None);
+        }
+        report_model(&ctx, &json!({"model": "effective"}));
+        assert_eq!(
+            ctx.reported_model.lock().unwrap().as_deref(),
+            Some("effective")
+        );
+    }
+
     #[tokio::test]
-    async fn runs_a_turn_and_reports_text_and_usage() {
+    async fn runs_a_turn_and_reports_text_usage_and_model() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log.jsonl");
         let sessions = Arc::new(SessionStore::load(dir.path()));
@@ -536,9 +571,17 @@ mod tests {
         let ctx = context(dir.path());
         let outcome = agent.run(&request(), &ctx).await.unwrap();
         assert!(outcome.success, "{outcome:?}");
-        assert_eq!(outcome.model, None);
-        assert_eq!(*ctx.reported_model.lock().unwrap(), None);
+        assert_eq!(outcome.model.as_deref(), Some("codex-default"));
+        assert_eq!(
+            ctx.reported_model.lock().unwrap().as_deref(),
+            Some("codex-default")
+        );
         assert_eq!(outcome.summary, "CODEX-REPLY");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !logged.contains("\"model\":"),
+            "must preserve Codex defaults: {logged}"
+        );
         let usage = outcome.usage.expect("usage");
         assert_eq!(usage.prompt_tokens, 1_000);
         assert_eq!(usage.cached_tokens, 750);
@@ -591,7 +634,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(active, "codex turn should be active");
-        assert_eq!(*ctx.reported_model.lock().unwrap(), None);
+        assert_eq!(
+            ctx.reported_model.lock().unwrap().as_deref(),
+            Some("codex-default")
+        );
         assert!(!run.is_finished());
 
         let receipt = agent
@@ -609,7 +655,7 @@ mod tests {
 
         let outcome = run.await.unwrap().unwrap();
         assert!(outcome.success, "{outcome:?}");
-        assert_eq!(outcome.model, None);
+        assert_eq!(outcome.model.as_deref(), Some("codex-default"));
         assert!(
             outcome.summary.contains("also run the linter"),
             "{outcome:?}"
@@ -619,25 +665,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resumes_a_thread_and_passes_the_model_without_reporting_it() {
+    async fn resumes_a_thread_and_reports_the_effective_model() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log.jsonl");
         let sessions = Arc::new(SessionStore::load(dir.path()));
-        let agent = agent(base_config(&log), Arc::clone(&sessions));
+        let mut config = base_config(&log);
+        config
+            .env
+            .insert("FAKE_CODEX_RESUME_MODEL".into(), "resolved-resume".into());
+        let agent = agent(config, Arc::clone(&sessions));
         let mut ctx = context(dir.path());
         ctx.model = Some("gpt-fast".into());
 
-        for _ in 0..2 {
+        for expected in ["gpt-fast", "resolved-resume"] {
             let outcome = agent.run(&request(), &ctx).await.unwrap();
             assert!(outcome.success);
-            assert_eq!(outcome.model, None);
-            assert_eq!(*ctx.reported_model.lock().unwrap(), None);
+            assert_eq!(outcome.model.as_deref(), Some(expected));
+            assert_eq!(
+                ctx.reported_model.lock().unwrap().as_deref(),
+                Some(expected)
+            );
         }
 
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(logged.contains("thread/start"), "{logged}");
         assert!(logged.contains("thread/resume"), "{logged}");
         assert!(logged.contains("gpt-fast"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn missing_server_model_remains_unknown_on_start_and_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir.path().join("log.jsonl"));
+        config
+            .env
+            .insert("FAKE_CODEX_OMIT_MODEL".into(), "1".into());
+        let agent = agent(config, Arc::new(SessionStore::load(dir.path())));
+        let mut ctx = context(dir.path());
+        ctx.model = Some("requested".into());
+        for _ in 0..2 {
+            *ctx.reported_model.lock().unwrap() = Some("stale".into());
+            let outcome = agent.run(&request(), &ctx).await.unwrap();
+            assert!(outcome.success);
+            assert_eq!(outcome.model, None);
+            assert_eq!(*ctx.reported_model.lock().unwrap(), None);
+        }
     }
 
     #[tokio::test]
@@ -650,6 +722,7 @@ mod tests {
         let agent = agent(config, Arc::new(SessionStore::load(dir.path())));
         let outcome = agent.run(&request(), &context(dir.path())).await.unwrap();
         assert!(!outcome.success);
+        assert_eq!(outcome.model.as_deref(), Some("codex-default"));
         assert!(outcome.summary.contains("failed"), "{outcome:?}");
         assert!(outcome.summary.contains("refused"), "{outcome:?}");
     }

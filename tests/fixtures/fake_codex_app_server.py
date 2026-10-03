@@ -8,6 +8,8 @@ Notifications carry ``method``/``params`` with no ``id``.
 Environment:
 
 * ``FAKE_CODEX_LOG`` writes every request line as JSON.
+* ``FAKE_CODEX_OMIT_MODEL=1`` omits model metadata from thread responses.
+* ``FAKE_CODEX_RESUME_MODEL`` overrides the model reported on resume.
 * ``FAKE_CODEX_WAIT_FOR_STEER=1`` holds the turn open after its first delta
   until a ``turn/steer`` arrives.
 * ``FAKE_CODEX_STEER_LOG`` records steer text.
@@ -49,6 +51,16 @@ def send(message):
 
 def respond(request_id, result):
     send({"id": request_id, "result": result})
+
+
+def respond_thread(request_id, params, resume=False):
+    result = {"thread": {"id": "thread-1"}}
+    if os.environ.get("FAKE_CODEX_OMIT_MODEL") != "1":
+        model = params.get("model", "codex-default")
+        if resume:
+            model = os.environ.get("FAKE_CODEX_RESUME_MODEL", model)
+        result["model"] = model
+    respond(request_id, result)
 
 
 def finish_turn(turn_status=None):
@@ -100,10 +112,10 @@ for line in sys.stdin:
         respond(request_id, {"codexHome": "/tmp/codex", "platformFamily": "unix",
                              "platformOs": "linux", "userAgent": "fake"})
     elif method == "thread/start":
-        respond(request_id, {"thread": {"id": "thread-1"}, "model": params.get("model", "codex-default")})
+        respond_thread(request_id, params)
     elif method == "thread/resume":
         if params.get("threadId") == "thread-1":
-            respond(request_id, {"thread": {"id": "thread-1"}, "model": params.get("model", "codex-default")})
+            respond_thread(request_id, params, resume=True)
         else:
             send({"id": request_id, "error": {"code": -32600, "message": "unknown thread"}})
     elif method == "turn/start":

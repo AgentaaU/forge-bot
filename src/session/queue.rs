@@ -1004,6 +1004,19 @@ impl Inner {
             let _running =
                 RunningGuard::enter(&self.running, key.clone(), agent.clone(), context.clone());
 
+            // An RPC error can arrive after the adapter has resolved its model.
+            // Keep that metadata on this candidate's failure; the next candidate
+            // starts with reported_model cleared above.
+            let agent_failure = |error: &BotError| {
+                let mut outcome = permission_aware_failure(&job, error);
+                outcome.model = context
+                    .reported_model
+                    .lock()
+                    .expect("model mutex poisoned")
+                    .clone();
+                outcome
+            };
+
             let outcome = match agent.run(&request, &context).await {
                 Ok(outcome) => outcome,
                 Err(error) if error.is_agent_unavailable() => {
@@ -1017,11 +1030,11 @@ impl Inner {
                     );
                     unavailable_hits += 1;
                     tracing::warn!(job = %job.id, agent = %name, %error, "agent cannot be started");
-                    last_outcome = Some(permission_aware_failure(&job, &error));
+                    last_outcome = Some(agent_failure(&error));
                     previous_reason = Some(UnavailableReason::StartFailed);
                     continue;
                 }
-                Err(error) => permission_aware_failure(&job, &error),
+                Err(error) => agent_failure(&error),
             };
 
             // A successful run clears any earlier capacity/start-failure
@@ -2957,6 +2970,106 @@ mod tests {
                     .trim()
                     .is_empty()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_turn_start_error_preserves_model_without_leaking_to_fallback() {
+        struct FakeCodex(crate::agent::codex_app_server::CodexAppServerAgent);
+
+        #[async_trait::async_trait]
+        impl crate::agent::Agent for FakeCodex {
+            fn name(&self) -> &str {
+                "codex"
+            }
+
+            async fn run(
+                &self,
+                request: &AgentRequest,
+                context: &AgentContext,
+            ) -> Result<AgentOutcome> {
+                self.0.run(request, context).await
+            }
+        }
+
+        for fallback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(dir.path());
+            config.policy.allow_all = true;
+            config.capacity.fallback = fallback;
+            config.agent_sequence = vec!["codex".into(), "secondary".into()];
+            config.agents.overrides.insert(
+                "secondary".into(),
+                crate::config::AgentConfig {
+                    command: Some("sh".into()),
+                    args: Some(vec!["-c".into(), "echo fallback-reply".into()]),
+                    ..Default::default()
+                },
+            );
+            let config = Arc::new(config);
+            let mut registry = AgentRegistry::from_config(&config);
+            let adapter_config = crate::config::AgentConfig {
+                command: Some(
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/fake_codex_app_server.py"
+                    )
+                    .into(),
+                ),
+                env: [("FAKE_CODEX_FAIL_TURN".into(), "1".into())].into(),
+                ..Default::default()
+            };
+            let adapter = crate::agent::codex_app_server::CodexAppServerAgent::new(
+                &adapter_config,
+                Arc::new(crate::agent::session::SessionStore::load(dir.path())),
+            );
+            registry.insert_for_test("codex", Arc::new(FakeCodex(adapter)));
+            let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+            let dispatcher = Dispatcher::new(
+                config.clone(),
+                Arc::new(registry),
+                sessions.clone(),
+                Arc::new(NoopForgeApi),
+                Policy::new(&config.policy),
+            )
+            .unwrap();
+            dispatcher
+                .submit(
+                    message("o/r"),
+                    Mention {
+                        agent: Some("codex".into()),
+                        message: "go".into(),
+                    },
+                    "codex",
+                )
+                .await
+                .unwrap();
+            wait_for_drain(&sessions).await;
+
+            let reopened = SessionStore::open(dir.path()).unwrap();
+            let session = reopened
+                .get(&SessionStore::key(&message("o/r"), Some("default")))
+                .unwrap();
+            let run = session.runs.last().unwrap();
+            if fallback {
+                assert_eq!(run.agent, "secondary");
+                assert_eq!(run.success, Some(true));
+                assert!(run.summary.as_deref().unwrap().contains("fallback-reply"));
+                assert_eq!(
+                    run.model, None,
+                    "Codex metadata must not leak to the fallback"
+                );
+            } else {
+                assert_eq!(run.agent, "codex");
+                assert_eq!(run.success, Some(false));
+                assert!(
+                    run.summary
+                        .as_deref()
+                        .unwrap()
+                        .contains("turn start failed")
+                );
+                assert_eq!(run.model.as_deref(), Some("codex-default"));
+            }
         }
     }
 
