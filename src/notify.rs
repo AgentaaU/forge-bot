@@ -34,13 +34,13 @@ use crate::forge::ForgeMessage;
 /// The `/notifications` page script, kept in its own file so it can be
 /// exercised directly and so it does not need brace-escaping inside the HTML
 /// template.
-const PAGE_SCRIPT: &str = include_str!("notifications.js");
+const PAGE_SCRIPT: &str = include_str!("../web/notifications.js");
 
 /// PNG used as the notification's large icon (and the web app/manifest icon).
-const NOTIFICATION_ICON: &[u8] = include_bytes!("../resource/notifications-icon.png");
+const NOTIFICATION_ICON: &[u8] = include_bytes!("../web/notifications-icon.png");
 
 /// Monochrome PNG used as the Android notification badge (status-bar icon).
-const NOTIFICATION_BADGE: &[u8] = include_bytes!("../resource/notifications-badge.png");
+const NOTIFICATION_BADGE: &[u8] = include_bytes!("../web/notifications-badge.png");
 
 /// One pending human notification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -271,7 +271,9 @@ pub fn render_html(humans: &[String], ca_cert: bool) -> String {
     for (index, login) in humans.iter().enumerate() {
         let selected = if index == 0 { " selected" } else { "" };
         options.push_str(&format!(
-            "<option value=\"{login}\"{selected}>{login}</option>",
+            include_str!("../web/notification-option.html"),
+            login = login,
+            selected = selected,
         ));
     }
     let empty_hint = if humans.is_empty() {
@@ -281,64 +283,17 @@ pub fn render_html(humans: &[String], ca_cert: bool) -> String {
         ""
     };
     let ca_cert_button = if ca_cert {
-        r#"<a class="button" href="/notifications/ca.crt" download="forge-bot-ca.crt">Download CA certificate</a>"#
+        include_str!("../web/notification-ca.html")
     } else {
         ""
     };
 
     format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="manifest" href="/notifications.webmanifest">
-<link rel="icon" type="image/png" href="/notifications/icon.png">
-<link rel="apple-touch-icon" href="/notifications/icon.png">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="forge-bot">
-<title>forge-bot notifications</title>
-<style>
-body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 48rem; padding: 0 1rem; }}
-.row {{ display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }}
-select, button, .button {{ font: inherit; padding: .4rem .6rem; }}
-.button {{ border: 1px solid #767676; border-radius: 2px; background: #efefef; color: #000; text-decoration: none; }}
-#log {{ list-style: none; padding: 0; }}
-#log li {{ border: 1px solid #ddd; border-radius: .4rem; margin: .5rem 0; padding: .6rem; }}
-#log a {{ font-weight: 600; }}
-#diagnostics {{ background: #f6f8fa; border: 1px solid #ddd; border-radius: .4rem; padding: .6rem; white-space: pre-wrap; word-break: break-word; display: none; }}
-small {{ color: #666; }}
-</style>
-</head>
-<body>
-<h1>forge-bot notifications</h1>
-<p>Pick your human account and enable browser notifications. Web push can deliver even when this page is closed; polling requires keeping it open.
-Desktop browsers use the page directly. Mobile browsers require HTTPS and a
-service worker; on iOS 16.4+ add this page to the Home Screen first, then grant
-notification permission. Use <em>Send test notification</em> to confirm the
-browser can raise them, or <em>Run diagnostics</em> to upload the browser/OS
-state for debugging.</p>
-<p id="hint"><em>{empty_hint}</em></p>
-<div class="row">
-<label>Human <select id="recipient">{options}</select></label>
-<button id="enable">Enable notifications</button>
-<button id="disable-push">Disable web push</button>
-<button id="test">Send test notification</button>
-<button id="diagnostics-button">Run diagnostics</button>
-<button id="refresh">Refresh</button>
-{ca_cert_button}
-</div>
-<p><small id="status"></small></p>
-<pre id="diagnostics"></pre>
-<ul id="log"></ul>
-<script>
-{PAGE_SCRIPT}
-</script>
-</body>
-</html>
-"#,
+        include_str!("../web/notifications.html"),
+        PAGE_SCRIPT = PAGE_SCRIPT,
+        ca_cert_button = ca_cert_button,
+        empty_hint = empty_hint,
+        options = options,
     )
 }
 
@@ -346,7 +301,7 @@ state for debugging.</p>
 ///
 /// Handles background pushes and opens the forge location on notification clicks.
 pub fn service_worker_js() -> &'static str {
-    include_str!("notifications-sw.js")
+    include_str!("../web/notifications-sw.js")
 }
 
 /// Web app manifest so "Add to Home Screen" installs a notification-capable
@@ -357,20 +312,7 @@ pub fn service_worker_js() -> &'static str {
 /// `apple-mobile-web-app-capable` meta tag); otherwise the saved item reopens
 /// in the default browser, where these notifications are unavailable.
 pub fn manifest_json() -> &'static str {
-    r##"{
-  "name": "forge-bot notifications",
-  "short_name": "forge-bot",
-  "description": "Browser notifications for forge-bot human requests.",
-  "start_url": "/notifications",
-  "scope": "/",
-  "display": "standalone",
-  "background_color": "#ffffff",
-  "theme_color": "#ffffff",
-  "icons": [
-    {"src": "/notifications/icon.png", "sizes": "192x192", "type": "image/png"}
-  ]
-}
-"##
+    include_str!("../web/notifications.webmanifest")
 }
 
 /// The PNG used as the notification's large icon and the web app icon.

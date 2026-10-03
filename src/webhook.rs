@@ -131,39 +131,12 @@ async fn admin_page(State(state): State<AppState>) -> Html<String> {
         };
         let name = status::escape_html(&name);
         rows.push_str(&format!(
-            "<tr><td>{name}</td><td>{availability}</td><td><button data-agent=\"{name}\">Reset cooldown</button></td></tr>"
+            include_str!("../web/admin-row.html"),
+            availability = availability,
+            name = name
         ));
     }
-    Html(format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>forge-bot admin</title><style>
-body {{ font: 16px system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }}
-table {{ width: 100%; border-collapse: collapse; }} th, td {{ text-align: left; padding: .8rem; border-bottom: 1px solid #ccc; }}
-button {{ padding: .5rem .8rem; cursor: pointer; }}
-</style></head><body><nav><a href="/status">Status</a> · <a href="/notifications">Notifications</a></nav>
-<h1>Agent administration</h1><p>Reset a cooldown to make an agent eligible for automatic selection immediately. This does not cancel running jobs.</p>
-<table><thead><tr><th>Agent</th><th>Availability</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table>
-<p id="result" role="status" aria-live="polite"></p><p><a href="/admin">Refresh availability</a></p>
-<script>
-document.querySelectorAll('button[data-agent]').forEach(button => {{
-    button.addEventListener('click', async () => {{
-        button.disabled = true;
-        const result = document.getElementById('result');
-        try {{
-            const response = await fetch('/admin/reset-cooldown', {{
-                method: 'POST', headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify({{agent: button.dataset.agent}})
-            }});
-            if (!response.ok) throw new Error('Reset failed (' + response.status + ')');
-            button.closest('tr').children[1].textContent = 'Available';
-            result.textContent = 'Cooldown reset for ' + button.dataset.agent + '.';
-        }} catch (error) {{ result.textContent = error.message; }}
-        finally {{ button.disabled = false; }}
-    }});
-}});
-</script></body></html>"#
-    ))
+    Html(format!(include_str!("../web/admin.html"), rows = rows))
 }
 
 #[derive(serde::Deserialize)]

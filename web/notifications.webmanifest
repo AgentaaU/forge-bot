@@ -1,0 +1,13 @@
+{
+  "name": "forge-bot notifications",
+  "short_name": "forge-bot",
+  "description": "Browser notifications for forge-bot human requests.",
+  "start_url": "/notifications",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [
+    {"src": "/notifications/icon.png", "sizes": "192x192", "type": "image/png"}
+  ]
+}

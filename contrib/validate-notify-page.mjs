@@ -2,7 +2,7 @@
 // Dynamic regression for the emitted /notifications page script.
 //
 // The page is plain JavaScript with no build step, so this harness runs the
-// real `src/notifications.js` against a deterministic browser-API stub. It
+// real `web/notifications.js` against a deterministic browser-API stub. It
 // covers the regressions that are hard to catch with static assertions:
 //
 //   1. Delayed activation: the registration resolves while the worker is still
@@ -26,7 +26,7 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const source = readFileSync(join(root, 'src', 'notifications.js'), 'utf8');
+const source = readFileSync(join(root, 'web', 'notifications.js'), 'utf8');
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -55,7 +55,7 @@ function workerHarness(registration, records = new Map()) {
     addEventListener(type, handler) { handlers[type] = handler; },
     skipWaiting() {}, clients: { async claim() {}, async openWindow() {} },
   };
-  vm.runInNewContext(readFileSync(join(root, 'src', 'notifications-sw.js'), 'utf8'), { self, URL, Response });
+  vm.runInNewContext(readFileSync(join(root, 'web', 'notifications-sw.js'), 'utf8'), { self, URL, Response });
   return {
     handlers, records,
     message(data, ports) {
@@ -643,7 +643,7 @@ for (const failure of ['queue overflow', 'network/provider failure', '404/410 cl
     registration: { showNotification: async (title, options) => { shown.push({ title, options }); } },
     clients: { claim: async () => {}, openWindow: async (url) => { opened.push(url); } },
   };
-  vm.runInNewContext(readFileSync(join(root, 'src', 'notifications-sw.js'), 'utf8'), { self: worker, URL });
+  vm.runInNewContext(readFileSync(join(root, 'web', 'notifications-sw.js'), 'utf8'), { self: worker, URL });
   let pending;
   const entry = notification(7, 'alice', 'background message');
   handlers.push({ data: { json: () => entry }, waitUntil: (value) => { pending = value; } });

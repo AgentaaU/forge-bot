@@ -347,7 +347,8 @@ pub fn render_html(threads: &[ThreadStatus], query: Option<&str>) -> String {
             None => "No threads yet.".to_owned(),
         };
         rows.push_str(&format!(
-            "<tr><td colspan=\"9\" class=\"empty\">{message}</td></tr>"
+            include_str!("../../web/status-empty.html"),
+            message = message
         ));
     }
     for thread in &matched {
@@ -368,57 +369,13 @@ pub fn render_html(threads: &[ThreadStatus], query: Option<&str>) -> String {
     };
     let search_value = escape_html(query.unwrap_or_default());
     let clear = if query.is_some() {
-        "<a class=\"clear\" href=\"/status\">clear</a>"
+        include_str!("../../web/status-clear.html")
     } else {
         ""
     };
 
     format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="15">
-<title>forge-bot — thread status</title>
-<style>
-:root {{ color-scheme: light dark; }}
-body {{ font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 2rem; }}
-h1 {{ font-size: 1.35rem; margin: 0 0 .75rem; }}
-p.sub {{ color: #888; margin: 0 0 1.25rem; }}
-form.search {{ display: flex; gap: .5rem; align-items: center; margin: 0 0 1rem; }}
-form.search input {{ flex: 1; max-width: 34rem; padding: .4rem .55rem; font: inherit; color: inherit; background: transparent; border: 1px solid #8886; border-radius: .35rem; }}
-form.search button {{ padding: .4rem .75rem; font: inherit; color: inherit; background: #8881; border: 1px solid #8886; border-radius: .35rem; cursor: pointer; }}
-form.search a.clear {{ color: #888; }}
-table {{ border-collapse: collapse; width: 100%; font-size: .92rem; }}
-th, td {{ text-align: left; padding: .5rem .65rem; border-bottom: 1px solid #8883; vertical-align: top; }}
-th {{ font-weight: 600; }}
-td.repo {{ color: #888; font-size: .85rem; }}
-tr.empty td {{ text-align: center; color: #888; padding: 2rem; }}
-a {{ color: inherit; }}
-.state {{ display: inline-block; border-radius: 999px; padding: .12rem .55rem; font-size: .78rem; font-weight: 600; }}
-.state.running {{ background: #2f9e44; color: #fff; }}
-.state.queued {{ background: #f08c00; color: #fff; }}
-.state.idle {{ background: #868e9633; }}
-</style>
-</head>
-<body>
-<h1>forge-bot — thread status</h1>
-<form class="search" method="get" action="/status">
-<input type="search" name="q" value="{query}" placeholder="owner/repo/pulls/123#issuecomment-456" aria-label="Search by comment URL">
-<button type="submit">Search</button>
-{clear}
-</form>
-<p class="sub">{summary} Refreshes every 15s.</p>
-<table>
-<thead><tr><th>State</th><th>Thread</th><th>Agent</th><th>Model</th><th>Cache</th><th>Queued</th><th>Runs</th><th>Updated</th><th>Last result</th><th>Details</th></tr></thead>
-<tbody>
-{rows}
-</tbody>
-</table>
-</body>
-</html>
-"#,
+        include_str!("../../web/status.html"),
         query = search_value,
         summary = summary,
         clear = clear,
@@ -457,7 +414,7 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
     );
     let number = thread.number.map(|n| format!(" #{n}")).unwrap_or_default();
     let thread_cell = format!(
-        "<a href=\"{location}\">{repository}{number}</a><div class=\"repo\">{kind}</div>",
+        include_str!("../../web/status-thread.html"),
         location = escape_html(&thread.location),
         repository = escape_html(&thread.repository),
         number = escape_html(&number),
@@ -467,7 +424,7 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
     let agent = if thread.state == ThreadState::Running {
         match thread.running_since {
             Some(since) => format!(
-                "{}<div class=\"repo\">for {}</div>",
+                include_str!("../../web/status-running-agent.html"),
                 escape_html(&thread.agent),
                 escape_html(&humanize_age(now, since))
             ),
@@ -496,16 +453,11 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
     };
 
     format!(
-        "<tr><td><span class=\"state {state}\">{label}</span></td>\
-<td>{thread_cell}</td>\
-<td>{agent}</td>\
-<td>{model}</td>\
-<td>{cache}</td>\
-<td>{queued}</td>\
-<td>{runs}</td>\
-<td>{updated}</td>\
-<td>{last}</td>\
-<td><a href=\"{details_url}\">View</a></td></tr>\n",
+        include_str!("../../web/status-row.html"),
+        agent = agent,
+        details_url = details_url,
+        last = last,
+        thread_cell = thread_cell,
         state = thread.state.label(),
         label = thread.state.label(),
         model = thread
@@ -550,10 +502,8 @@ pub fn render_details(
                 .map(|time| time.to_rfc3339())
                 .unwrap_or_else(|| "In progress".to_owned());
             runs.push_str(&format!(
-                "<section><h2>Run {number}: {agent} · {result}</h2>\
-<p>Started: <time>{started}</time> · Finished: <time>{finished}</time> · {cache}</p>\
-<h3>Request</h3><pre>{message}</pre>\
-<h3>Result</h3><pre>{summary}</pre></section>",
+                include_str!("../../web/details-run.html"),
+                result = result,
                 number = index + 1,
                 agent = escape_html(&run.agent),
                 started = escape_html(&run.started_at.to_rfc3339()),
@@ -567,32 +517,24 @@ pub fn render_details(
                     .filter(|output| !output.is_empty())
                     .unwrap_or("Waiting for agent output.");
                 runs.push_str(&format!(
-                    "<h3>Live output</h3><pre>{}</pre>",
+                    include_str!("../../web/details-live.html"),
                     escape_html(output)
                 ));
             }
         }
     }
     if runs.is_empty() {
-        runs.push_str("<p>No runs yet.</p>");
+        runs.push_str(include_str!("../../web/details-empty.html"));
     }
     let refresh = if thread.state == ThreadState::Running {
-        "<meta http-equiv=\"refresh\" content=\"2\">"
+        include_str!("../../web/details-refresh.html")
     } else {
         ""
     };
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-{refresh}<title>{title} — session details</title><style>\
-:root {{ color-scheme: light dark; }}\
-body {{ font-family: system-ui, sans-serif; max-width: 70rem; margin: 2rem auto; padding: 0 1rem; }}\
-section {{ border-top: 1px solid #8885; margin-top: 1.5rem; }}\
-pre {{ white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; background: #8882; border-radius: .4rem; }}\
-a {{ color: inherit; }}</style></head><body>\
-<p><a href=\"/status\">← Status</a></p><h1>{title}</h1>\
-<p><a href=\"{location}\">Open thread</a> · {state} · {count} run(s)</p>\
-{runs}</body></html>",
+        include_str!("../../web/details.html"),
+        refresh = refresh,
+        runs = runs,
         title = escape_html(&title),
         location = escape_html(&thread.location),
         state = thread.state.label(),
