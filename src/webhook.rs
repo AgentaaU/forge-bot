@@ -70,6 +70,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
+        .route("/admin", get(admin_page))
+        .route("/admin/reset-cooldown", post(reset_cooldown))
         .route("/status", get(status_page))
         .route("/status/details", get(status_details))
         .route("/status.json", get(status_json))
@@ -105,8 +107,81 @@ async fn root(State(state): State<AppState>) -> impl IntoResponse {
         "agents": state.agents.names(),
         "mention": state.config.trigger(),
         "status": "/status",
+        "admin": "/admin",
         "notifications": "/notifications",
     }))
+}
+
+/// Operator controls use the same registry as dispatch and fallback selection.
+async fn admin_page(State(state): State<AppState>) -> Html<String> {
+    let mut rows = String::new();
+    for name in state.agents.names() {
+        let cooldown = state.agents.cooldown_remaining(&name);
+        let availability = match cooldown {
+            Some(remaining) => format!(
+                "{} ({} seconds remaining)",
+                state
+                    .agents
+                    .unavailable_reason(&name)
+                    .map(|reason| reason.label())
+                    .unwrap_or("unavailable"),
+                remaining.as_secs().saturating_add(1),
+            ),
+            None => "Available".to_owned(),
+        };
+        let name = status::escape_html(&name);
+        rows.push_str(&format!(
+            "<tr><td>{name}</td><td>{availability}</td><td><button data-agent=\"{name}\">Reset cooldown</button></td></tr>"
+        ));
+    }
+    Html(format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>forge-bot admin</title><style>
+body {{ font: 16px system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }}
+table {{ width: 100%; border-collapse: collapse; }} th, td {{ text-align: left; padding: .8rem; border-bottom: 1px solid #ccc; }}
+button {{ padding: .5rem .8rem; cursor: pointer; }}
+</style></head><body><nav><a href="/status">Status</a> · <a href="/notifications">Notifications</a></nav>
+<h1>Agent administration</h1><p>Reset a cooldown to make an agent eligible for automatic selection immediately. This does not cancel running jobs.</p>
+<table><thead><tr><th>Agent</th><th>Availability</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table>
+<p id="result" role="status" aria-live="polite"></p><p><a href="/admin">Refresh availability</a></p>
+<script>
+document.querySelectorAll('button[data-agent]').forEach(button => {{
+    button.addEventListener('click', async () => {{
+        button.disabled = true;
+        const result = document.getElementById('result');
+        try {{
+            const response = await fetch('/admin/reset-cooldown', {{
+                method: 'POST', headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{agent: button.dataset.agent}})
+            }});
+            if (!response.ok) throw new Error('Reset failed (' + response.status + ')');
+            button.closest('tr').children[1].textContent = 'Available';
+            result.textContent = 'Cooldown reset for ' + button.dataset.agent + '.';
+        }} catch (error) {{ result.textContent = error.message; }}
+        finally {{ button.disabled = false; }}
+    }});
+}});
+</script></body></html>"#
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct ResetCooldown {
+    agent: String,
+}
+
+// Requiring JSON keeps cross-origin HTML forms from changing cooldown state.
+async fn reset_cooldown(
+    State(state): State<AppState>,
+    Json(request): Json<ResetCooldown>,
+) -> Response {
+    if state.agents.get(&request.agent).is_err() {
+        return (StatusCode::NOT_FOUND, "unknown agent\n").into_response();
+    }
+    state.agents.mark_available(&request.agent);
+    tracing::info!(agent = %request.agent, "agent cooldown reset by admin");
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Human-readable status page for every thread the bot knows about.

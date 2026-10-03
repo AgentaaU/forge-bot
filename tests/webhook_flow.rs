@@ -4,6 +4,7 @@
 //! mention extraction → policy → dispatcher → agent.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -42,6 +43,7 @@ const PAYLOAD: &str = r#"{
 struct Harness {
     app: axum::Router,
     sessions: Arc<SessionStore>,
+    agents: Arc<AgentRegistry>,
 }
 
 #[allow(clippy::field_reassign_with_default)]
@@ -118,11 +120,13 @@ fn harness_with(dir: &std::path::Path, configure: impl FnOnce(&mut Config)) -> H
     )
     .unwrap();
 
-    let state = forge_bot::webhook::AppState::new(config.clone(), adapters, agents, dispatcher);
+    let state =
+        forge_bot::webhook::AppState::new(config.clone(), adapters, agents.clone(), dispatcher);
 
     Harness {
         app: forge_bot::webhook::router(state),
         sessions,
+        agents,
     }
 }
 
@@ -2081,4 +2085,74 @@ async fn push_api_falls_back_when_not_configured() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn admin_resets_only_the_selected_agent_cooldown() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(dir.path());
+    h.agents
+        .mark_unavailable("custom", Duration::from_secs(3600));
+    h.agents
+        .mark_unavailable("codex", Duration::from_secs(3600));
+    let response = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = std::str::from_utf8(&body).unwrap();
+    assert!(html.contains("Reset cooldown"));
+    assert!(html.contains("capacity limit"));
+    assert!(!h.agents.is_available("custom"));
+
+    for (agent, expected) in [
+        ("missing", StatusCode::NOT_FOUND),
+        ("custom", StatusCode::NO_CONTENT),
+        ("custom", StatusCode::NO_CONTENT),
+    ] {
+        let response = h
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/reset-cooldown")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"agent": agent}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert!(h.agents.is_available("custom"));
+    assert_eq!(h.agents.cooldown_remaining("custom"), None);
+    assert!(!h.agents.is_available("codex"));
+
+    for method in ["GET", "POST"] {
+        let response = h
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/admin/reset-cooldown")
+                    .body(Body::from("agent=codex"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+        assert!(!h.agents.is_available("codex"));
+    }
 }

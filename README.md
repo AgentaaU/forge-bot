@@ -346,6 +346,16 @@ Quick repository hook: **Settings → Webhooks → Add webhook → Forgejo**, ta
 The endpoint also accepts GitHub (`/webhooks/github`) and GitLab
 (`/webhooks/gitlab`) webhooks, selected by URL path.
 
+## Admin page
+
+`GET /admin` lists registered agents and their remaining cooldowns. Click
+**Reset cooldown** to make that agent eligible for automatic selection again
+immediately, without restarting the bot. Other agents and running jobs are
+unaffected. The page uses `POST /admin/reset-cooldown` with a JSON body such as
+`{"agent":"codex"}`; unknown agents return 404. Cooldowns are held in memory.
+Protect `/admin` and `/admin/reset-cooldown` with reverse proxy authentication,
+as with the other non-webhook routes, or keep the server on a trusted network.
+
 ## Status page
 
 While the server is running, `GET /status` renders a self-refreshing HTML page
