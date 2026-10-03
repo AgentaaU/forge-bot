@@ -975,6 +975,10 @@ impl Inner {
                 }
             };
 
+            if let Err(error) = self.sessions.set_running_agent(&key, job.id, name) {
+                tracing::warn!(%error, "failed to persist running agent");
+            }
+
             // A start failure has no provider response to inspect.
             let fallback_cooldown = Duration::from_secs(self.config.capacity.cooldown_secs.max(1));
 
@@ -3802,6 +3806,63 @@ echo "end:$token" >> "$AGENT_LOG"
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_names_fallback_agent_while_it_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, log, release) = gated_config(dir.path(), 1);
+        config.agents.overrides.insert(
+            "capacity-agent".into(),
+            capacity_config(dir.path()).agents.overrides["capacity-agent"].clone(),
+        );
+        config.agent_sequence = vec!["capacity-agent".into(), "gate".into()];
+        let config = Arc::new(config);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            isolated_registry(&config, &["capacity-agent", "gate"]),
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+        dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    agent: Some("capacity-agent".into()),
+                    message: "TOKEN_A".into(),
+                },
+                "capacity-agent",
+            )
+            .await
+            .unwrap();
+        wait_for_log(&log, "start:TOKEN_A").await;
+
+        let snapshot =
+            super::super::status::snapshot(sessions.list(), sessions.pending_jobs().unwrap());
+        let path = std::fs::read_dir(dir.path().join("sessions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let persisted: super::super::store::Session =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        // Release the process before asserting, including on test failure.
+        release_token(&release, "TOKEN_A");
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot[0].state,
+            super::super::status::ThreadState::Running
+        );
+        assert_eq!(snapshot[0].agent, "gate");
+        assert_eq!(snapshot[0].runs, 1);
+        assert_eq!(snapshot[0].queued, 0);
+        assert_eq!(persisted.agent, "gate");
+        assert_eq!(persisted.runs[0].agent, "gate");
+        wait_for_drain(&sessions).await;
     }
 
     /// Comments on different issues must not be serialized behind each other

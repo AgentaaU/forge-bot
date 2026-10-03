@@ -195,6 +195,27 @@ impl SessionStore {
         Ok(session.clone())
     }
 
+    /// Persist the adapter about to run, including a fallback, so status
+    /// snapshots identify it while the job is still in flight.
+    pub fn set_running_agent(&self, key: &str, job_id: Uuid, agent: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("session mutex poisoned");
+        let Some(session) = sessions.get_mut(key) else {
+            return Ok(());
+        };
+        let Some(run) = session
+            .runs
+            .iter_mut()
+            .rev()
+            .find(|run| run.job_id == job_id && run.finished_at.is_none())
+        else {
+            return Ok(());
+        };
+        run.agent = agent.to_owned();
+        session.agent = agent.to_owned();
+        session.updated_at = Utc::now();
+        self.persist_locked(session)
+    }
+
     /// Record the outcome of a run. `agent` is the adapter that actually ran,
     /// which may differ from the requested one when the dispatcher fell back
     /// after a capacity error.
