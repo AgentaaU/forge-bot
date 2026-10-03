@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use crate::agent::command::CommandAgent;
 use crate::agent::pi_rpc::PiPoolAgent;
@@ -53,8 +53,8 @@ impl std::fmt::Display for UnavailableReason {
 /// A cooldown window together with the reason it was recorded.
 #[derive(Debug, Clone)]
 struct Unavailable {
-    /// Instant at which the agent may be tried again.
-    until: Instant,
+    /// Wall-clock deadline, so provider cooldowns expire during system suspend.
+    until: SystemTime,
     /// Why the agent is out of rotation.
     reason: UnavailableReason,
 }
@@ -284,7 +284,7 @@ impl AgentRegistry {
         cooldown: Duration,
         reason: UnavailableReason,
     ) {
-        let until = Instant::now() + cooldown;
+        let until = SystemTime::now() + cooldown;
         self.unavailable
             .lock()
             .expect("agent availability mutex poisoned")
@@ -313,7 +313,7 @@ impl AgentRegistry {
 
     /// Whether an agent may currently be used. Expired entries are forgotten.
     pub fn is_available(&self, name: &str) -> bool {
-        let now = Instant::now();
+        let now = SystemTime::now();
         let mut unavailable = self
             .unavailable
             .lock()
@@ -333,13 +333,18 @@ impl AgentRegistry {
     /// Expired entries are forgotten, matching [`Self::is_available`]. Useful
     /// for assertions and for reporting the cooldown an agent was marked with.
     pub fn cooldown_remaining(&self, name: &str) -> Option<Duration> {
-        let now = Instant::now();
+        let now = SystemTime::now();
         let mut unavailable = self
             .unavailable
             .lock()
             .expect("agent availability mutex poisoned");
         match unavailable.get(name) {
-            Some(entry) if entry.until > now => Some(entry.until - now),
+            Some(entry) if entry.until > now => Some(
+                entry
+                    .until
+                    .duration_since(now)
+                    .expect("deadline is in the future"),
+            ),
             Some(_) => {
                 unavailable.remove(name);
                 None
@@ -351,7 +356,7 @@ impl AgentRegistry {
     /// The reason `name` is currently unavailable, if it is. Expired entries
     /// are forgotten, matching [`Self::is_available`].
     pub fn unavailable_reason(&self, name: &str) -> Option<UnavailableReason> {
-        let now = Instant::now();
+        let now = SystemTime::now();
         let mut unavailable = self
             .unavailable
             .lock()
@@ -539,6 +544,30 @@ mod tests {
         registry.mark_unavailable("codex", Duration::from_secs(60));
         registry.mark_available("codex");
         assert!(registry.is_available("codex"));
+    }
+
+    #[test]
+    fn cooldown_expires_after_wall_clock_passes_during_suspend() {
+        let registry = AgentRegistry::from_config(&Config::default());
+        // Simulate a two-hour provider cooldown followed by an overnight
+        // suspend. No process/monotonic time needs to pass for it to expire.
+        let marked_at = SystemTime::now() - Duration::from_secs(13 * 60 * 60);
+        let deadline = marked_at + Duration::from_secs(2 * 60 * 60);
+        for query in 0..3 {
+            registry.unavailable.lock().unwrap().insert(
+                "codex".into(),
+                Unavailable {
+                    until: deadline,
+                    reason: UnavailableReason::CapacityLimit,
+                },
+            );
+            match query {
+                0 => assert!(registry.available_names().contains(&"codex".to_owned())),
+                1 => assert_eq!(registry.cooldown_remaining("codex"), None),
+                _ => assert_eq!(registry.unavailable_reason("codex"), None),
+            }
+            assert!(!registry.unavailable.lock().unwrap().contains_key("codex"));
+        }
     }
 
     #[test]
