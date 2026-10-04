@@ -65,9 +65,12 @@ requests, result summaries, and recent live output while a run is active.
 The `/admin` page shows agent availability and remaining capacity cooldowns.
 An operator can reset a cooldown there to make an adapter eligible for automatic
 selection again without restarting the service. For people who need to step in,
-`/notifications` can turn mentions of a configured human account into browser
-system notifications. With HTTPS and a configured web-push key, subscribed
-browsers can receive them even when the page is closed; polling is available
+`/notifications` can turn mentions of a configured human account into system
+notifications on Linux, Android, iOS, Windows, and macOS through a compatible
+browser. Allow notifications for both the site and the browser in your system
+settings. On iOS 16.4+, add the page to the Home Screen, open it from there, and
+grant permission. With HTTPS and a configured web-push key, subscribed browsers
+can receive notifications even when the page is closed; polling is available
 while the page stays open. Protect these pages and APIs with reverse proxy
 authentication or keep them on a trusted network: they have no built-in login.
 
