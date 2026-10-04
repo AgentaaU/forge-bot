@@ -51,14 +51,52 @@ adapters queue the follow-up for the next turn.
 
 Work in a single thread is serialized, while different threads can run in
 parallel within a configured worker limit. Capacity failures can fall back to
-another available adapter. A status page shows running and queued work, the
-agent involved, and recent results.
+another available adapter.
+
+## Follow the work from your browser
+
+The built-in web pages make it easier to see what is happening without reading
+through every forge comment. `/status` shows running, queued, and idle threads,
+their agents and recent results. Paste an issue or comment URL into the search
+box to find its conversation. Open a thread's details to see run history,
+requests, result summaries, and recent live output while a run is active.
+`/status.json` exposes the same status snapshot for scripts or dashboards.
+
+The `/admin` page shows agent availability and remaining capacity cooldowns.
+An operator can reset a cooldown there to make an adapter eligible for automatic
+selection again without restarting the service. For people who need to step in,
+`/notifications` can turn mentions of a configured human account into browser
+system notifications. With HTTPS and a configured web-push key, subscribed
+browsers can receive them even when the page is closed; polling is available
+while the page stays open. Protect these pages and APIs with reverse proxy
+authentication or keep them on a trusted network: they have no built-in login.
+
+## Let implementation and review agents hand work back and forth
 
 You can configure separate agent accounts for implementation and review, each
-with its own forge identity, Linux account, workspace, and session. forge-bot
-instructs an author agent to hand a pull request to a configured reviewer in a
-separate comment. This supports a review workflow; it does not guarantee that
-an agent will find every defect or complete every requested action.
+with its own forge identity, Linux account, workspace, and session. After
+submitting or updating a PR, the author agent is instructed to post a separate
+comment mentioning the configured reviewer. The reviewer checks the current
+diff and relevant tests. If changes are needed, it mentions the PR author with
+specific findings; the author is asked to fix them and request another review.
+
+For example, an implementation account can propose a fix, a reviewer account
+can request a missing edge-case check, and the implementation account can
+update the branch and hand the new head back for review. Each handoff stays in
+the PR conversation. When the review is clear, the reviewer is instructed to
+rebase and squash to one commit, verify the final diff and checks, approve, and
+enable fast-forward auto-merge. These are agent instructions, so completion
+still depends on the agents' behavior, forge permissions, and merge checks.
+
+Forgejo also supports opt-in automatic work from signed webhook events:
+Actions failures and PR conflicts can start an agent without a fresh mention.
+These triggers continue the thread's conversation and reuse the adapter that
+last ran there, or the default for a new thread. Automatic work is disabled by
+default; operators must explicitly allow repositories and PR authors through
+`[policy].auto_allowed_repos` and `auto_allowed_pr_authors`. If an agent needs a
+secret, account registration, or privilege that only a person can provide, it
+is instructed to mention a configured human and explain what it needs while
+continuing any work that is not blocked.
 
 ## Who should try it?
 
