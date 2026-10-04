@@ -410,7 +410,7 @@ mention as a notification without routing another agent run.
 `GET /notifications` is a small web page that turns those notifications into
 browser system notifications. Pick the human account, grant notification
 permission, and click **Enable notifications**. Web push is the default
-transport preference. Configure a stable VAPID key and contact URI to enable it:
+transport. Configure a stable VAPID key and contact URI to enable it:
 
 ```sh
 umask 077
@@ -434,19 +434,22 @@ Changing the selected human rebinds that browser subscription. **Disable web
 push** removes it from the server and browser; **Enable notifications** subscribes
 again. After replacing the VAPID key, disable and re-enable existing subscriptions.
 
-Without a configured key, with `transport = "polling"`, or when the browser
-cannot subscribe, keep the page open. It polls
-`GET /notifications.json?recipient=<login>&after=<id>` every five seconds.
-Polling continues to verify delivery even after subscribing. Both transports
-use the service worker's display receipts, written only after `showNotification`
-succeeds, to avoid duplicate system notifications. Receipts persist in browser
-Cache Storage (bounded to 2048 entries), so dismissed notifications and worker
-restarts do not cause a second display. If browser storage is unavailable,
-deduplication uses in-memory receipts and still-visible notifications. Pending
-entries from before subscription and failed/dropped pushes are displayed by
-polling while the page is open. Push delivery uses a bounded queue and a one-day TTL;
-failed sends remain in the polling log, and expired (404/410) subscriptions are
-removed. Pending push sends are not durable across server restarts.
+The configured transport is authoritative. With `transport = "polling"`, keep
+this page open to deliver system notifications from the notification log every
+five seconds. With `transport = "web_push"`, only push events deliver real
+system notifications; page polling refreshes the log without displaying them.
+Missing VAPID configuration, failed subscriptions, expired subscriptions, and
+provider failures do not switch to polling delivery. The page reports missing
+configuration and subscription errors; configure the key and contact URI and
+click **Enable notifications** to repair the subscription. **Disable web push**
+unsubscribes without enabling polling delivery.
+
+Web Push receipts persist in browser Cache Storage (bounded to 2048 entries),
+so repeated push events and worker restarts do not cause duplicate displays.
+Push delivery uses a bounded queue and a one-day TTL; failed sends remain in
+the page log, and expired (404/410) subscriptions are removed. Pending push sends
+are not durable across server restarts. Test notifications explicitly request a
+fresh browser display in either mode.
 
 Only the exact hosts `fcm.googleapis.com`, `updates.push.services.mozilla.com`,
 and `web.push.apple.com` are accepted by default; `[notifications] push_hosts`
@@ -496,9 +499,8 @@ with `GET /notifications/diagnostics`. These checks cover browser state, not
 Android notification permissions or channels. The page keeps delivery feedback
 separate from polling status and provides Android settings instructions below
 the controls. Polling-only mode calls `registration.showNotification` directly;
-Web Push and its polling fallback share worker receipts to avoid duplicate
-delivery. Diagnostics report which path is selected, and test notifications
-always make a fresh direct display request.
+Web Push events use worker receipts to avoid duplicate delivery. Diagnostics
+report which path is selected, and test notifications always make a fresh direct display request.
 
 The cursors are kept per human account, so switching accounts does not hide a
 recipient's pending notifications, and a server restart is detected through a

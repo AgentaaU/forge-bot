@@ -123,10 +123,13 @@ ack = true
 result = false
 
 [notifications]
-# Prefer background delivery; set "polling" for the page-only transport.
+# Transport is authoritative; Web Push never falls back to polling delivery.
+# Select transport = "polling" explicitly for delivery while the page is open.
 transport = "web_push"
 # Generate a stable key: openssl ecparam -name prime256v1 -genkey -noout -out vapid.pem
-# Keep the key private and readable by the bot. Without a key, polling is used.
+# Web Push requires both vapid_private_key_path and vapid_subject below.
+# Keep the key private and readable by the bot. Without both settings, Web Push
+# provides no automatic system delivery; the page still updates its log.
 # vapid_private_key_path = "/etc/forge-bot/vapid.pem"
 # vapid_subject = "mailto:operator@example.com"
 # Optional exact host allowlist for another trusted push service. Default:

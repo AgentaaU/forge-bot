@@ -2053,7 +2053,7 @@ async fn push_api_registers_humans_and_rejects_invalid_subscriptions() {
 }
 
 #[tokio::test]
-async fn push_api_falls_back_when_not_configured() {
+async fn push_api_reports_missing_configuration_without_changing_mode() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness_with(dir.path(), with_human);
     let response = harness
@@ -2068,7 +2068,13 @@ async fn push_api_falls_back_when_not_configured() {
         .await
         .unwrap();
     let data: Value = serde_json::from_str(&body_text(response).await).unwrap();
-    assert_eq!(data, serde_json::json!({"transport": "polling"}));
+    assert_eq!(data["transport"], "web_push");
+    assert!(
+        data["error"]
+            .as_str()
+            .unwrap()
+            .contains("vapid_private_key_path")
+    );
     let response = harness
         .app
         .clone()
@@ -2085,6 +2091,28 @@ async fn push_api_falls_back_when_not_configured() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn push_api_honors_explicit_polling_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), |config| {
+        with_human(config);
+        config.notifications.transport = forge_bot::config::NotificationTransport::Polling;
+    });
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/notifications/push")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let data: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(data, serde_json::json!({"transport": "polling"}));
 }
 
 #[tokio::test]

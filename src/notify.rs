@@ -507,7 +507,7 @@ mod tests {
         // A rejected display (for example permission not yet granted on a new
         // Android install) must not advance the cursor past the entry.
         assert!(
-            html.contains("const displayed = await handle(recipient, notification)"),
+            html.contains("await handle(recipient, notification)"),
             "{html}"
         );
         assert!(
@@ -519,7 +519,7 @@ mod tests {
         assert!(html.contains("Click \"Enable notifications\""), "{html}");
         // Granting permission re-polls immediately instead of losing the batch.
         assert!(
-            html.contains("if (permission === 'granted') { permissionGranted(); await syncPush(false, true); poll(); }"),
+            html.contains("if (permission === 'granted') { permissionGranted(); await syncPush(false, true); await poll(); }"),
             "{html}"
         );
         // Only a contiguous handled prefix may advance the cursor, so a later

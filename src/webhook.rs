@@ -565,9 +565,13 @@ async fn receive(
 }
 
 async fn push_config(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(match state.dispatcher.push() {
-        Some(push) => json!({"transport": "web_push", "public_key": push.public_key}),
-        None => json!({"transport": "polling"}),
+    Json(match state.config.notifications.transport {
+        crate::config::NotificationTransport::Polling => json!({"transport": "polling"}),
+        crate::config::NotificationTransport::WebPush => match state.dispatcher.push() {
+            Some(push) => json!({"transport": "web_push", "public_key": push.public_key}),
+            None => json!({"transport": "web_push", "error":
+                "Web Push requires notifications.vapid_private_key_path and notifications.vapid_subject."}),
+        },
     })
 }
 

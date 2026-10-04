@@ -97,7 +97,7 @@ function notification(id, recipient, message, generation = 'gen-1') {
 // receives the entry, the per-entry attempt count and the options; it may
 // resolve, reject (to simulate a failed display) or return a promise the test
 // resolves later (to hold a display in flight).
-function createHarness({ permission, requestedPermission = 'granted', notificationApi = true, secureContext = true, entries = [], onShow, registrationError, push = false, existingPush = false, failPush = false } = {}) {
+function createHarness({ permission, requestedPermission = 'granted', notificationApi = true, secureContext = true, entries = [], onShow, registrationError, push = false, existingPush = false, failPush = false, configError = false, configUnavailable = false } = {}) {
   const pushRequests = [];
   let subscription = existingPush ? makeSubscription() : null;
   function makeSubscription() {
@@ -247,9 +247,10 @@ function createHarness({ permission, requestedPermission = 'granted', notificati
     Notification,
     fetch(url, options) {
       if (url === '/notifications/push') {
+        if (!options && configUnavailable) { return Promise.reject(new Error('offline')); }
         if (options) { pushRequests.push({ method: options.method, body: JSON.parse(options.body) }); }
         return Promise.resolve({ ok: !options || !failPush, status: failPush ? 500 : 200, json: async () => (push
-          ? { transport: 'web_push', public_key: Buffer.alloc(65, 1).toString('base64url') }
+          ? { transport: 'web_push', error: configError ? 'Missing VAPID key' : undefined, public_key: Buffer.alloc(65, 1).toString('base64url') }
           : { transport: 'polling' }) });
       }
       requests.push(url);
@@ -277,6 +278,7 @@ function createHarness({ permission, requestedPermission = 'granted', notificati
   return {
     elements,
     pushRequests,
+    setConfigUnavailable: (value) => { configUnavailable = value; },
     push: (entry) => background.push(entry),
     expireSubscription: () => { subscription = null; },
     requests,
@@ -518,93 +520,37 @@ function createHarness({ permission, requestedPermission = 'granted', notificati
   console.log('registration failure: test button does not falsely claim success');
 }
 
-// Push: a fresh browser requires an explicit click; restored subscriptions are rebound.
+// Configured Web Push never displays polled entries as a fallback.
+for (const failure of ['unsubscribed', 'provider failure', 'expired subscription', 'missing key', 'config unavailable']) {
+  const h = createHarness({ permission: 'granted', push: true,
+    existingPush: failure !== 'unsubscribed', failPush: failure === 'provider failure',
+    configError: failure === 'missing key', configUnavailable: failure === 'config unavailable' });
+  h.activate(); await settle();
+  if (failure === 'expired subscription') { h.expireSubscription(); }
+  h.entries.push(notification(1, 'alice', failure));
+  await h.poll(); await h.poll();
+  assert(h.shown.length === 0, failure + ': switched to polling delivery');
+  assert(h.elements.log.children.length === 1, failure + ': missing page log');
+  if (failure === 'config unavailable') { assert(h.requests.at(-1).includes('after=0'), 'unknown mode consumed entry'); }
+  if (['missing key', 'provider failure', 'config unavailable'].includes(failure)) {
+    assert(h.elements['delivery-status'].textContent.length > 0, failure + ': error missing');
+  }
+}
 {
   const h = createHarness({ permission: 'granted', push: true });
-  h.activate();
-  await settle();
-  assert(h.pushRequests.length === 0, 'startup subscribed without an explicit enable click');
-  await h.elements.enable.listeners.click();
-  await settle();
-  assert(h.pushRequests[0].body.recipient === 'alice', 'enable did not bind Alice');
-  const pushed = notification(1, 'alice', 'pushed');
-  h.entries.push(pushed);
-  await h.push(pushed);
-  await h.poll();
-  assert(h.shown.length === 1, 'polling duplicated a push notification');
-  h.elements.recipient.value = 'bob';
-  h.elements.recipient.listeners.change();
-  await settle();
-  assert(h.pushRequests.at(-1).body.recipient === 'bob', 'recipient switch did not rebind');
-  h.elements['disable-push'].listeners.click();
-  await settle();
-  assert(h.pushRequests.at(-1).method === 'DELETE', 'disable did not remove the server subscription');
-  h.entries.push(notification(2, 'bob', 'poll after disable'));
-  await h.poll();
-  assert(h.shown.some((entry) => entry.id === 2), 'disable did not restore polling notifications');
-}
-{
-  const h = createHarness({ permission: 'granted', push: true, existingPush: true });
-  h.activate();
-  await settle();
-  assert(h.pushRequests.length === 1 && h.pushRequests[0].method === 'POST', 'existing subscription was not restored');
-}
-{
-  const h = createHarness({ permission: 'granted', push: true, existingPush: true, failPush: true,
-    entries: [notification(1, 'alice', 'fallback')] });
-  h.activate();
-  await settle();
-  assert(h.shown.length === 1, 'failed registration did not fall back to polling');
-}
-
-// A request predating subscription must survive enabling and be displayed.
-{
-  const h = createHarness({ permission: 'default', push: true,
-    entries: [notification(1, 'alice', 'pending before subscribe')] });
-  h.activate();
-  await settle();
-  assert(h.shown.length === 0, 'pending entry displayed before permission');
-  assert(h.requests.at(-1).includes('after=0'), 'pending entry consumed before enable');
-  await h.elements.enable.listeners.click();
-  await settle();
-  assert(h.shown.length === 1, 'subscribing lost the pending entry');
-  await h.poll();
-  assert(h.requests.at(-1).includes('after=1'), 'successful display did not commit the cursor');
-  assert(h.shown.length === 1, 'pending entry displayed twice');
-}
-// No push reaches the browser for overflow, provider failure, or expiration.
-// Registration is deliberately successful; it must never suppress fallback.
-for (const failure of ['queue overflow', 'network/provider failure', '404/410 cleanup']) {
-  const h = createHarness({ permission: 'granted', push: true, existingPush: true });
-  h.activate();
-  await settle();
-  if (failure === '404/410 cleanup') { h.expireSubscription(); }
-  const entry = notification(1, 'alice', failure);
-  h.entries.push(entry);
-  await h.poll();
-  assert(h.shown.length === 1, failure + ': polling did not recover the missing push');
-  await h.push(entry); // A delayed successful push must not duplicate recovery.
-  await h.poll();
-  assert(h.shown.length === 1, failure + ': late push duplicated polling');
-  assert(h.requests.at(-1).includes('after=1'), failure + ': cursor did not follow display');
-  assert(!h.elements.status.textContent.includes('Web push enabled'), 'status claimed unverified push delivery');
-}
-// A failed worker display must not create a receipt or advance the cursor.
-{
-  let fail = true;
-  const entry = notification(1, 'alice', 'retry display');
-  const h = createHarness({ permission: 'granted', push: true, existingPush: true,
-    onShow: () => { if (fail) { throw new Error('display rejected'); } } });
-  h.activate();
-  await settle();
-  h.entries.push(entry);
-  await h.poll();
-  await h.poll();
-  assert(h.requests.at(-1).includes('after=0') && h.shown.length === 0, 'failed display consumed entry');
-  fail = false;
-  await h.push(entry);
-  await h.poll();
-  assert(h.shown.length === 1, 'retry was suppressed by a failed-display receipt');
+  h.activate(); await settle();
+  assert(h.pushRequests.length === 0, 'startup subscribed without explicit click');
+  await h.elements.enable.listeners.click(); await settle();
+  assert(h.pushRequests.at(-1).body.recipient === 'alice', 'enable did not subscribe');
+  const entry = notification(1, 'alice', 'push delivery');
+  h.entries.push(entry); await h.push(entry); await h.poll();
+  assert(h.shown.length === 1 && h.workerMessages() === 0, 'page participated in push delivery');
+  h.elements.recipient.value = 'bob'; h.elements.recipient.listeners.change(); await settle();
+  assert(h.pushRequests.at(-1).body.recipient === 'bob', 'recipient did not rebind');
+  await h.elements['disable-push'].listeners.click(); await settle();
+  assert(h.pushRequests.at(-1).method === 'DELETE', 'disable did not unsubscribe');
+  h.entries.push(notification(2, 'bob', 'disabled')); await h.poll();
+  assert(h.shown.length === 1, 'disable switched to polling');
 }
 // Concurrent polling/push and a dismissed notification across worker restart.
 {
@@ -664,7 +610,7 @@ for (const failure of ['queue overflow', 'network/provider failure', '404/410 cl
   assert(closed && opened[0] === entry.location, 'click did not open the forge comment');
   handlers.notificationclick({ notification: { data: 'javascript:alert(1)', close() {} }, waitUntil() { throw new Error('unsafe URL opened'); } });
 }
-console.log('web push: subscription lifecycle, polling fallback, background display and click validated');
+console.log('web push: configured transport, subscription lifecycle, background display and click validated');
 
 // Polling activity must not erase blocked or unsupported delivery feedback.
 for (const options of [
@@ -710,13 +656,13 @@ console.log('system delivery feedback: blocked states and Android guidance survi
   const h = createHarness({ permission: 'granted', push: true, existingPush: true });
   h.activate();
   await settle();
-  h.entries.push(notification(1, 'alice', 'push fallback uses receipts'));
+  h.entries.push(notification(1, 'alice', 'push mode updates log only'));
   await h.poll();
-  assert(h.workerMessages() === 1, 'web push fallback bypassed shared receipts');
+  assert(h.workerMessages() === 0, 'Web Push mode used page delivery');
   await h.elements.test.listeners.click();
-  assert(h.workerMessages() === 1 && h.shown.length === 2, 'test button did not use a fresh direct display');
+  assert(h.workerMessages() === 0 && h.shown.length === 1, 'test button did not use a fresh direct display');
 }
-console.log('polling-only: direct display bypasses stale worker receipts; push retains deduplication');
+console.log('polling-only: direct display bypasses stale worker receipts; push mode avoids page delivery');
 // Every failed user attempt replaces the preceding successful test result.
 for (const button of ['test', 'enable']) {
   for (const options of [
@@ -815,4 +761,30 @@ for (const grantFlow of ['enable', 'permission-change', 'test', 'test-request'])
   assert(h.elements['delivery-status'].textContent.includes('real display failure'), 'grant or test hid unresolved delivery');
 }
 console.log('consumed permission warnings retire across grant flows and recipients');
+// Configuration failures survive permission guidance and recover through user actions.
+for (const push of [false, true]) {
+  for (const recovery of ['enable', 'refresh']) {
+    const h = createHarness({ permission: 'granted', push, configUnavailable: true,
+      entries: [notification(1, 'alice', 'pending during configuration outage')] });
+    h.activate(); await settle();
+    const error = h.elements['delivery-status'].textContent;
+    assert(error.includes('Could not load notification mode'), 'configuration error missing');
+    await h.elements.enable.listeners.click();
+    await h.poll();
+    assert(h.elements['delivery-status'].textContent === error, 'failed retry or permission grant hid configuration error');
+    assert(h.shown.length === 0, 'unknown transport displayed pending entry');
+    assert(h.requests.at(-1).includes('after=0'), 'unknown transport consumed pending entry');
+    h.setConfigUnavailable(false);
+    await h.elements[recovery].listeners.click(); await settle();
+    await h.poll();
+    assert(!h.elements['delivery-status'].textContent.includes('Could not load notification mode'), 'resolved configuration error remained');
+    assert(h.shown.length === (push ? 0 : 1), 'recovered transport did not control automatic display');
+    assert(h.requests.at(-1).includes('after=1'), 'recovered transport did not advance cursor');
+    assert(h.elements.log.children.length === 1, 'configuration retry duplicated log entry');
+    if (push && recovery === 'enable') {
+      assert(h.pushRequests.some((request) => request.method === 'POST'), 'Enable did not subscribe after configuration recovery');
+    }
+  }
+}
+console.log('transient configuration failures recover through Enable and Refresh with transport honored');
 console.log('VALIDATION OK');

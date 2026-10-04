@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validates_configuration_and_falls_back_without_a_key() {
+    async fn validates_configuration_and_leaves_push_unavailable_without_a_key() {
         assert_eq!(
             NotificationsConfig::default().transport,
             NotificationTransport::WebPush

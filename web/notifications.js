@@ -9,19 +9,35 @@ try {
 } catch (_) { /* Storage may be disabled. */ }
 let registration = null;
 let pushConfig = null;
+let configurationError = '';
 let pushUpdates = Promise.resolve();
 
 async function loadPushConfig() {
   try {
     const response = await fetch('/notifications/push');
-    if (response.ok) { pushConfig = await response.json(); }
-  } catch (_) { /* Polling remains available. */ }
+    if (!response.ok) { throw new Error('Configuration returned ' + response.status); }
+    pushConfig = await response.json();
+    if (!['web_push', 'polling'].includes(pushConfig.transport)) {
+      throw new Error('Unknown notification transport');
+    }
+    configurationError = pushConfig.error || '';
+    refreshDeliveryStatus();
+  } catch (error) {
+    pushConfig = null;
+    configurationError = 'Could not load notification mode: ' + error.message;
+    refreshDeliveryStatus();
+  }
 }
 
 function syncPush(disable = false, create = false) {
   // Serialize selection changes so the final server binding matches the UI.
   pushUpdates = pushUpdates.catch(function () {}).then(async function () {
-    if (!registration || !registration.pushManager) { return; }
+    if (!pushConfig || pushConfig.transport !== 'web_push') { return; }
+    if (pushConfig.error) { setDeliveryStatus(pushConfig.error); return; }
+    if (!registration || !registration.pushManager) {
+      setDeliveryStatus('Web Push requires an active service worker and Push API.');
+      return;
+    }
     let subscription = await registration.pushManager.getSubscription();
     if (disable) {
       if (subscription) {
@@ -32,14 +48,14 @@ function syncPush(disable = false, create = false) {
         if (!response.ok) { throw new Error('Could not remove push subscription'); }
         await subscription.unsubscribe();
       }
-      setStatus('Web push disabled. Polling while this page is open.');
+      setDeliveryStatus('Web Push disabled. Enable notifications to subscribe again.');
       return;
     }
     if (!pushConfig || pushConfig.transport !== 'web_push' ||
         typeof Notification === 'undefined' || Notification.permission !== 'granted') { return; }
     const recipient = recipientSelect.value;
     if (!recipient) { return; }
-    if (!subscription && !create) { return; }
+    if (!subscription && !create) { setDeliveryStatus('Web Push is not subscribed. Click Enable notifications.'); return; }
     if (!subscription) {
       const encoded = pushConfig.public_key.replace(/-/g, '+').replace(/_/g, '/');
       const bytes = Uint8Array.from(atob(encoded), function (character) { return character.charCodeAt(0); });
@@ -53,10 +69,11 @@ function syncPush(disable = false, create = false) {
     });
     if (!response.ok) { throw new Error('Push subscription returned ' + response.status); }
     if (recipientSelect.value === recipient) {
-      setStatus('Browser subscribed for ' + recipient + '; polling also verifies delivery while open.');
+      setDeliveryStatus('');
+      setStatus('Browser subscribed for ' + recipient + '.');
     }
   }).catch(function (error) {
-    setStatus('Web push failed: ' + error.message + '. Polling while this page is open.');
+    setDeliveryStatus('Web Push failed: ' + error.message);
   });
   return pushUpdates;
 }
@@ -96,9 +113,9 @@ const deliveryWarnings = {};
 let permissionGuidance = false;
 function refreshDeliveryStatus() {
   const failures = deliveryFailures[recipientSelect.value];
-  document.getElementById('delivery-status').textContent =
-    failures && failures.size ? failures.values().next().value.text
-      : (deliveryWarnings[recipientSelect.value] || {}).text || deliveryGuidance;
+  document.getElementById('delivery-status').textContent = configurationError ||
+    (failures && failures.size ? failures.values().next().value.text
+      : (deliveryWarnings[recipientSelect.value] || {}).text || deliveryGuidance);
 }
 function setDeliveryStatus(text, permissionWarning = false) {
   permissionGuidance = permissionWarning;
@@ -182,7 +199,8 @@ async function enable() {
   // Permission often arrives after earlier polls already fetched the batch;
   // poll again now so those entries are delivered instead of waiting five
   // seconds (or being lost if the cursor had advanced).
-  if (permission === 'granted') { permissionGranted(); await syncPush(false, true); poll(); }
+  if (!pushConfig) { await loadPushConfig(); }
+  if (permission === 'granted') { permissionGranted(); await syncPush(false, true); await poll(); }
 }
 
 // Deliver a synthetic notification on demand. This lets a person confirm that
@@ -243,7 +261,7 @@ async function collectDiagnostics() {
     permissionState: null,
     displayTest: null,
     notificationDeliveryPath: pushConfig && pushConfig.transport === 'web_push'
-      ? 'worker-receipts' : 'direct-showNotification',
+      ? 'web-push' : pushConfig ? 'direct-showNotification' : 'unavailable',
     generation: generation,
     cursors: cursors,
     delivered: serializeDelivered(),
@@ -337,31 +355,6 @@ async function runDiagnostics() {
   }
 }
 
-// Web Push and its polling fallback share receipts to avoid duplicate delivery.
-// Polling-only mode uses the original direct showNotification path below.
-function displayThroughWorker(notification) {
-  return new Promise(function (resolve, reject) {
-    const channel = new MessageChannel();
-    const timeout = setTimeout(function () {
-      channel.port1.close();
-      reject(new Error('Service worker display acknowledgement timed out'));
-    }, 10000);
-    channel.port1.onmessage = function (event) {
-      clearTimeout(timeout);
-      channel.port1.close();
-      if (event.data && event.data.displayed === true) { resolve(); }
-      else { reject(new Error(event.data && event.data.error || 'Service worker display failed')); }
-    };
-    try {
-      registration.active.postMessage({ type: 'display-notification', notification: notification }, [channel.port2]);
-    } catch (error) {
-      clearTimeout(timeout);
-      channel.port1.close();
-      reject(error);
-    }
-  });
-}
-
 // Display one entry. Resolves to `{ handled, raised }`: `handled` means the
 // entry may be consumed (accepted, blocked, or impossible to show) so the
 // cursor can advance. `raised` means the browser accepted the request; the
@@ -394,17 +387,7 @@ async function display(notification, report = setDeliveryStatus) {
   };
   if (registration && typeof registration.showNotification === 'function') {
     try {
-      // Receipt deduplication is needed only when push can race with polling.
-      // Keep polling-only delivery on the previously working Android path,
-      // without consulting receipts from an earlier session. Tests also bypass
-      // receipts so each click makes a fresh display request.
-      if (pushConfig && pushConfig.transport === 'web_push' && notification.id &&
-          registration.active && typeof registration.active.postMessage === 'function' &&
-          typeof MessageChannel !== 'undefined') {
-        await displayThroughWorker(notification);
-      } else {
-        await registration.showNotification(title, options);
-      }
+      await registration.showNotification(title, options);
       return { handled: true, raised: true };
     } catch (error) {
       // Android rejects `new Notification` and can reject `showNotification`
@@ -550,7 +533,10 @@ async function poll() {
       // or advance anything on the newly selected page.
       if (!isCurrent(seq, recipient) || generation !== batchGeneration) { return; }
       render(notification);
-      const displayed = await handle(recipient, notification);
+      // Web Push owns system delivery in push mode. This fetch updates only
+      // the page log; provider/subscription errors never select polling delivery.
+      const displayed = pushConfig && (pushConfig.transport === 'web_push' ||
+        await handle(recipient, notification));
       if (!isCurrent(seq, recipient) || generation !== batchGeneration) { return; }
       if (displayed) {
         if (handled) { committed = notification.id; }
@@ -582,7 +568,10 @@ document.getElementById('disable-push').addEventListener('click', function () { 
 document.getElementById('enable').addEventListener('click', enable);
 document.getElementById('test').addEventListener('click', testNotification);
 document.getElementById('diagnostics-button').addEventListener('click', runDiagnostics);
-document.getElementById('refresh').addEventListener('click', poll);
+document.getElementById('refresh').addEventListener('click', async function () {
+  if (!pushConfig) { await loadPushConfig(); await syncPush(); }
+  await poll();
+});
 // A permission change (for example the user unblocks notifications in browser
 // settings) should deliver whatever is still pending without waiting.
 if (navigator.permissions && navigator.permissions.query) {
