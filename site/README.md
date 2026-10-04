@@ -43,3 +43,31 @@ When updating the page, keep its feature descriptions aligned with `README.md`
 and check mobile layouts, keyboard navigation, and the documentation links.
 GitHub workflow setup reference:
 https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages
+
+## Startup video
+
+Both languages embed the 24-second silent introduction in `media/startup.mp4`.
+The first video source is jsDelivr's CDN URL for the GitHub mirror's `main`;
+the second is the same asset served locally by Pages. The poster is local,
+playback requires an explicit user action, and `preload="none"` avoids fetching
+the video before playback. English and Chinese transcripts are included below
+it. No audio or external footage is used.
+
+The CDN becomes available after this change is merged and synchronized to
+`AgentaaU/forge-bot` on GitHub. No CDN account or upload secret is needed.
+Check that the CDN URL returns `200` and `Content-Type: video/mp4` after
+synchronization. Until then, the local video source and download link work.
+jsDelivr caches branch URLs; when replacing the video, use a new asset filename
+and update both pages so viewers receive the new version immediately.
+
+To regenerate the committed video and poster, install Python Pillow and ffmpeg,
+and use the JetBrains Mono Regular font at the path in the renderer:
+
+```sh
+python3 contrib/render-startup-video.py
+ffprobe -v error -show_entries format=duration,size site/media/startup.mp4
+```
+
+The renderer creates six animated scenes at 1280×720, 12 fps, encoded as H.264
+with `yuv420p` and MP4 fast-start metadata for browser playback. It is a separate
+asset authoring step; the website and Pages deployment still need no build.

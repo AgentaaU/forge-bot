@@ -87,6 +87,29 @@
           <div class="window-footer">同一段对话，上下文持续保留。</div>
         </div>
       </section>
+      <section class="wrap intro" aria-labelledby="intro-title">
+        <h2 id="intro-title">从评论到代码</h2>
+        <p>观看 24 秒项目介绍。视频无音频，画面文字为英文；下方提供中文文字稿。</p>
+        <video controls playsinline preload="none" width="1280" height="720"
+          poster="./media/startup-poster.webp" aria-label="项目介绍"
+          aria-describedby="intro-transcript">
+          <source src="https://cdn.jsdelivr.net/gh/AgentaaU/forge-bot@main/site/media/startup.mp4" type="video/mp4" />
+          <source src="./media/startup.mp4" type="video/mp4" />
+          <a href="./media/startup.mp4">下载视频</a>
+        </video>
+        <details id="intro-transcript">
+          <summary>阅读视频文字稿</summary>
+          <ol>
+            <li>forge-bot 将 Forgejo、GitHub 和 GitLab 上的提及转换为智能体任务。</li>
+            <li>在议题或拉取请求评论中提及智能体。</li>
+            <li>网关验证事件、授权请求，并传递位置 URL 和消息。</li>
+            <li>智能体读取上下文、修改代码、运行测试并回复。</li>
+            <li>在同一讨论串中继续交流；会话保留上下文，状态页面显示进度。</li>
+            <li>按照部署指南构建、配置并验证环境。</li>
+          </ol>
+        </details>
+        <p><a class="text-link" href="./media/startup.mp4" download>下载视频</a></p>
+      </section>
       <section class="band" id="how-it-works" aria-labelledby="workflow-title">
         <div class="wrap">
           <p class="eyebrow">轻量网关，职责清晰</p>

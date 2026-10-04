@@ -504,3 +504,22 @@ html:lang(zh) h2,
 html:lang(zh) h3 {
   letter-spacing: 0;
 }
+
+.intro {
+  padding-block: 32px 64px;
+}
+.intro video {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin-block: 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #111b19;
+}
+.intro summary {
+  cursor: pointer;
+}
+.intro li {
+  margin-block: 8px;
+}
