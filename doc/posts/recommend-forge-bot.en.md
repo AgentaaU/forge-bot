@@ -77,9 +77,9 @@ repositories, scoped forge tokens, and protected status and admin routes.
 
 ## Give it a concrete first task
 
-Start with the project's [README](https://github.com/AgentaaU/forge-bot),
-[example configuration](https://github.com/AgentaaU/forge-bot),
-and [deployment guide](https://github.com/AgentaaU/forge-bot).
+Start with the project's [README](https://github.com/AgentaaU/forge-bot/blob/main/README.md),
+[example configuration](https://github.com/AgentaaU/forge-bot/blob/main/config.example.toml),
+and [deployment guide](https://github.com/AgentaaU/forge-bot/blob/main/deploy.md).
 Configure an agent account and authorization policy, authenticate the agent
 CLI, and connect signed webhooks. Polling is also available when you cannot
 create a webhook.

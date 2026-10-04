@@ -63,9 +63,9 @@ Linux 用户、工作目录和会话。提交或更新 PR 后，forge-bot 会指
 
 ## 从一个具体的小任务开始
 
-先阅读项目的 [README](https://github.com/AgentaaU/forge-bot)、
-[配置示例](https://github.com/AgentaaU/forge-bot)
-和[部署指南](https://github.com/AgentaaU/forge-bot)。
+先阅读项目的 [README](https://github.com/AgentaaU/forge-bot/blob/main/README.md)、
+[配置示例](https://github.com/AgentaaU/forge-bot/blob/main/config.example.toml)
+和[部署指南](https://github.com/AgentaaU/forge-bot/blob/main/deploy.md)。
 配置智能体账号和授权策略，完成智能体 CLI 的认证，再接入带签名验证的 webhook。
 如果没有创建 webhook 的权限，也可以使用轮询方式接入。
 
