@@ -97,7 +97,7 @@ function notification(id, recipient, message, generation = 'gen-1') {
 // receives the entry, the per-entry attempt count and the options; it may
 // resolve, reject (to simulate a failed display) or return a promise the test
 // resolves later (to hold a display in flight).
-function createHarness({ permission, entries = [], onShow, registrationError, push = false, existingPush = false, failPush = false } = {}) {
+function createHarness({ permission, requestedPermission = 'granted', notificationApi = true, secureContext = true, entries = [], onShow, registrationError, push = false, existingPush = false, failPush = false } = {}) {
   const pushRequests = [];
   let subscription = existingPush ? makeSubscription() : null;
   function makeSubscription() {
@@ -109,6 +109,7 @@ function createHarness({ permission, entries = [], onShow, registrationError, pu
   let currentPermission = permission;
   let currentGeneration = 'gen-1';
   let constructorCalls = 0;
+  let workerMessages = 0;
   let worker;
 
   function element() {
@@ -140,6 +141,7 @@ function createHarness({ permission, entries = [], onShow, registrationError, pu
 
   const elements = {
     status: element(),
+    'delivery-status': element(),
     log: element(),
     recipient: element(),
     enable: element(),
@@ -155,8 +157,8 @@ function createHarness({ permission, entries = [], onShow, registrationError, pu
       return currentPermission;
     }
     static requestPermission() {
-      currentPermission = 'granted';
-      return Promise.resolve('granted');
+      currentPermission = requestedPermission;
+      return Promise.resolve(requestedPermission);
     }
     constructor() {
       constructorCalls += 1;
@@ -190,8 +192,9 @@ function createHarness({ permission, entries = [], onShow, registrationError, pu
 
   const background = workerHarness(registration);
 
+  const permissionState = { state: permission, onchange: null };
   const sandbox = {
-    window: { Notification, isSecureContext: true },
+    window: { Notification, isSecureContext: secureContext },
     atob: (value) => Buffer.from(value, "base64").toString("binary"),
     Uint8Array,
     MessageChannel: TestMessageChannel,
@@ -210,6 +213,7 @@ function createHarness({ permission, entries = [], onShow, registrationError, pu
       createElement: () => element(),
     },
     navigator: {
+      permissions: { query: async () => permissionState },
       serviceWorker: {
         register(script, options) {
           if (script !== '/notifications/sw.js') throw new Error(`unexpected script ${script}`);
@@ -221,7 +225,7 @@ function createHarness({ permission, entries = [], onShow, registrationError, pu
           }
           worker = {
             state: 'installing',
-            postMessage: (data, ports) => background.message(data, ports),
+            postMessage: (data, ports) => { workerMessages++; return background.message(data, ports); },
             listeners: {},
             addEventListener(type, handler) {
               this.listeners[type] = handler;
@@ -267,6 +271,7 @@ function createHarness({ permission, entries = [], onShow, registrationError, pu
     setInterval() {},
   };
 
+  if (!notificationApi) { delete sandbox.Notification; delete sandbox.window.Notification; }
   vm.runInNewContext(source, sandbox, { filename: 'notifications.js' });
 
   return {
@@ -279,6 +284,8 @@ function createHarness({ permission, entries = [], onShow, registrationError, pu
     attempts,
     entries,
     activate: () => worker.activate(),
+    permissionChange: () => { permissionState.state = currentPermission; permissionState.onchange(); },
+    setPermission: (value) => { currentPermission = value; },
     grant: () => {
       currentPermission = 'granted';
     },
@@ -287,6 +294,7 @@ function createHarness({ permission, entries = [], onShow, registrationError, pu
     },
     poll: () => elements.refresh.listeners.click(),
     constructorCalls: () => constructorCalls,
+    workerMessages: () => workerMessages,
   };
 }
 
@@ -500,11 +508,11 @@ function createHarness({ permission, entries = [], onShow, registrationError, pu
   h.elements.test.listeners.click();
   await settle();
   assert(
-    !h.elements.status.textContent.includes('Test notification sent'),
+    !h.elements['delivery-status'].textContent.includes('Test notification accepted'),
     `the test button falsely reported success: ${h.elements.status.textContent}`,
   );
   assert(
-    h.elements.status.textContent.includes('cannot raise system notifications'),
+    h.elements['delivery-status'].textContent.includes('cannot raise system notifications'),
     `the test button did not report the failure: ${h.elements.status.textContent}`,
   );
   console.log('registration failure: test button does not falsely claim success');
@@ -657,4 +665,154 @@ for (const failure of ['queue overflow', 'network/provider failure', '404/410 cl
   handlers.notificationclick({ notification: { data: 'javascript:alert(1)', close() {} }, waitUntil() { throw new Error('unsafe URL opened'); } });
 }
 console.log('web push: subscription lifecycle, polling fallback, background display and click validated');
+
+// Polling activity must not erase blocked or unsupported delivery feedback.
+for (const options of [
+  { permission: 'denied' },
+  { permission: 'granted', registrationError: new Error('storage blocked') },
+]) {
+  const h = createHarness({ ...options, entries: [notification(1, 'alice', 'blocked')] });
+  await settle();
+  if (!options.registrationError) { h.activate(); await settle(); }
+  const feedback = h.elements['delivery-status'].textContent;
+  assert(feedback.includes('page only'), 'missing delivery failure feedback');
+  await h.poll();
+  assert(h.elements['delivery-status'].textContent === feedback, 'poll erased delivery feedback');
+}
+{
+  const h = createHarness({ permission: 'granted' });
+  h.activate();
+  await settle();
+  await h.elements.test.listeners.click();
+  assert(h.shown.length === 1, 'test did not ask the browser to show a notification');
+  const feedback = h.elements['delivery-status'].textContent;
+  assert(feedback.includes('accepted by the browser') && feedback.includes('notification shade'), 'test claimed verified OS delivery');
+  await h.poll();
+  assert(h.elements['delivery-status'].textContent === feedback, 'poll erased test guidance');
+}
+console.log('system delivery feedback: blocked states and Android guidance survive polling');
+// Polling-only mode must bypass stale durable worker receipts. Seed a receipt
+// by displaying through push, then poll the same entry through the page.
+{
+  const entry = notification(1, 'alice', 'polling-only regression');
+  const h = createHarness({ permission: 'granted' });
+  h.activate();
+  await settle();
+  await h.push(entry);
+  h.entries.push(entry);
+  await h.poll();
+  assert(h.shown.length === 2, 'old worker receipt suppressed direct polling display');
+  assert(h.workerMessages() === 0, 'polling-only mode used worker receipt protocol');
+  await h.poll();
+  assert(h.shown.length === 2, 'page cursor did not prevent repeated polling display');
+}
+{
+  const h = createHarness({ permission: 'granted', push: true, existingPush: true });
+  h.activate();
+  await settle();
+  h.entries.push(notification(1, 'alice', 'push fallback uses receipts'));
+  await h.poll();
+  assert(h.workerMessages() === 1, 'web push fallback bypassed shared receipts');
+  await h.elements.test.listeners.click();
+  assert(h.workerMessages() === 1 && h.shown.length === 2, 'test button did not use a fresh direct display');
+}
+console.log('polling-only: direct display bypasses stale worker receipts; push retains deduplication');
+// Every failed user attempt replaces the preceding successful test result.
+for (const button of ['test', 'enable']) {
+  for (const options of [
+    { permission: 'default', requestedPermission: 'denied' },
+    { permission: 'default', requestedPermission: 'default' },
+    { permission: 'granted', notificationApi: false },
+    ...(button === 'enable' ? [{ permission: 'granted', secureContext: false }] : []),
+  ]) {
+    const h = createHarness(options);
+    h.activate();
+    await settle();
+    await h.elements[button].listeners.click();
+    const feedback = h.elements['delivery-status'].textContent;
+    assert(feedback.includes('permission:') || feedback.includes('no Notification API') || feedback.includes('require HTTPS'),
+      button + ': missing persistent early failure');
+    assert(h.shown.length === 0, button + ': failed attempt requested display');
+    await h.poll();
+    assert(h.elements['delivery-status'].textContent === feedback, button + ': empty poll erased early failure');
+  }
+}
+{
+  const h = createHarness({ permission: 'granted', requestedPermission: 'denied' });
+  h.activate();
+  await settle();
+  await h.elements.test.listeners.click();
+  assert(h.elements['delivery-status'].textContent.includes('accepted by the browser'), 'missing prior success');
+  h.setPermission('denied');
+  await h.elements.test.listeners.click();
+  await h.poll();
+  assert(h.elements['delivery-status'].textContent === 'Notification permission: denied', 'denied test retained prior success');
+  assert(h.shown.length === 1, 'denied second test requested display');
+}
+// Recovery belongs to the failed entry, including within a partial batch.
+for (const partial of [false, true]) {
+  let recoverSecond = false;
+  const h = createHarness({ permission: 'granted',
+    entries: [notification(1, 'alice', 'retry-one'), ...(partial ? [
+      notification(2, 'alice', 'retry-two'), notification(3, 'alice', 'success-three'),
+    ] : [])],
+    onShow: (entry, attempt) => {
+      if (entry.id === 1 && attempt === 1) { throw new Error('temporary failure'); }
+      if (partial && entry.id === 2 && !recoverSecond) { throw new Error('still unresolved'); }
+    },
+  });
+  h.activate();
+  await settle();
+  assert(h.elements['delivery-status'].textContent.includes('temporary failure'), 'later success hid first failure');
+  await h.poll();
+  if (partial) {
+    assert(h.elements['delivery-status'].textContent.includes('still unresolved'), 'first recovery hid unresolved second entry');
+    await h.poll();
+    assert(h.requests.at(-1).includes('after=1'), 'cursor passed unresolved second entry');
+    recoverSecond = true;
+    await h.poll();
+  }
+  await h.poll();
+  assert(h.elements['delivery-status'].textContent === '', 'accepted retry retained delivery error');
+  assert(h.requests.at(-1).includes(partial ? 'after=3' : 'after=1'), 'recovered cursor did not advance');
+  await h.elements.test.listeners.click();
+  const guidance = h.elements['delivery-status'].textContent;
+  h.entries.push(notification(partial ? 4 : 2, 'alice', 'unrelated success'));
+  await h.poll();
+  await h.poll();
+  assert(h.elements['delivery-status'].textContent === guidance, 'unrelated or empty poll erased test guidance');
+}
+console.log('attempt feedback and per-entry retry recovery validated');
+// Consumed denied entries cannot retry; origin-wide grants retire their warnings.
+for (const grantFlow of ['enable', 'permission-change', 'test', 'test-request']) {
+  const h = createHarness({ permission: 'denied', entries: [notification(1, 'alice', 'blocked old entry')] });
+  h.activate(); await settle(); await h.poll();
+  assert(h.requests.at(-1).includes('after=1'), 'denied entry was not consumed');
+  assert(h.elements['delivery-status'].textContent.includes('blocked'), 'denied warning missing');
+  h.elements.recipient.value = 'bob'; h.elements.recipient.listeners.change(); await settle();
+  if (grantFlow === 'test-request') { h.setPermission('default'); } else { h.grant(); }
+  if (grantFlow === 'permission-change') { h.permissionChange(); }
+  else { await h.elements[grantFlow === 'test-request' ? 'test' : grantFlow].listeners.click(); }
+  await settle();
+  h.elements.recipient.value = 'alice'; h.elements.recipient.listeners.change(); await settle();
+  h.entries.push(notification(2, 'alice', 'new accepted entry'));
+  await h.poll(); await h.elements.test.listeners.click(); await h.poll();
+  assert(h.shown.length === (grantFlow.startsWith('test') ? 3 : 2), 'grant failed to deliver new entry and test');
+  assert(h.requests.at(-1).includes('after=2'), 'new entry cursor did not advance');
+  const guidance = h.elements['delivery-status'].textContent;
+  assert(guidance.includes('Test notification accepted'), 'consumed warning hid accepted test');
+  await h.poll();
+  assert(h.elements['delivery-status'].textContent === guidance, 'empty poll erased guidance');
+}
+// A grant must not clear a genuine unresolved display failure.
+{
+  const h = createHarness({ permission: 'granted', entries: [notification(1, 'alice', 'unresolved')],
+    onShow: (entry) => { if (entry.id === 1) { throw new Error('real display failure'); } } });
+  h.activate(); await settle();
+  await h.elements.enable.listeners.click(); await settle();
+  h.permissionChange(); await settle();
+  await h.elements.test.listeners.click(); await h.poll();
+  assert(h.elements['delivery-status'].textContent.includes('real display failure'), 'grant or test hid unresolved delivery');
+}
+console.log('consumed permission warnings retire across grant flows and recipients');
 console.log('VALIDATION OK');

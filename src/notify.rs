@@ -519,7 +519,7 @@ mod tests {
         assert!(html.contains("Click \"Enable notifications\""), "{html}");
         // Granting permission re-polls immediately instead of losing the batch.
         assert!(
-            html.contains("if (permission === 'granted') { await syncPush(false, true); poll(); }"),
+            html.contains("if (permission === 'granted') { permissionGranted(); await syncPush(false, true); poll(); }"),
             "{html}"
         );
         // Only a contiguous handled prefix may advance the cursor, so a later
@@ -556,8 +556,8 @@ mod tests {
         assert!(html.contains("notificationPermission"), "{html}");
         assert!(html.contains("getRegistrations()"), "{html}");
         assert!(html.contains("displayTest"), "{html}");
-        // A failed registration is the state the Android report showed, and
-        // `register()` swallows its error, so the report must carry it.
+        // Registration failures must remain available in diagnostics even
+        // though setup catches the error and polling continues.
         assert!(html.contains("serviceWorkerError"), "{html}");
         assert!(
             html.contains("serviceWorkerError = error.name + ': ' + error.message"),

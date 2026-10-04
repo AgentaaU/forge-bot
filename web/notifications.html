@@ -29,8 +29,8 @@ small {{ color: #666; }}
 Desktop browsers use the page directly. Mobile browsers require HTTPS and a
 service worker; on iOS 16.4+ add this page to the Home Screen first, then grant
 notification permission. Use <em>Send test notification</em> to confirm the
-browser can raise them, or <em>Run diagnostics</em> to upload the browser/OS
-state for debugging.</p>
+notification appears in your system notification shade, or <em>Run diagnostics</em>
+to upload browser state for debugging.</p>
 <p id="hint"><em>{empty_hint}</em></p>
 <div class="row">
 <label>Human <select id="recipient">{options}</select></label>
@@ -42,6 +42,17 @@ state for debugging.</p>
 {ca_cert_button}
 </div>
 <p><small id="status"></small></p>
+<p id="delivery-status" role="status"></p>
+<details>
+<summary>Notifications appear here but not in the system notification shade?</summary>
+<p>On Android, open <strong>Settings → Apps → your browser → Notifications</strong>.
+Allow notifications for the browser and this site's notification channel. If you
+installed this page as an app, also check that app's notification settings.
+Check Do Not Disturb and any battery restrictions, then send a test notification.</p>
+<p>Site permission and Android notification settings are separate. The browser
+can accept a notification while Android suppresses it; this page and its
+diagnostics cannot read or change those system settings.</p>
+</details>
 <pre id="diagnostics"></pre>
 <ul id="log"></ul>
 <script>

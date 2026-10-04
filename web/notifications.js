@@ -88,6 +88,39 @@ const displaying = {};
 
 function setStatus(text) { status.textContent = text; }
 
+// Keep delivery feedback separate from polling/subscription activity. Browsers
+// cannot observe whether Android actually surfaces an accepted notification.
+let deliveryGuidance = '';
+const deliveryFailures = {};
+const deliveryWarnings = {};
+let permissionGuidance = false;
+function refreshDeliveryStatus() {
+  const failures = deliveryFailures[recipientSelect.value];
+  document.getElementById('delivery-status').textContent =
+    failures && failures.size ? failures.values().next().value.text
+      : (deliveryWarnings[recipientSelect.value] || {}).text || deliveryGuidance;
+}
+function setDeliveryStatus(text, permissionWarning = false) {
+  permissionGuidance = permissionWarning;
+  deliveryGuidance = text;
+  refreshDeliveryStatus();
+}
+
+// Permission is origin-wide. Retire warnings for every recipient, including
+// consumed denied entries, but keep real display errors until their retry succeeds.
+function permissionGranted() {
+  for (const recipient of Object.keys(deliveryWarnings)) {
+    if (deliveryWarnings[recipient].permission) { delete deliveryWarnings[recipient]; }
+  }
+  for (const failures of Object.values(deliveryFailures)) {
+    for (const [id, feedback] of failures) {
+      if (feedback.permission) { failures.delete(id); }
+    }
+  }
+  if (permissionGuidance) { deliveryGuidance = ''; permissionGuidance = false; }
+  refreshDeliveryStatus();
+}
+
 async function setupServiceWorker() {
   // Required on Android and iOS, whose browsers throw on `new Notification`.
   // Registration only succeeds in a secure context (HTTPS, or localhost).
@@ -137,19 +170,19 @@ function activeRegistration(pending) {
 
 async function enable() {
   if (!('Notification' in window)) {
-    setStatus('This browser has no Notification API. On mobile, serve over HTTPS and add the page to the Home Screen.');
+    setDeliveryStatus('This browser has no Notification API. On mobile, serve over HTTPS and add the page to the Home Screen.');
     return;
   }
   if (!window.isSecureContext) {
-    setStatus('Browser notifications require HTTPS; open this page over a secure connection.');
+    setDeliveryStatus('Browser notifications require HTTPS; open this page over a secure connection.');
     return;
   }
   const permission = await Notification.requestPermission();
-  setStatus('Notification permission: ' + permission);
+  setDeliveryStatus('Notification permission: ' + permission, true);
   // Permission often arrives after earlier polls already fetched the batch;
   // poll again now so those entries are delivered instead of waiting five
   // seconds (or being lost if the cursor had advanced).
-  if (permission === 'granted') { await syncPush(false, true); poll(); }
+  if (permission === 'granted') { permissionGranted(); await syncPush(false, true); poll(); }
 }
 
 // Deliver a synthetic notification on demand. This lets a person confirm that
@@ -157,23 +190,26 @@ async function enable() {
 // error if it cannot) without waiting for the next real request.
 async function testNotification() {
   if (typeof Notification === 'undefined') {
-    setStatus('This browser has no Notification API.');
+    setDeliveryStatus('This browser has no Notification API.');
     return;
   }
   if (Notification.permission !== 'granted') {
     const permission = await Notification.requestPermission();
     if (permission !== 'granted') {
-      setStatus('Notification permission: ' + permission);
+      setDeliveryStatus('Notification permission: ' + permission, true);
       return;
     }
   }
+  permissionGranted();
   const result = await display({
     id: 0,
     repository: 'forge-bot test',
     message: 'This is a test notification from forge-bot.',
     location: location.href,
   });
-  if (result.raised) { setStatus('Test notification sent.'); }
+  if (result.raised) {
+    setDeliveryStatus('Test notification accepted by the browser. Check your system notification shade. If it is missing, check the notification settings below.');
+  }
 }
 
 function serializeDelivered() {
@@ -184,8 +220,8 @@ function serializeDelivered() {
   return out;
 }
 
-// Collect the browser/OS state that decides whether Android can show a
-// notification. The page uploads this to `/notifications/diagnostics` so the
+// Collect browser state relevant to notification delivery. Android system
+// permissions and notification channels are not exposed to this page. The page uploads this to `/notifications/diagnostics` so the
 // operator can read it even when the notification never appears.
 async function collectDiagnostics() {
   const report = {
@@ -206,6 +242,8 @@ async function collectDiagnostics() {
     ready: null,
     permissionState: null,
     displayTest: null,
+    notificationDeliveryPath: pushConfig && pushConfig.transport === 'web_push'
+      ? 'worker-receipts' : 'direct-showNotification',
     generation: generation,
     cursors: cursors,
     delivered: serializeDelivered(),
@@ -299,8 +337,8 @@ async function runDiagnostics() {
   }
 }
 
-// Both transports use the worker's receipt store. Only a display acknowledgement
-// (or a receipt from an earlier successful display) lets polling consume an entry.
+// Web Push and its polling fallback share receipts to avoid duplicate delivery.
+// Polling-only mode uses the original direct showNotification path below.
 function displayThroughWorker(notification) {
   return new Promise(function (resolve, reject) {
     const channel = new MessageChannel();
@@ -325,18 +363,22 @@ function displayThroughWorker(notification) {
 }
 
 // Display one entry. Resolves to `{ handled, raised }`: `handled` means the
-// entry may be consumed (shown, blocked, or impossible to show) so the cursor
-// can advance, while `raised` means the OS was actually asked to show it.
-async function display(notification) {
-  if (typeof Notification === 'undefined') { return { handled: true, raised: false }; }
+// entry may be consumed (accepted, blocked, or impossible to show) so the
+// cursor can advance. `raised` means the browser accepted the request; the
+// page cannot verify whether the OS surfaced it.
+async function display(notification, report = setDeliveryStatus) {
+  if (typeof Notification === 'undefined') {
+    report('This browser has no Notification API; showing notifications on the page only.');
+    return { handled: true, raised: false };
+  }
   const permission = Notification.permission;
   if (permission === 'denied') {
     // The user blocked this origin; the log below is all we can offer.
-    setStatus('Browser notifications are blocked for this site; showing them on the page only.');
+    report('Browser notifications are blocked for this site; showing them on the page only.', true);
     return { handled: true, raised: false };
   }
   if (permission !== 'granted') {
-    setStatus('Click "Enable notifications" to receive browser notifications.');
+    report('Click "Enable notifications" to receive browser notifications.', true);
     return { handled: false, raised: false };
   }
   const title = 'forge-bot: ' + notification.repository;
@@ -352,7 +394,12 @@ async function display(notification) {
   };
   if (registration && typeof registration.showNotification === 'function') {
     try {
-      if (registration.active && typeof registration.active.postMessage === 'function' &&
+      // Receipt deduplication is needed only when push can race with polling.
+      // Keep polling-only delivery on the previously working Android path,
+      // without consulting receipts from an earlier session. Tests also bypass
+      // receipts so each click makes a fresh display request.
+      if (pushConfig && pushConfig.transport === 'web_push' && notification.id &&
+          registration.active && typeof registration.active.postMessage === 'function' &&
           typeof MessageChannel !== 'undefined') {
         await displayThroughWorker(notification);
       } else {
@@ -362,7 +409,7 @@ async function display(notification) {
     } catch (error) {
       // Android rejects `new Notification` and can reject `showNotification`
       // while the worker is settling; retry rather than consume the entry.
-      setStatus('Could not show a notification: ' + error.message);
+      report('Could not show a notification: ' + error.message);
       return { handled: false, raised: false };
     }
   }
@@ -373,7 +420,7 @@ async function display(notification) {
     // No service worker and no usable constructor: keep the log entry and
     // advance so the same batch is not fetched forever, but report honestly
     // that nothing was raised (the mobile constructor throws).
-    setStatus('This browser cannot raise system notifications; showing them on the page only.');
+    report('This browser cannot raise system notifications; showing them on the page only.');
     return { handled: true, raised: false };
   }
 }
@@ -434,10 +481,25 @@ async function handle(recipient, notification) {
   const inFlight = displayingFor(recipient);
   let pending = inFlight.get(notification.id);
   if (!pending) {
-    pending = display(notification).then(
+    const displayGeneration = generation;
+    const failures = deliveryFailures[recipient] || (deliveryFailures[recipient] = new Map());
+    let feedback = null;
+    pending = display(notification, function (text, permission = false) { feedback = { text, permission }; }).then(
       function (result) {
         inFlight.delete(notification.id);
         if (result.handled) { deliveredSet.add(notification.id); }
+        // Only this entry's acceptance resolves its feedback. A later success
+        // must not hide an earlier failure, nor erase synthetic test guidance.
+        if (generation === displayGeneration) {
+          if (result.raised) { failures.delete(notification.id); }
+          else if (feedback) {
+            if (result.handled) {
+              failures.delete(notification.id);
+              deliveryWarnings[recipient] = feedback;
+            } else { failures.set(notification.id, feedback); }
+          }
+          if (recipientSelect.value === recipient) { refreshDeliveryStatus(); }
+        }
         return result.handled;
       },
       function (error) {
@@ -473,6 +535,9 @@ async function poll() {
       for (const key of Object.keys(cursors)) { delete cursors[key]; }
       for (const key of Object.keys(delivered)) { delete delivered[key]; }
       for (const key of Object.keys(displaying)) { delete displaying[key]; }
+      for (const key of Object.keys(deliveryFailures)) { delete deliveryFailures[key]; }
+      for (const key of Object.keys(deliveryWarnings)) { delete deliveryWarnings[key]; }
+      refreshDeliveryStatus();
       log.textContent = '';
       rendered.clear();
     }
@@ -508,6 +573,7 @@ recipientSelect.addEventListener('change', function () {
   // this recipient's log with its own cursor.
   try { window.localStorage.setItem('forge-bot-recipient', recipientSelect.value); } catch (_) {}
   requestSeq++;
+  refreshDeliveryStatus();
   log.textContent = '';
   rendered.clear();
   syncPush().then(poll);
@@ -522,7 +588,7 @@ document.getElementById('refresh').addEventListener('click', poll);
 if (navigator.permissions && navigator.permissions.query) {
   navigator.permissions.query({ name: 'notifications' }).then(function (state) {
     state.onchange = function () {
-      if (state.state === 'granted') { poll(); }
+      if (state.state === 'granted') { permissionGranted(); poll(); }
     };
   }).catch(function () {});
 }

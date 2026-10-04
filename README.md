@@ -483,16 +483,22 @@ and the page shows a **Download CA certificate** link
 rendered when the file exists.
 
 On Android 13+ the site permission is separate from Chrome's own OS-level
-notification permission. If the page reports "Test notification sent." but no
+notification permission. If the page reports "Test notification accepted by the browser" but no
 notification appears, enable Android **Settings → Apps → Chrome →
-Notifications** and check Do Not Disturb / battery restrictions; `notify()` is
-allowed to resolve even when the platform drops the notification.
+Notifications** and check Do Not Disturb / battery restrictions; `showNotification()` can
+resolve even when the platform drops the notification.
 
 The page's **Run diagnostics** button re-checks the same state
 (`isSecureContext`, `Notification.permission`, the Permissions API, the service
 worker registrations/controller and a live `showNotification` result) and
-uploads the report to `GET /notifications/diagnostics`, so the browser/OS state
-can be inspected without a remote debugger.
+uploads the report with `POST /notifications/diagnostics`; operators can read it
+with `GET /notifications/diagnostics`. These checks cover browser state, not
+Android notification permissions or channels. The page keeps delivery feedback
+separate from polling status and provides Android settings instructions below
+the controls. Polling-only mode calls `registration.showNotification` directly;
+Web Push and its polling fallback share worker receipts to avoid duplicate
+delivery. Diagnostics report which path is selected, and test notifications
+always make a fresh direct display request.
 
 The cursors are kept per human account, so switching accounts does not hide a
 recipient's pending notifications, and a server restart is detected through a
