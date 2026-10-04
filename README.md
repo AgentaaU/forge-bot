@@ -602,3 +602,10 @@ Measurements that informed the design live under [`doc/`](doc/):
 - [`doc/kvcache-hit-rate.md`](doc/kvcache-hit-rate.md) — prompt/KV cache hit
   rate of the Codex and Pi sessions forge-bot invokes, with the reproducer
   [`contrib/analyze-kvcache.py`](contrib/analyze-kvcache.py).
+
+## Introducing forge-bot
+
+Recommendation posts for sharing the project:
+
+- [English](doc/posts/recommend-forge-bot.en.md)
+- [简体中文](doc/posts/recommend-forge-bot.zh-CN.md)
