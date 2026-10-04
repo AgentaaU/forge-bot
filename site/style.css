@@ -55,6 +55,8 @@ p {
   justify-content: space-between;
   align-items: center;
   padding-block: 28px;
+  flex-wrap: wrap;
+  gap: 16px;
   border-bottom: 1px solid var(--line);
 }
 .brand {
@@ -77,6 +79,8 @@ p {
 .nav nav {
   display: flex;
   gap: 30px;
+  flex-wrap: wrap;
+  align-items: center;
   font-size: 14px;
   font-weight: 600;
 }
@@ -483,4 +487,20 @@ footer .brand {
   h1 {
     font-size: 46px;
   }
+}
+
+.language-switch {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+html:lang(zh) h1 {
+  font-size: clamp(36px, 5vw, 64px);
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+html:lang(zh) h2,
+html:lang(zh) h3 {
+  letter-spacing: 0;
 }

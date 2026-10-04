@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="forge-bot 将 Forgejo、GitHub 和 GitLab 中议题及拉取请求里的提及转为编程智能体任务。"
+    />
+    <meta name="theme-color" content="#111b19" />
+    <title>forge-bot — 从提及到行动</title>
+    <link rel="alternate" hreflang="en" href="./" />
+    <link rel="alternate" hreflang="zh-CN" href="./zh.html" />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">跳转到正文</a>
+    <header class="wrap nav">
+      <a class="brand" href="./zh.html"
+        ><span class="mark" aria-hidden="true">f.</span> forge-bot</a
+      >
+      <nav aria-label="主导航">
+        <a href="#how-it-works">工作原理</a>
+        <a href="#quick-start">快速开始</a>
+        <a href="https://github.com/AgentaaU/forge-bot"
+          >源码 <span aria-hidden="true">↗</span></a
+        >
+        <a
+          class="language-switch"
+          href="./"
+          lang="en"
+          hreflang="en"
+          aria-label="Switch to English"
+          >English</a
+        >
+      </nav>
+    </header>
+    <main id="main">
+      <section class="wrap hero" aria-labelledby="headline">
+        <div>
+          <p class="eyebrow">你的代码平台，你的智能体。</p>
+          <h1 id="headline">从一次提及<br />到 <em>实际行动。</em></h1>
+          <p class="lede">
+            将议题或拉取请求中的评论转为编程智能体任务。让智能体调查问题、修改代码、运行测试，并回到任务发起的地方回复。
+          </p>
+          <div class="actions">
+            <a class="button" href="#quick-start"
+              >立即开始 <span aria-hidden="true">→</span></a
+            ><a
+              class="text-link"
+              href="https://github.com/AgentaaU/forge-bot/blob/main/README.md"
+              >阅读文档</a
+            >
+          </div>
+          <p class="compat">
+            Forgejo · GitHub · GitLab <span>/</span> 使用 Rust 构建
+          </p>
+        </div>
+        <div class="conversation" aria-label="议题对话示例">
+          <div class="window-bar">
+            <span class="dot"></span><span class="dot"></span
+            ><span class="dot"></span><span>议题 / 修复失败的测试</span>
+          </div>
+          <div class="comment">
+            <span class="avatar">Y</span>
+            <div>
+              <p class="comment-author">你 <span>刚刚</span></p>
+              <p><strong>@agent</strong> 调查这次测试失败并修复它</p>
+            </div>
+          </div>
+          <div class="route">
+            <span>提及</span><span aria-hidden="true">→</span><span>网关</span
+            ><span aria-hidden="true">→</span><span>智能体</span>
+          </div>
+          <div class="comment">
+            <span class="avatar bot">f.</span>
+            <div>
+              <p class="comment-author">forge-bot <span>处理中</span></p>
+              <p>接下来交给智能体。</p>
+              <ul class="steps">
+                <li>查看对话和代码仓库</li>
+                <li>修改代码并运行检查</li>
+                <li>推送改动并在代码平台回复</li>
+              </ul>
+            </div>
+          </div>
+          <div class="window-footer">同一段对话，上下文持续保留。</div>
+        </div>
+      </section>
+      <section class="band" id="how-it-works" aria-labelledby="workflow-title">
+        <div class="wrap">
+          <p class="eyebrow">轻量网关，职责清晰</p>
+          <h2 id="workflow-title">你的评论就是起点。</h2>
+          <div class="grid three">
+            <article>
+              <span class="number">01 / 连接</span>
+              <h3>在工作发生的地方接入</h3>
+              <p>
+                接收来自 Forgejo、GitHub 或 GitLab 的签名 Webhook。无法创建
+                Webhook 时，也可以使用轮询接入。
+              </p>
+            </article>
+            <article>
+              <span class="number">02 / 路由</span>
+              <h3>将提及转为请求</h3>
+              <p>
+                网关验证事件，检查用户和仓库权限，并将来源 URL
+                和消息传给智能体。
+              </p>
+            </article>
+            <article>
+              <span class="number">03 / 执行</span>
+              <h3>智能体负责完成任务</h3>
+              <p>
+                智能体读取上下文、编辑检出的代码、验证改动，并在代码平台回复。网关不负责构建智能体的上下文。
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+      <section class="wrap capabilities" aria-labelledby="capabilities-title">
+        <div>
+          <p class="eyebrow">选择你的工具链</p>
+          <h2 id="capabilities-title">不同的智能体，<br />同一个入口。</h2>
+          <p class="lede small">
+            使用 Codex、Pi、Claude Code、Antigravity CLI、Kimi
+            或配置的自定义智能体。模型选择遵循适配器的默认设置，除非你明确配置或指定模型。
+          </p>
+          <a
+            class="text-link"
+            href="https://github.com/AgentaaU/forge-bot/blob/main/config.example.toml"
+            >查看配置 <span aria-hidden="true">↗</span></a
+          >
+        </div>
+        <div class="feature-list">
+          <article>
+            <h3>让对话持续进行</h3>
+            <p>
+              每个讨论串的会话都会保留上下文。支持此功能的适配器可在运行中接收后续消息；其他适配器则将下一轮消息加入队列。
+            </p>
+          </article>
+          <article>
+            <h3>了解任务进展</h3>
+            <p>
+              通过网页状态、运行详情和实时输出查看正在运行及排队中的任务。对用户的提及可以触发浏览器通知。
+            </p>
+          </article>
+          <article>
+            <h3>控制谁能运行哪些任务</h3>
+            <p>
+              通过用户和仓库策略控制请求权限。配置的智能体用户通过 cgroup
+              执行器，以独立的 Linux 账户运行。
+            </p>
+          </article>
+        </div>
+      </section>
+      <section
+        class="wrap start"
+        id="quick-start"
+        aria-labelledby="start-title"
+      >
+        <div>
+          <p class="eyebrow">从检出代码开始</p>
+          <h2 id="start-title">让下一个议题<br />拥有一个智能体。</h2>
+          <p>
+            构建二进制程序，配置代码平台和智能体用户，然后验证设置。你需要
+            Rust、支持 cgroup v2 的 Linux
+            主机、代码平台令牌，以及已完成身份验证的智能体 CLI。
+          </p>
+          <a
+            class="button"
+            href="https://github.com/AgentaaU/forge-bot/blob/main/deploy.md"
+            >部署指南 <span aria-hidden="true">↗</span></a
+          >
+        </div>
+        <div class="terminal">
+          <div class="terminal-label">终端 / 快速开始</div>
+          <pre
+            tabindex="0"
+            role="region"
+            aria-label="快速开始命令"
+          ><code>git clone https://github.com/AgentaaU/forge-bot.git
+cd forge-bot
+cargo build --release
+
+cp config.example.toml forge-bot.toml
+$EDITOR forge-bot.toml
+
+# 启动服务前验证配置
+cargo run -- check
+cargo run -- serve</code></pre>
+          <p>
+            至少配置一个智能体用户，并指定且仅指定一个默认用户。服务安装、凭据和
+            Webhook 设置请参阅部署指南。
+          </p>
+        </div>
+      </section>
+      <section class="wrap resources" aria-labelledby="resources-title">
+        <h2 id="resources-title">进一步了解。</h2>
+        <div class="grid three">
+          <a href="https://github.com/AgentaaU/forge-bot/blob/main/README.md"
+            ><h3>文档 <span aria-hidden="true">↗</span></h3>
+            <p>架构、适配器、策略和开发。</p></a
+          ><a
+            href="https://github.com/AgentaaU/forge-bot/blob/main/doc/forgejo-webhook.md"
+            ><h3>Webhook 设置 <span aria-hidden="true">↗</span></h3>
+            <p>事件、签名、权限范围和验证。</p></a
+          ><a href="https://forgejo.shylockhg.me/shylock/forge-bot/issues"
+            ><h3>参与项目 <span aria-hidden="true">↗</span></h3>
+            <p>报告问题，或参与规划下一次改进。</p></a
+          >
+        </div>
+      </section>
+    </main>
+    <footer class="wrap">
+      <a class="brand" href="./zh.html">forge-bot</a>
+      <p>面向编程智能体、支持多种代码平台的网关。</p>
+      <a href="https://forgejo.shylockhg.me/shylock/forge-bot"
+        >Forgejo 源码 <span aria-hidden="true">↗</span></a
+      >
+    </footer>
+  </body>
+</html>

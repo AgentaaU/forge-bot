@@ -12,6 +12,15 @@ python3 -m http.server 8000 --directory site
 # Open http://localhost:8000
 ```
 
+## Languages
+
+`index.html` is the English page and `zh.html` is the Simplified Chinese page.
+Each navigation bar links to the other language without requiring JavaScript.
+Both pages share `style.css` and use relative language links so switching also
+works under a GitHub Pages project subpath. Keep both pages in sync when
+changing content, including titles, descriptions, and accessibility labels.
+The documentation links currently point to the existing English documentation.
+
 ## Publishing on GitHub Pages
 
 The GitHub mirror referenced by the project docs is `AgentaaU/forge-bot`.
