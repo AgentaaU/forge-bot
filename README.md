@@ -21,6 +21,12 @@ Forge → webhook → gateway → (location URL, message) → agent → does eve
 The gateway never builds context for the agent. It hands it a location and a
 message; the agent decides what to look at.
 
+## Project page
+
+The standalone project landing page lives in [`site/`](site/README.md), with
+a GitHub Pages deployment workflow for the GitHub mirror. See the site guide
+for local preview and publishing setup.
+
 ## How it works
 
 ```text
