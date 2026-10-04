@@ -3,7 +3,7 @@
 测试失败了，线索在 Issue 里；修复方案正在讨论，代码和意见都在 PR 里。
 想请编程智能体帮忙，却还要打开另一个聊天窗口，再复制一遍背景？
 
-[forge-bot](https://forgejo.shylockhg.me/shylock/forge-bot) 提供了一个直接的入口：
+[forge-bot](https://github.com/AgentaaU/forge-bot) 提供了一个直接的入口：
 在 Issue 或 PR 的评论里提及配置好的机器人账号，说明任务，就能启动编程智能体。
 智能体可以读取仓库和讨论、修改代码、执行检查、推送分支，并在原来的讨论中回复结果。
 具体能完成哪些操作，取决于它使用的工具和获得的权限。
@@ -63,9 +63,9 @@ Linux 用户、工作目录和会话。提交或更新 PR 后，forge-bot 会指
 
 ## 从一个具体的小任务开始
 
-先阅读项目的 [README](https://forgejo.shylockhg.me/shylock/forge-bot/src/branch/main/README.md)、
-[配置示例](https://forgejo.shylockhg.me/shylock/forge-bot/src/branch/main/config.example.toml)
-和[部署指南](https://forgejo.shylockhg.me/shylock/forge-bot/src/branch/main/deploy.md)。
+先阅读项目的 [README](https://github.com/AgentaaU/forge-bot)、
+[配置示例](https://github.com/AgentaaU/forge-bot)
+和[部署指南](https://github.com/AgentaaU/forge-bot)。
 配置智能体账号和授权策略，完成智能体 CLI 的认证，再接入带签名验证的 webhook。
 如果没有创建 webhook 的权限，也可以使用轮询方式接入。
 

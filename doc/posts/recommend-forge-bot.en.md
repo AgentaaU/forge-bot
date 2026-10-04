@@ -4,7 +4,7 @@ A failing test has an issue. A proposed fix has a pull request. The discussion,
 logs, and review comments are already there. Why move the task into another chat
 window just to ask a coding agent for help?
 
-[forge-bot](https://forgejo.shylockhg.me/shylock/forge-bot) lets you start that work
+[forge-bot](https://github.com/AgentaaU/forge-bot) lets you start that work
 from the conversation itself. Mention the configured bot account in an issue or
 pull-request comment, describe the task, and the bot dispatches a coding agent.
 The agent can inspect the repository and forge discussion, change code, run
@@ -77,9 +77,9 @@ repositories, scoped forge tokens, and protected status and admin routes.
 
 ## Give it a concrete first task
 
-Start with the project's [README](https://forgejo.shylockhg.me/shylock/forge-bot/src/branch/main/README.md),
-[example configuration](https://forgejo.shylockhg.me/shylock/forge-bot/src/branch/main/config.example.toml),
-and [deployment guide](https://forgejo.shylockhg.me/shylock/forge-bot/src/branch/main/deploy.md).
+Start with the project's [README](https://github.com/AgentaaU/forge-bot),
+[example configuration](https://github.com/AgentaaU/forge-bot),
+and [deployment guide](https://github.com/AgentaaU/forge-bot).
 Configure an agent account and authorization policy, authenticate the agent
 CLI, and connect signed webhooks. Polling is also available when you cannot
 create a webhook.
