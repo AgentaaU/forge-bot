@@ -67,7 +67,7 @@ impl UserRuntime {
     /// The trailing boundary prevents `@bot` from capturing `@bot-reviewer`,
     /// and the leading boundary keeps email-like `user@bot` text from matching.
     pub fn is_mentioned(&self, body: &str) -> bool {
-        mention_login(body, &self.login)
+        mention_login(&crate::mention::strip_code(body), &self.login)
     }
 }
 
@@ -345,6 +345,28 @@ mod tests {
         assert_eq!(
             identities.recipient("@shylock-bot do it").unwrap().id,
             "bot"
+        );
+    }
+
+    #[test]
+    fn quoted_mentions_do_not_make_a_comment_ambiguous() {
+        let config = config_with_users(&[
+            ("shylock-bot", UserRole::Default, "agent"),
+            ("shylock-reviewer", UserRole::Reviewer, "reviewer"),
+        ]);
+        let identities = Identities::resolve(&config, &names()).unwrap();
+        let body = "@shylock-reviewer review the head `b8affa0`; the dry run renders \
+                    `@shylock-bot` with no `--agent`";
+        assert_eq!(identities.matching_users(body).len(), 1);
+        assert_eq!(
+            identities.recipient(body).unwrap().login,
+            "shylock-reviewer"
+        );
+        // A genuine two-user mention is still ambiguous.
+        assert!(
+            identities
+                .recipient("@shylock-bot and @shylock-reviewer")
+                .is_err()
         );
     }
 

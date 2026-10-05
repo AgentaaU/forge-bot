@@ -617,6 +617,170 @@ async fn explicit_users_route_by_login() {
     );
 }
 
+/// A harness with two configured agent users so mention routing can be
+/// exercised against ambiguous and quoted comments.
+fn two_user_routing_harness(dir: &std::path::Path) -> Harness {
+    harness_with(dir, |config| {
+        config.users.clear();
+        config.policy.allow_all = false;
+        config.policy.allowed_users = vec!["shylock".into()];
+        config.policy.allowed_repos = vec!["shylock/forge-bot".into()];
+        let user = |role, host: &str| UserConfig {
+            role,
+            host_user: host.into(),
+            agent: None,
+            agent_model: None,
+            token: None,
+        };
+        config
+            .users
+            .insert("shylock-bot".into(), user(UserRole::Default, "agent"));
+        config.users.insert(
+            "shylock-reviewer".into(),
+            user(UserRole::Reviewer, "reviewer"),
+        );
+    })
+}
+
+#[tokio::test]
+async fn quoted_agent_mention_does_not_block_routing() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = two_user_routing_harness(dir.path());
+
+    // Regression for issue #196: the quoted `@shylock-bot` in the report must
+    // not make the comment look like it addresses two configured users.
+    let payload = PAYLOAD.replace("\"id\": 77", "\"id\": 208").replace(
+        "@shylock-bot --agent=custom please do the thing",
+        "@shylock-reviewer please review `b8affa0`; the dry run renders `@shylock-bot` too",
+    );
+    assert_eq!(accepted(&harness.app, "issue_comment", &payload).await, 1);
+
+    wait_for_jobs(&harness.sessions).await;
+    let reviewer = harness
+        .sessions
+        .get("user:shylock-reviewer:forgejo:shylock/forge-bot:issue:1")
+        .expect("reviewer session should exist");
+    assert_eq!(reviewer.runs.len(), 1);
+}
+
+/// A comment whose inline backtick runs have unequal lengths is not a code
+/// span, so both mentions are addressed and the ambiguous comment is rejected.
+#[tokio::test]
+async fn unequal_inline_backtick_runs_keep_both_mentions() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = two_user_routing_harness(dir.path());
+
+    let payload = PAYLOAD.replace("\"id\": 77", "\"id\": 209").replace(
+        "@shylock-bot --agent=custom please do the thing",
+        "@shylock-reviewer review `literal @shylock-bot please``now",
+    );
+    assert_eq!(accepted(&harness.app, "issue_comment", &payload).await, 0);
+}
+
+/// A code span may cross a line break inside a paragraph, so the quoted
+/// `@shylock-bot` must not be routed even though it is on its own line.
+#[tokio::test]
+async fn inline_code_span_crossing_a_line_hides_the_mention() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = two_user_routing_harness(dir.path());
+
+    let payload = PAYLOAD.replace("\"id\": 77", "\"id\": 210").replace(
+        "@shylock-bot --agent=custom please do the thing",
+        "@shylock-reviewer review `quoted\\n@shylock-bot`",
+    );
+    assert_eq!(accepted(&harness.app, "issue_comment", &payload).await, 1);
+
+    wait_for_jobs(&harness.sessions).await;
+    let reviewer = harness
+        .sessions
+        .get("user:shylock-reviewer:forgejo:shylock/forge-bot:issue:1")
+        .expect("reviewer session should exist");
+    assert_eq!(reviewer.runs.len(), 1);
+}
+
+/// A fenced block only closes on a run of the same length as its opener, and
+/// only when nothing but whitespace follows it.
+#[tokio::test]
+async fn fence_closer_must_match_the_opening_run() {
+    for (id, body) in [
+        (
+            211,
+            "@shylock-reviewer review\\n````\\n```\\n@shylock-bot\\n````",
+        ),
+        (
+            212,
+            "@shylock-reviewer review\\n```\\n```example\\n@shylock-bot\\n```",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = two_user_routing_harness(dir.path());
+        let payload = PAYLOAD
+            .replace("\"id\": 77", &format!("\"id\": {id}"))
+            .replace("@shylock-bot --agent=custom please do the thing", body);
+        assert_eq!(accepted(&harness.app, "issue_comment", &payload).await, 1);
+
+        wait_for_jobs(&harness.sessions).await;
+        let reviewer = harness
+            .sessions
+            .get("user:shylock-reviewer:forgejo:shylock/forge-bot:issue:1")
+            .expect("reviewer session should exist");
+        assert_eq!(reviewer.runs.len(), 1);
+    }
+}
+
+/// A backtick fence's info string cannot contain backticks and top-level
+/// fences are indented at most three spaces; otherwise the rest of the
+/// comment must still be routed.
+#[tokio::test]
+async fn invalid_fence_openers_do_not_drop_the_request() {
+    for (id, body) in [
+        (213, r"```@shylock-bot```\n@shylock-reviewer review"),
+        (214, r"    ```\n@shylock-reviewer review"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = two_user_routing_harness(dir.path());
+        let payload = PAYLOAD
+            .replace("\"id\": 77", &format!("\"id\": {id}"))
+            .replace("@shylock-bot --agent=custom please do the thing", body);
+        assert_eq!(accepted(&harness.app, "issue_comment", &payload).await, 1);
+
+        wait_for_jobs(&harness.sessions).await;
+        let reviewer = harness
+            .sessions
+            .get("user:shylock-reviewer:forgejo:shylock/forge-bot:issue:1")
+            .expect("reviewer session should exist");
+        assert_eq!(reviewer.runs.len(), 1);
+    }
+}
+
+/// Escaped backticks do not delimit code, so both configured users are
+/// addressed and the ambiguous comment is rejected.
+#[tokio::test]
+async fn escaped_backticks_keep_both_mentions_ambiguous() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = two_user_routing_harness(dir.path());
+
+    let payload = PAYLOAD.replace("\"id\": 77", "\"id\": 215").replace(
+        "@shylock-bot --agent=custom please do the thing",
+        r"@shylock-reviewer review \\`literal @shylock-bot please\\`",
+    );
+    assert_eq!(accepted(&harness.app, "issue_comment", &payload).await, 0);
+}
+
+/// A thematic break interrupts the paragraph, so the backticks do not pair and
+/// both mentions remain addressed, rejecting the ambiguous comment.
+#[tokio::test]
+async fn block_interrupt_stops_inline_span_routing() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = two_user_routing_harness(dir.path());
+
+    let payload = PAYLOAD.replace("\"id\": 77", "\"id\": 216").replace(
+        "@shylock-bot --agent=custom please do the thing",
+        r"@shylock-reviewer review `quoted\n***\n@shylock-bot please`",
+    );
+    assert_eq!(accepted(&harness.app, "issue_comment", &payload).await, 0);
+}
+
 #[tokio::test]
 async fn unqualified_mention_uses_first_agent_in_sequence() {
     let dir = tempfile::tempdir().unwrap();

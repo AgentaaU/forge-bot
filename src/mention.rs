@@ -4,6 +4,9 @@
 //! extraction is deliberately forge agnostic: it operates on a plain comment
 //! body and a configurable trigger string.
 
+use std::ops::Range;
+
+use pulldown_cmark::{Event, Options, Parser, Tag};
 use serde::{Deserialize, Serialize};
 
 /// The result of matching the configured trigger in a comment body.
@@ -119,6 +122,54 @@ fn matching_prefix_len(body: &str, lower_trigger: &str) -> Option<usize> {
     None
 }
 
+/// Return `body` with Markdown code spans and fenced blocks removed.
+///
+/// The forge does not linkify a login inside code, so a quoted `@user` in an
+/// agent's report is not an addressed recipient. Removing code before mention
+/// detection keeps such a quote from making an otherwise unambiguous comment
+/// look like it addresses several users (issue #196).
+///
+/// A CommonMark parser identifies the code ranges, so inline spans, indented
+/// blocks, fenced blocks, escapes, and paragraph interrupts follow the same
+/// rules the forge's renderer uses.
+pub fn strip_code(body: &str) -> String {
+    let mut ranges = code_ranges(body);
+    if ranges.is_empty() {
+        return body.to_owned();
+    }
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut out = String::with_capacity(body.len());
+    let mut cursor = 0;
+    for range in ranges {
+        // Code ranges do not nest, but skip any that start inside a span
+        // already removed.
+        if range.start < cursor {
+            continue;
+        }
+        out.push_str(&body[cursor..range.start]);
+        // Keep a separator so words on either side do not concatenate.
+        out.push(' ');
+        cursor = range.end;
+    }
+    out.push_str(&body[cursor..]);
+    out
+}
+
+/// The byte ranges of every inline code span and code block in `body`.
+fn code_ranges(body: &str) -> Vec<Range<usize>> {
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_GFM;
+    Parser::new_ext(body, options)
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Code(_) | Event::Start(Tag::CodeBlock(_)) => Some(range),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +275,104 @@ mod tests {
     fn matches_custom_trigger() {
         let m = extract_mention("@forge-bot build it", "@forge-bot").unwrap();
         assert_eq!(m.message, "build it");
+    }
+
+    #[test]
+    fn strips_inline_code_spans() {
+        let body = "review `@shylock-bot` / `@shylock-reviewer` now";
+        let stripped = strip_code(body);
+        assert!(!stripped.contains("@shylock-bot"));
+        assert!(!stripped.contains("@shylock-reviewer"));
+        assert!(stripped.contains("review"));
+        assert!(stripped.contains("now"));
+    }
+
+    #[test]
+    fn strips_fenced_code_blocks() {
+        let body = "@agent look\n```\n@other ping\n```\nafter";
+        let stripped = strip_code(body);
+        assert!(stripped.contains("@agent"));
+        assert!(!stripped.contains("@other"));
+        assert!(stripped.contains("after"));
+    }
+
+    #[test]
+    fn keeps_unmatched_backticks_and_multibyte_text() {
+        let stripped = strip_code("café ` open @user");
+        assert!(stripped.contains("café"));
+        assert!(stripped.contains("@user"));
+    }
+
+    #[test]
+    fn unequal_backtick_runs_stay_literal() {
+        // One opening backtick but a two-backtick "closer" is literal text in
+        // CommonMark, so both mentions remain visible to routing.
+        let stripped = strip_code("@a review `literal @b please``now");
+        assert!(stripped.contains("@a"));
+        assert!(stripped.contains("@b"));
+    }
+
+    #[test]
+    fn strips_inline_code_across_lines() {
+        // Forgejo renders a code span that spans the line break, hiding @b.
+        let stripped = strip_code("@a review `quoted\n@b`");
+        assert!(stripped.contains("@a"));
+        assert!(!stripped.contains("@b"));
+    }
+
+    #[test]
+    fn blank_line_ends_a_pending_inline_span() {
+        // A code span cannot cross a blank line, so @b is literal text.
+        let stripped = strip_code("@a review `quoted\n\n@b`");
+        assert!(stripped.contains("@a"));
+        assert!(stripped.contains("@b"));
+    }
+
+    #[test]
+    fn fence_closer_must_match_the_opening_run() {
+        // A shorter run is content, not a closer, so @b stays inside code.
+        let stripped = strip_code("@a review\n````\n```\n@b\n````");
+        assert!(stripped.contains("@a"));
+        assert!(!stripped.contains("@b"));
+
+        // A run followed by non-whitespace is content, not a closer.
+        let stripped = strip_code("@a review\n```\n```example\n@b\n```");
+        assert!(stripped.contains("@a"));
+        assert!(!stripped.contains("@b"));
+    }
+
+    #[test]
+    fn invalid_fence_openers_do_not_swallow_the_rest() {
+        // An info string may not contain backticks, so this is an inline code
+        // span followed by the reviewer mention.
+        let stripped = strip_code("```@b```\n@a review");
+        assert!(stripped.contains("@a"));
+        assert!(!stripped.contains("@b"));
+
+        // Four spaces of indentation start an indented code block, not a fence;
+        // the mention after it is a normal paragraph.
+        let stripped = strip_code("    ```\n@a review");
+        assert!(stripped.contains("@a"));
+    }
+
+    #[test]
+    fn escaped_backticks_are_not_code_delimiters() {
+        // Backslash escapes (and their parity) keep both mentions outside code.
+        let stripped = strip_code("@a review \\`literal @b please\\`");
+        assert!(stripped.contains("@a"));
+        assert!(stripped.contains("@b"));
+
+        // An even number of backslashes leaves the backtick unescaped.
+        let stripped = strip_code("@a review \\\\`@b`");
+        assert!(stripped.contains("@a"));
+        assert!(!stripped.contains("@b"));
+    }
+
+    #[test]
+    fn block_interrupts_stop_inline_spans() {
+        // A thematic break ends the paragraph, so the backticks do not pair.
+        let stripped = strip_code("@a review `quoted\n***\n@b please`");
+        assert!(stripped.contains("@a"));
+        assert!(stripped.contains("@b"));
     }
 }
