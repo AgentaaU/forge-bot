@@ -29,6 +29,26 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - name: Materialize local video fallback
+        # The MP4 is CDN-hosted and intentionally not committed to Git. The
+        # published pages keep a local <source>, so fetch the primary URL and
+        # fail the deploy rather than publish a broken fallback. Download to a
+        # temporary file and install it only after a complete transfer.
+        run: |
+          set -eu
+          video_url=$(sed -n 's/.*<source src="\(https:\/\/forge-bot-cdn[^"]*\.mp4\)".*/\1/p' site/index.html | head -n1)
+          if [ -z "$video_url" ]; then
+            echo "::error::No CDN video URL found in site/index.html."
+            exit 1
+          fi
+          mkdir -p site/media
+          tmp=$(mktemp)
+          trap 'rm -f "$tmp"' EXIT
+          curl -fsSL --retry 3 "$video_url" -o "$tmp"
+          test -s "$tmp"
+          install -m 644 "$tmp" site/media/startup.mp4
+          test -s site/media/startup.mp4
+          echo "Fetched $video_url into site/media/startup.mp4"
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:

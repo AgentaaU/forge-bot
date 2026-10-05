@@ -96,26 +96,36 @@
       </section>
       <section class="wrap intro" aria-labelledby="intro-title">
         <h2 id="intro-title">From comment to working code</h2>
-        <p>Watch the 24-second introduction. Silent, with English on-screen text.</p>
-        <video controls playsinline preload="none" width="1280" height="720"
+        <p>Watch the 24-second product walkthrough. Silent, with English on-screen text.</p>
+        <video controls playsinline preload="none" width="1920" height="1080"
           poster="./media/startup-poster.webp" aria-label="Project introduction"
           aria-describedby="intro-transcript">
-          <source src="https://cdn.jsdelivr.net/gh/AgentaaU/forge-bot@main/site/media/startup.mp4" type="video/mp4" />
+          <source src="https://forge-bot-cdn.forge-bot-media.workers.dev/media/startup-v2.mp4" type="video/mp4" />
           <source src="./media/startup.mp4" type="video/mp4" />
-          <a href="./media/startup.mp4">Download the video</a>
+          <a
+            href="https://forge-bot-cdn.forge-bot-media.workers.dev/media/startup-v2.mp4"
+            >Download the video</a
+          >
         </video>
         <details id="intro-transcript">
           <summary>Read the video transcript</summary>
           <ol>
-            <li>forge-bot turns mentions into agent runs on Forgejo, GitHub, and GitLab.</li>
-            <li>Mention an agent in an issue or pull request comment.</li>
-            <li>The gateway verifies the event, authorizes the request, and routes the location URL and message.</li>
-            <li>The agent inspects context, edits code, runs tests, and replies.</li>
-            <li>Follow up in the same thread; sessions preserve context and status shows progress.</li>
-            <li>Build, configure, and validate your setup using the deployment guide.</li>
+            <li>forge-bot turns a mention into a working agent on Forgejo, GitHub, and GitLab.</li>
+            <li>A maintainer describes the bug; you reply <code>@agent fix the failing login test</code>.</li>
+            <li>The gateway verifies the event, authorizes the request, and routes it to your agent.</li>
+            <li>The agent inspects the code, edits <code>queue.rs</code>, runs all 1,937 tests, and commits.</li>
+            <li>It replies in the same thread with the fix, the test result, and the full context.</li>
+            <li>Mention an agent in your next issue and review the diff; read the deployment guide to get started.</li>
           </ol>
         </details>
-        <p><a class="text-link" href="./media/startup.mp4" download>Download the video</a></p>
+        <p>
+          <a
+            class="text-link"
+            href="https://forge-bot-cdn.forge-bot-media.workers.dev/media/startup-v2.mp4"
+            download
+            >Download the video</a
+          >
+        </p>
       </section>
       <section class="band" id="how-it-works" aria-labelledby="workflow-title">
         <div class="wrap">

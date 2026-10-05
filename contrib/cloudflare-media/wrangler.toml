@@ -1,0 +1,9 @@
+name = "forge-bot-cdn"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+# Media is stored in this Workers KV namespace under the `media/` prefix.
+[[kv_namespaces]]
+binding = "MEDIA"
+id = "418b77163d444d4db0fb1a25b45521d8"

@@ -7,3 +7,6 @@ forge-bot.toml
 /config.toml
 /state/
 *.state/
+.wrangler/
+# Large generated media is published to the Cloudflare CDN, not committed.
+/site/media/startup.mp4
