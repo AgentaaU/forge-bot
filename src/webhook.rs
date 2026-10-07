@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -160,7 +160,7 @@ async fn reset_cooldown(
 /// Human-readable status page for every thread the bot knows about.
 async fn status_page(State(state): State<AppState>, Query(query): Query<StatusQuery>) -> Response {
     match state.dispatcher.threads() {
-        Ok(threads) => Html(status::render_html(&threads, query.q.as_deref())).into_response(),
+        Ok(threads) => fresh_html(status::render_html(&threads, query.q.as_deref())),
         Err(error) => {
             tracing::warn!(%error, "failed to build thread status");
             (
@@ -187,12 +187,11 @@ async fn status_details(
                     .filter(|run| run.finished_at.is_none())
                     .and_then(|run| state.dispatcher.live_output(run.job_id))
                     .map(|output| output.text());
-                Html(status::render_details(
+                fresh_html(status::render_details(
                     thread,
                     session.as_ref(),
                     live_output.as_deref(),
                 ))
-                .into_response()
             }
             None => (StatusCode::NOT_FOUND, "thread not found\n").into_response(),
         },
@@ -210,6 +209,17 @@ async fn status_details(
 #[derive(serde::Deserialize)]
 struct DetailsQuery {
     key: String,
+}
+
+/// Wrap a status page in a response that is never cached. The pages refresh
+/// themselves every couple of seconds, so a cached copy would keep showing
+/// stale live output even after the agent made progress.
+fn fresh_html(body: String) -> Response {
+    let mut response = Html(body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Machine-readable form of the status page, optionally filtered by `q`.

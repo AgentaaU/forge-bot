@@ -412,19 +412,49 @@ impl PiRpcClient {
                     }
                 }
                 "message_update" => {
-                    if let Some(event) = record.get("assistantMessageEvent")
-                        && event["type"] == "text_delta"
-                        && let Some(delta) = event["delta"].as_str()
-                    {
-                        streamed.push_str(delta);
-                        if let Some(live_output) = live_output {
-                            live_output.append(delta.as_bytes());
+                    if let Some(event) = record.get("assistantMessageEvent") {
+                        match event["type"].as_str().unwrap_or_default() {
+                            "text_delta" => {
+                                if let Some(delta) = event["delta"].as_str() {
+                                    streamed.push_str(delta);
+                                    append_live(live_output, delta);
+                                }
+                            }
+                            // Reasoning is not part of the final reply, but
+                            // showing it keeps the live view moving while the
+                            // model works instead of stalling on the last
+                            // assistant sentence.
+                            "thinking_start" => append_live(live_output, "\n[thinking] "),
+                            "thinking_delta" => {
+                                if let Some(delta) = event["delta"].as_str() {
+                                    append_live(live_output, delta);
+                                }
+                            }
+                            "thinking_end" => append_live(live_output, "\n"),
+                            _ => {}
                         }
                     }
                     // The partial message carries the running usage; keep it
                     // as a fallback in case the final `message_end` is missed.
                     if let Some(partial) = assistant_usage(&record["usage"]) {
                         streamed_usage = partial;
+                    }
+                }
+                // Tool calls are where a long run spends most of its time.
+                // Without them the live output freezes on the last assistant
+                // sentence for minutes or hours (issue #200).
+                "tool_execution_start" => {
+                    let name = record["toolName"].as_str().unwrap_or("tool");
+                    let summary = format_tool_call(name, &record["args"]);
+                    append_live(live_output, &format!("\n$ {summary}\n"));
+                }
+                "tool_execution_end" => {
+                    if record["isError"].as_bool().unwrap_or(false) {
+                        append_live(live_output, "  [tool error]\n");
+                    } else if let Some(result) = summarize_tool_result(&record["result"]) {
+                        for line in result.lines() {
+                            append_live(live_output, &format!("  {line}\n"));
+                        }
                     }
                 }
                 "message_end" => {
@@ -536,6 +566,99 @@ fn assistant_usage(value: &Value) -> Option<TokenUsage> {
         prompt_tokens: input + cached,
         cached_tokens: cached,
     })
+}
+
+/// Append to the shared live buffer when the status page is watching.
+fn append_live(live_output: Option<&LiveOutput>, text: &str) {
+    if let Some(live_output) = live_output {
+        live_output.append(text.as_bytes());
+    }
+}
+
+/// One-line label for a tool call, mirroring the labels the Pi CLI shows in
+/// its own progress display. This is what keeps the live output useful while
+/// the agent is busy inside a tool instead of producing assistant text.
+fn format_tool_call(name: &str, args: &Value) -> String {
+    let arg = |key: &str| args[key].as_str().unwrap_or("");
+    let path = if arg("path").is_empty() {
+        arg("file_path")
+    } else {
+        arg("path")
+    };
+    match name {
+        "read" => {
+            // Tool-start events arrive before argument validation, and Pi
+            // accepts an offset of zero as the beginning of the file, so
+            // normalize the offset before formatting the range.
+            let offset = args["offset"].as_u64();
+            let limit = args["limit"].as_u64();
+            if offset.is_none() && limit.is_none() {
+                format!("read {path}")
+            } else {
+                let start = offset.unwrap_or(1).max(1);
+                match limit {
+                    // A zero limit selects no lines, so show the start rather
+                    // than an inverted `start-1` range.
+                    Some(0) => format!("read {path}:{start}"),
+                    Some(limit) => {
+                        let end = start.saturating_add(limit.saturating_sub(1));
+                        format!("read {path}:{start}-{end}")
+                    }
+                    None => format!("read {path}:{start}"),
+                }
+            }
+        }
+        "write" => format!("write {path}"),
+        "edit" => format!("edit {path}"),
+        "bash" => format!("bash {}", one_line(arg("command"), 80)),
+        "grep" => format!("grep /{}/ in {}", arg("pattern"), or_dot(path)),
+        "find" => format!("find {} in {}", arg("pattern"), or_dot(path)),
+        "ls" => format!("ls {}", or_dot(path)),
+        other => format!("{other} {}", one_line(&args.to_string(), 80)),
+    }
+}
+
+/// Flatten a tool result's text blocks into a bounded block for the live view.
+/// Returns `None` when the result has no text to show.
+fn summarize_tool_result(result: &Value) -> Option<String> {
+    let mut text = String::new();
+    for block in result["content"].as_array().into_iter().flatten() {
+        if block["type"] == "text"
+            && let Some(part) = block["text"].as_str()
+        {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(part);
+        }
+    }
+    if text.trim().is_empty() {
+        return None;
+    }
+    // Bound one result so a large file read or command dump cannot push the
+    // rest of the run out of the buffer.
+    const MAX: usize = 1200;
+    if text.chars().count() > MAX {
+        let truncated: String = text.chars().take(MAX).collect();
+        text = format!("{truncated}…");
+    }
+    Some(text)
+}
+
+/// Collapse whitespace and truncate a value for a one-line label.
+fn one_line(value: &str, limit: usize) -> String {
+    let flattened = value.replace(['\n', '\t'], " ");
+    let flattened = flattened.trim();
+    if flattened.chars().count() > limit {
+        let truncated: String = flattened.chars().take(limit).collect();
+        format!("{truncated}…")
+    } else {
+        flattened.to_owned()
+    }
+}
+
+fn or_dot(path: &str) -> &str {
+    if path.is_empty() { "." } else { path }
 }
 
 /// State of the pool.
@@ -1857,6 +1980,169 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 1_000);
         assert_eq!(usage.cached_tokens, 900);
         assert_eq!(usage.hit_rate(), Some(90.0));
+    }
+
+    #[tokio::test]
+    async fn tool_activity_is_streamed_to_live_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = PiRpcConfig {
+            command: fake_pi_command(),
+            timeout_secs: 5,
+            ..Default::default()
+        };
+        config.env.insert(
+            "FAKE_PI_EVENTS".into(),
+            json!([
+                {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "working"}},
+                {"type": "message_update", "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 0}},
+                {"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "delta": "weighing options"}},
+                {"type": "message_update", "assistantMessageEvent": {"type": "thinking_end", "content": "weighing options"}},
+                {"type": "tool_execution_start", "toolName": "bash", "args": {"command": "make prove"}},
+                {"type": "tool_execution_end", "toolName": "bash", "isError": false,
+                 "result": {"content": [{"type": "text", "text": "proof ok"}]}},
+                {"type": "tool_execution_start", "toolName": "read",
+                 "args": {"path": "Engine.tla", "offset": 10, "limit": 5}},
+                {"type": "tool_execution_end", "toolName": "read", "isError": true,
+                 "result": {"content": []}},
+                {"type": "tool_execution_start", "toolName": "read",
+                 "args": {"path": "Empty.tla", "offset": 0, "limit": 0}},
+                {"type": "tool_execution_end", "toolName": "read", "isError": false,
+                 "result": {"content": [{"type": "text", "text": "nothing to read"}]}},
+                {"type": "tool_execution_start", "toolName": "read",
+                 "args": {"path": "Huge.tla", "offset": u64::MAX, "limit": u64::MAX}},
+                {"type": "tool_execution_end", "toolName": "read", "isError": false,
+                 "result": {"content": [{"type": "text", "text": "huge"}]}},
+                {"type": "agent_settled"}
+            ])
+            .to_string(),
+        );
+        let agent = PiPoolAgent::new(&config, store(), 1);
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let output = LiveOutput::default();
+        let context = AgentContext {
+            workspace: dir.path().to_path_buf(),
+            forge: Some(ForgeKind::Forgejo),
+            repository: "o/r".into(),
+            issue_number: Some(1),
+            live_output: Some(output.clone()),
+            ..Default::default()
+        };
+
+        let outcome = agent.run(&request, &context).await.unwrap();
+        assert!(outcome.success);
+        let live = output.text();
+        assert!(live.contains("working"), "{live}");
+        assert!(live.contains("[thinking] weighing options"), "{live}");
+        assert!(live.contains("bash make prove"), "{live}");
+        assert!(live.contains("proof ok"), "{live}");
+        assert!(live.contains("read Engine.tla:10-14"), "{live}");
+        assert!(live.contains("[tool error]"), "{live}");
+        assert!(live.contains("read Empty.tla:1"), "{live}");
+        assert!(
+            live.contains("read Huge.tla:18446744073709551615-18446744073709551615"),
+            "{live}"
+        );
+    }
+
+    #[test]
+    fn tool_call_labels_are_compact() {
+        assert_eq!(
+            format_tool_call("read", &json!({"path": "a/b.tla", "offset": 3, "limit": 4})),
+            "read a/b.tla:3-6"
+        );
+        assert_eq!(
+            format_tool_call("read", &json!({"path": "a/b.tla", "offset": 3})),
+            "read a/b.tla:3"
+        );
+        assert_eq!(
+            format_tool_call("read", &json!({"path": "a/b.tla"})),
+            "read a/b.tla"
+        );
+        // Pi treats offset zero as the first line, and a zero limit selects
+        // no lines; neither may underflow the displayed range.
+        assert_eq!(
+            format_tool_call("read", &json!({"path": "a/b.tla", "offset": 0, "limit": 0})),
+            "read a/b.tla:1"
+        );
+        assert_eq!(
+            format_tool_call("read", &json!({"path": "a/b.tla", "offset": 0, "limit": 5})),
+            "read a/b.tla:1-5"
+        );
+        assert_eq!(
+            format_tool_call("read", &json!({"path": "a/b.tla", "limit": 0})),
+            "read a/b.tla:1"
+        );
+        // Tool-start events arrive before validation, so non-numeric or
+        // negative arguments must fall back to the bare path.
+        assert_eq!(
+            format_tool_call(
+                "read",
+                &json!({"path": "a/b.tla", "offset": -1, "limit": "nope"})
+            ),
+            "read a/b.tla"
+        );
+        // Huge arguments arrive before validation and must saturate instead
+        // of panicking or wrapping the endpoint.
+        assert_eq!(
+            format_tool_call(
+                "read",
+                &json!({"path": "a/b.tla", "offset": u64::MAX, "limit": u64::MAX})
+            ),
+            "read a/b.tla:18446744073709551615-18446744073709551615"
+        );
+        assert_eq!(
+            format_tool_call(
+                "read",
+                &json!({"path": "a/b.tla", "offset": 0, "limit": u64::MAX})
+            ),
+            "read a/b.tla:1-18446744073709551615"
+        );
+        assert_eq!(format_tool_call("write", &json!({"path": "x"})), "write x");
+        assert_eq!(
+            format_tool_call("edit", &json!({"file_path": "y"})),
+            "edit y"
+        );
+        assert_eq!(
+            format_tool_call("bash", &json!({"command": "make\nprove"})),
+            "bash make prove"
+        );
+        assert_eq!(
+            format_tool_call("grep", &json!({"pattern": "foo", "path": "src"})),
+            "grep /foo/ in src"
+        );
+        assert_eq!(
+            format_tool_call("find", &json!({"pattern": "*.tla"})),
+            "find *.tla in ."
+        );
+        assert_eq!(format_tool_call("ls", &json!({})), "ls .");
+        assert_eq!(
+            format_tool_call("custom", &json!({"a": 1})),
+            "custom {\"a\":1}"
+        );
+        let long = format_tool_call("bash", &json!({"command": "x".repeat(200)}));
+        assert!(long.ends_with('…'), "{long}");
+        assert_eq!(long.chars().count(), "bash ".len() + 80 + 1);
+    }
+
+    #[test]
+    fn tool_results_are_bounded() {
+        assert_eq!(summarize_tool_result(&json!({"content": []})), None);
+        assert_eq!(
+            summarize_tool_result(&json!({"content": [
+                {"type": "text", "text": "one"},
+                {"type": "text", "text": "two"}
+            ]})),
+            Some("one\ntwo".to_owned())
+        );
+        let long = summarize_tool_result(
+            &json!({"content": [{"type": "text", "text": "z".repeat(1500)}]}),
+        )
+        .unwrap();
+        assert!(long.ends_with('…'), "{long}");
+        assert_eq!(long.chars().count(), 1201);
     }
 
     #[tokio::test]

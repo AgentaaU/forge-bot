@@ -472,6 +472,21 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
     )
 }
 
+/// How many of the most recent live-output lines the details page shows. The
+/// live buffer can hold up to a megabyte; rendering all of it makes the page
+/// slow and buries the newest activity, so only the tail is shown in a
+/// fixed-height box.
+const LIVE_OUTPUT_LINES: usize = 24;
+
+/// Keep only the last `max` lines of `text`.
+fn tail_lines(text: &str, max: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max {
+        return text.to_owned();
+    }
+    lines[lines.len() - max..].join("\n")
+}
+
 /// Render the persisted conversation history. A queued thread may have no
 /// session yet, so its details page still renders with an empty run list.
 pub fn render_details(
@@ -515,10 +530,11 @@ pub fn render_details(
             if run.finished_at.is_none() {
                 let output = live_output
                     .filter(|output| !output.is_empty())
-                    .unwrap_or("Waiting for agent output.");
+                    .map(|output| tail_lines(output, LIVE_OUTPUT_LINES))
+                    .unwrap_or_else(|| "Waiting for agent output.".to_owned());
                 runs.push_str(&format!(
                     include_str!("../../web/details-live.html"),
-                    escape_html(output)
+                    escape_html(&output)
                 ));
             }
         }
@@ -848,8 +864,32 @@ mod tests {
         let html = render_details(&threads[0], Some(&stored), Some("<script>live</script>"));
         assert!(html.contains("http-equiv=\"refresh\" content=\"2\""));
         assert!(html.contains("<h3>Live output</h3>"));
+        assert!(html.contains("class=\"live-output\""));
         assert!(html.contains("&lt;script&gt;live&lt;/script&gt;"));
         assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn details_show_only_the_latest_live_output_lines() {
+        let stored = session("forgejo:owner/repo:issue:1", vec![running()]);
+        let threads = snapshot(vec![stored.clone()], vec![]);
+        let output: String = (0..(LIVE_OUTPUT_LINES + 5))
+            .map(|index| format!("line-{index}\n"))
+            .collect();
+        let html = render_details(&threads[0], Some(&stored), Some(&output));
+        assert!(!html.contains("line-4\n"), "old lines must be dropped");
+        assert!(html.contains("line-5\n"), "the tail must be kept");
+        assert!(
+            html.contains(&format!("line-{}", LIVE_OUTPUT_LINES + 4)),
+            "the newest line must be kept"
+        );
+    }
+
+    #[test]
+    fn tail_lines_handles_short_and_empty_output() {
+        assert_eq!(tail_lines("", 3), "");
+        assert_eq!(tail_lines("one\ntwo", 3), "one\ntwo");
+        assert_eq!(tail_lines("one\ntwo\nthree\nfour", 2), "three\nfour");
     }
 
     #[test]

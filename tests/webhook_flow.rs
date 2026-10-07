@@ -1241,6 +1241,13 @@ async fn details_show_output_while_the_agent_is_running() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
     let html = body_text(response).await;
     assert!(html.contains("<h3>Live output</h3>"), "{html}");
     assert!(html.contains("live tick"), "{html}");
