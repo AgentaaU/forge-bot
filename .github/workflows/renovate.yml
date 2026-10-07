@@ -1,0 +1,60 @@
+name: Renovate
+
+# Forgejo has no hosted Renovate app, so this workflow runs the Renovate CLI on
+# the self-hosted runner against this repository. Renovate talks to the Forgejo
+# API and opens/updates pull requests; it never pushes to `main` directly.
+#
+# The schedule is weekly and the job can also be dispatched by hand. The update
+# policy (grouping, toolchain handling, lock-file maintenance) lives in
+# `renovate.json` at the repository root. `renovate.json` pins
+# `"timezone": "Asia/Shanghai"` so the scheduled run falls inside the default
+# lock-file maintenance window (`before 4am on monday`) and does not depend on
+# the runner's local timezone.
+#
+# Required repository secret (Settings -> Actions -> Secrets):
+#   RENOVATE_TOKEN: a Forgejo token owned by a dedicated account. Grant the
+#   scopes Renovate needs: `write:repository` (open/update pull requests),
+#   `read:user` (platform authentication via /api/v1/user), `write:issue`
+#   (Dependency Dashboard), and `read:organization`. The account must have push
+#   access to this repository and a configured full name and email. See
+#   https://docs.renovatebot.com/modules/platform/forgejo/#authentication
+#   Until the secret exists the job logs a notice and exits without doing
+#   anything.
+
+on:
+  schedule:
+    # Mondays 02:00 Asia/Shanghai (UTC+8).
+    - cron: '0 18 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+
+jobs:
+  renovate:
+    runs-on: self-hosted
+    env:
+      RENOVATE_PLATFORM: forgejo
+      RENOVATE_ENDPOINT: ${{ github.server_url }}
+      RENOVATE_REPOSITORIES: ${{ github.repository }}
+      RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+      LOG_LEVEL: info
+    steps:
+      # Renovate's supported Node line is 24; pin it instead of relying on the
+      # runner's default toolchain.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Renovate
+        run: |
+          set -eu
+          if [ -z "${RENOVATE_TOKEN}" ]; then
+            echo "RENOVATE_TOKEN is not configured; skipping Renovate."
+            exit 0
+          fi
+          npx --yes renovate@44

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "timezone": "Asia/Shanghai",
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "Batch non-major Rust crate updates into one pull request.",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Cargo dependencies (non-major)"
+    },
+    {
+      "description": "Group the GitHub Actions used by CI.",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "description": "Keep the pinned Rust toolchain current.",
+      "matchManagers": ["rust-toolchain"],
+      "groupName": "Rust toolchain"
+    }
+  ]
+}

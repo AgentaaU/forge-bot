@@ -609,6 +609,26 @@ validated and covered in a single pass) and posts the result as a comment on the
 pull request, updating the same comment on every push via
 [`contrib/coverage-comment.sh`](contrib/coverage-comment.sh).
 
+## Dependency updates
+
+[Renovate](https://docs.renovatebot.com/) keeps the Cargo crates, the pinned
+Rust toolchain and the GitHub Actions used by CI current. The policy lives in
+[`renovate.json`](renovate.json): non-major Cargo updates are grouped into one
+pull request, while major updates and toolchain/action bumps stay separate, and
+lock-file maintenance is enabled.
+
+Forgejo has no hosted Renovate app, so
+[`.github/workflows/renovate.yml`](.github/workflows/renovate.yml) runs the
+Renovate CLI on the self-hosted runner every Monday and on manual dispatch. It
+needs a repository Actions secret named `RENOVATE_TOKEN`: a Forgejo token owned
+by a dedicated account. Renovate authenticates with the token through
+`/api/v1/user` and creates both pull requests and the Dependency Dashboard via
+the API, so the token needs the `write:repository`, `read:user`, `write:issue`,
+and `read:organization` scopes. The account must have push access to this
+repository and a configured full name and email. See Renovate's
+[Forgejo authentication requirements](https://docs.renovatebot.com/modules/platform/forgejo/#authentication).
+Until that secret is set the job logs a notice and exits without doing anything.
+
 ## Research notes
 
 Measurements that informed the design live under [`doc/`](doc/):
