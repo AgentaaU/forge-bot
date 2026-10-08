@@ -10,10 +10,10 @@ permissions:
   pull-requests: write
 
 jobs:
-  # Formatting and lints do not need the coverage build, so run them in their
-  # own job. The self-hosted runner advertises `capacity: 2`, so this job and
-  # `test` execute concurrently instead of one waiting behind the other.
-  lint:
+  # Formatting and lints run first in this job, before the instrumented
+  # coverage build, so one job checks style, lints and tests on a single
+  # pinned toolchain install.
+  test:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
@@ -34,24 +34,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
-
-  test:
-    runs-on: self-hosted
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up pinned Rust toolchain
-        run: |
-          # Each job gets fresh homes, avoiding concurrent writes and stale installs.
-          rust_home=$(mktemp -d "$RUNNER_TEMP/forge-bot-rust.XXXXXX")
-          export CARGO_HOME="$rust_home/cargo"
-          export RUSTUP_HOME="$rust_home/rustup"
-          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
-          export PATH="$CARGO_HOME/bin:$PATH"
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-          rustup install --no-self-update
-          rustup show active-toolchain
       - name: Install cargo-llvm-cov
         run: |
           if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
