@@ -361,7 +361,9 @@ summary from `/`.
 
 ## Admin page
 
-`GET /admin` lists registered agents and their remaining cooldowns. Click
+`GET /admin` shows the remaining capacity at the top: how many `[session] workers`
+slots are busy, how many are free, and how many jobs are queued for one. It then
+lists registered agents and their remaining cooldowns. Click
 **Reset cooldown** to make that agent eligible for automatic selection again
 immediately, without restarting the bot. Other agents and running jobs are
 unaffected. The page uses `POST /admin/reset-cooldown` with a JSON body such as

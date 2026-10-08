@@ -278,9 +278,34 @@ async fn admin_page(State(state): State<AppState>) -> Html<String> {
     let thread_rows = running_thread_rows(&state);
     Html(format!(
         include_str!("../web/admin.html"),
+        capacity = worker_capacity_summary(&state.dispatcher.capacity()),
         rows = rows,
         thread_rows = thread_rows
     ))
+}
+
+/// One sentence describing worker slots, so an operator can see whether new
+/// mentions will start at once or wait behind the running conversations.
+fn worker_capacity_summary(capacity: &crate::session::queue::Capacity) -> String {
+    let plural = |n: usize, word: &str| {
+        if n == 1 {
+            format!("{n} {word}")
+        } else {
+            format!("{n} {word}s")
+        }
+    };
+    let queued = if capacity.queued == 0 {
+        "no jobs queued".to_owned()
+    } else {
+        format!("{} queued", plural(capacity.queued, "job"))
+    };
+    format!(
+        "{} of {} busy, {} free; {}.",
+        capacity.busy,
+        plural(capacity.workers, "worker slot"),
+        capacity.free(),
+        queued,
+    )
 }
 
 /// One row per thread with an agent run in flight, each with a terminate

@@ -5,7 +5,7 @@ body {{ font: 16px system-ui, sans-serif; max-width: 900px; margin: 2rem auto; p
 table {{ width: 100%; border-collapse: collapse; }} th, td {{ text-align: left; padding: .8rem; border-bottom: 1px solid #ccc; }}
 button {{ padding: .5rem .8rem; cursor: pointer; }}
 </style></head><body><nav><a href="/status">Status</a> · <a href="/notifications">Notifications</a></nav>
-<h1>Agent administration</h1><p>Reset a cooldown to make an agent eligible for automatic selection immediately. This does not cancel running jobs.</p>
+<h1>Agent administration</h1><h2>Remaining capacity</h2><p id="capacity">{capacity}</p><p>Reset a cooldown to make an agent eligible for automatic selection immediately. This does not cancel running jobs.</p>
 <table><thead><tr><th>Agent</th><th>Availability</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table>
 <h2>Running threads</h2><p>Terminate stops the agent run in flight for a thread, and the thread is told so. Mentions already queued for that thread still run afterwards.</p>
 <table><thead><tr><th>Thread</th><th>Agent</th><th>Running since</th><th>Action</th></tr></thead><tbody>{thread_rows}</tbody></table>

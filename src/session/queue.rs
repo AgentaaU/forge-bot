@@ -8,6 +8,7 @@
 //! bounds how many agent processes (pooled or one-shot) may be in flight.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -67,6 +68,64 @@ struct Inner {
     /// that terminates it. Populated when a job is spawned and cleared when it
     /// ends, so [`Dispatcher::terminate`] only reaches in-flight runs.
     active: Mutex<HashMap<String, ActiveRun>>,
+    /// Worker slots running a conversation. Updated when a job is spawned and
+    /// when it ends, so the admin page never waits on the scheduler loop.
+    busy_workers: AtomicUsize,
+    /// Accepted jobs that have not started or been merged into a run yet:
+    /// buffered in the input channel, held in a per-conversation queue, or
+    /// awaiting follow-up delivery. Updated at each hand-off, so it stays
+    /// accurate while the scheduler is blocked on a follow-up.
+    waiting_jobs: AtomicUsize,
+}
+
+/// Holds one [`Inner::waiting_jobs`] slot while a job is handed to the
+/// scheduler. Releases it on drop unless the hand-off succeeded, so a cancelled
+/// or failed send cannot leave the count inflated.
+struct WaitingJob<'a> {
+    waiting: &'a AtomicUsize,
+    armed: bool,
+}
+
+impl<'a> WaitingJob<'a> {
+    fn begin(waiting: &'a AtomicUsize) -> Self {
+        waiting.fetch_add(1, Ordering::SeqCst);
+        Self {
+            waiting,
+            armed: true,
+        }
+    }
+
+    /// The job reached the scheduler's input; it now counts until it starts or
+    /// is merged.
+    fn delivered(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WaitingJob<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A snapshot of worker-pool occupancy for the admin page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capacity {
+    /// Configured `[session] workers` limit.
+    pub workers: usize,
+    /// Worker slots currently running a conversation.
+    pub busy: usize,
+    /// Jobs waiting for a free slot (several may belong to one conversation).
+    pub queued: usize,
+}
+
+impl Capacity {
+    /// Slots that can start a conversation right now.
+    pub fn free(&self) -> usize {
+        self.workers.saturating_sub(self.busy)
+    }
 }
 
 /// An in-flight job that an operator can terminate.
@@ -172,6 +231,8 @@ impl Dispatcher {
             tx,
             running: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
+            busy_workers: AtomicUsize::new(0),
+            waiting_jobs: AtomicUsize::new(0),
         });
 
         // Recover jobs that were queued when the process stopped.
@@ -180,8 +241,12 @@ impl Dispatcher {
                 Ok(jobs) if !jobs.is_empty() => {
                     tracing::info!(count = jobs.len(), "recovering pending jobs");
                     for job in jobs {
-                        if let Err(error) = inner.tx.try_send(job) {
-                            tracing::warn!(%error, "could not requeue recovered job");
+                        let handoff = WaitingJob::begin(&inner.waiting_jobs);
+                        match inner.tx.try_send(job) {
+                            Ok(()) => handoff.delivered(),
+                            Err(error) => {
+                                tracing::warn!(%error, "could not requeue recovered job");
+                            }
                         }
                     }
                 }
@@ -308,11 +373,15 @@ impl Dispatcher {
         }
 
         self.inner.sessions.save_job(&job)?;
+        // Counted from acceptance, not from the scheduler's receive, so a job
+        // buffered in the channel while the scheduler is blocked still shows.
+        let handoff = WaitingJob::begin(&self.inner.waiting_jobs);
         self.inner
             .tx
             .send(job.clone())
             .await
             .map_err(|_| BotError::Other(anyhow::anyhow!("job queue is closed")))?;
+        handoff.delivered();
 
         tracing::info!(job = %job.id, agent = %job.agent, repo = %job.message.repository, "job queued");
         Ok(job.id)
@@ -495,6 +564,15 @@ impl Dispatcher {
         self.inner.sessions.live_output(job_id)
     }
 
+    /// Current worker-pool occupancy and queue depth.
+    pub fn capacity(&self) -> Capacity {
+        Capacity {
+            workers: self.inner.config.session.workers.max(1),
+            busy: self.inner.busy_workers.load(Ordering::SeqCst),
+            queued: self.inner.waiting_jobs.load(Ordering::SeqCst),
+        }
+    }
+
     /// Terminate the run in flight for conversation `key`.
     ///
     /// The job future is dropped, which kills the agent process and its
@@ -642,9 +720,14 @@ fn spawn_job(inner: &Arc<Inner>, job: Job, key: String, done_tx: &mpsc::Unbounde
                 cancel: cancel_tx,
             },
         );
+    // The job leaves the waiting count exactly once, here, as it starts. The
+    // slot is freed by `DoneGuard` when the task ends, even on a panic.
+    inner.waiting_jobs.fetch_sub(1, Ordering::SeqCst);
+    inner.busy_workers.fetch_add(1, Ordering::SeqCst);
     let done = DoneGuard {
         key: Some(key.clone()),
         tx: done_tx.clone(),
+        busy_workers: inner.clone(),
     };
     tokio::spawn(async move {
         let _done = done;
@@ -681,10 +764,16 @@ fn spawn_job(inner: &Arc<Inner>, job: Job, key: String, done_tx: &mpsc::Unbounde
 struct DoneGuard {
     key: Option<String>,
     tx: mpsc::UnboundedSender<String>,
+    /// Frees this job's worker slot as soon as the job ends, without waiting
+    /// for the scheduler to process `tx`.
+    busy_workers: Arc<Inner>,
 }
 
 impl Drop for DoneGuard {
     fn drop(&mut self) {
+        self.busy_workers
+            .busy_workers
+            .fetch_sub(1, Ordering::SeqCst);
         if let Some(key) = self.key.take() {
             let _ = self.tx.send(key);
         }
@@ -784,9 +873,12 @@ impl Inner {
                     key,
                     "merged follow-up into the running agent"
                 );
+                // The follow-up is now part of the run in flight, so it stops
+                // waiting. This is the only path that merges a job, so it is
+                // released exactly once.
+                self.waiting_jobs.fetch_sub(1, Ordering::SeqCst);
                 self.ack_merged(job, &receipt.notice).await;
-                // The follow-up is now part of the run in flight, so drop its
-                // persisted job instead of replaying it after a restart.
+                // Drop its persisted job instead of replaying it after a restart.
                 if let Err(error) = self.sessions.remove_job(job.id) {
                     tracing::warn!(%error, job = %job.id, "failed to remove merged follow-up job");
                 }
@@ -4290,6 +4382,258 @@ echo "end:$token" >> "$AGENT_LOG"
         );
         let contents = std::fs::read_to_string(&log).unwrap();
         assert!(!contents.contains("end:TOKEN_A"), "{contents}");
+    }
+
+    /// The admin page's capacity figures track the worker slots in use and the
+    /// jobs waiting for one, and return to empty once the queue drains.
+    #[tokio::test]
+    async fn capacity_reports_busy_slots_and_queued_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dispatcher, sessions, log, release) = gated_dispatcher(dir.path(), 1);
+        let idle = dispatcher.capacity();
+        assert_eq!(
+            (idle.workers, idle.busy, idle.queued, idle.free()),
+            (1, 0, 0, 1)
+        );
+
+        submit_token(&dispatcher, "o/r", 7, "TOKEN_A").await;
+        wait_for_log(&log, "start:TOKEN_A").await;
+        submit_token(&dispatcher, "o/r", 8, "TOKEN_B").await;
+        wait_for_capacity(&dispatcher, |c| c.queued == 1).await;
+        let busy = dispatcher.capacity();
+        assert_eq!((busy.busy, busy.queued, busy.free()), (1, 1, 0));
+
+        release_token(&release, "TOKEN_A");
+        wait_for_log(&log, "start:TOKEN_B").await;
+        release_token(&release, "TOKEN_B");
+        wait_for_drain(&sessions).await;
+        wait_for_capacity(&dispatcher, |c| c.busy == 0).await;
+        let drained = dispatcher.capacity();
+        assert_eq!((drained.busy, drained.queued, drained.free()), (0, 0, 1));
+    }
+
+    /// Steerable agent whose first run blocks until the test releases it, and
+    /// whose follow-up delivery blocks until the test allows it. Later runs
+    /// return at once.
+    struct BlockingFollowUpAgent {
+        runs: std::sync::atomic::AtomicUsize,
+        follow_ups_started: std::sync::atomic::AtomicUsize,
+        run_release: tokio::sync::Notify,
+        follow_up_gate: tokio::sync::Notify,
+    }
+
+    impl BlockingFollowUpAgent {
+        fn new() -> Self {
+            Self {
+                runs: std::sync::atomic::AtomicUsize::new(0),
+                follow_ups_started: std::sync::atomic::AtomicUsize::new(0),
+                run_release: tokio::sync::Notify::new(),
+                follow_up_gate: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for BlockingFollowUpAgent {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+
+        async fn run(
+            &self,
+            _request: &AgentRequest,
+            _context: &AgentContext,
+        ) -> Result<AgentOutcome> {
+            if self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.run_release.notified().await;
+            }
+            Ok(AgentOutcome::success("done", Duration::ZERO))
+        }
+
+        async fn follow_up(
+            &self,
+            _request: &AgentRequest,
+            _context: &AgentContext,
+        ) -> Result<Option<crate::agent::SteerReceipt>> {
+            self.follow_ups_started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.follow_up_gate.notified().await;
+            Ok(Some(crate::agent::SteerReceipt::merged()))
+        }
+    }
+
+    /// Jobs accepted while the scheduler is blocked delivering a follow-up sit
+    /// in the input channel. They must still count as queued, and the merged
+    /// follow-up must leave the count exactly once.
+    #[tokio::test]
+    async fn capacity_counts_jobs_buffered_behind_a_blocked_follow_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.reply.ack = false;
+        config.policy.allow_all = true;
+        config.session.workers = 1;
+        config.agent_sequence = vec!["blocking".into()];
+        let config = Arc::new(config);
+
+        let agent = Arc::new(BlockingFollowUpAgent::new());
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test("blocking", agent.clone());
+        for name in registry.names() {
+            if name != "blocking" {
+                registry.mark_unavailable(&name, Duration::from_secs(3600));
+            }
+        }
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(registry),
+            sessions.clone(),
+            Arc::new(RecordingForgeApi::new()),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        let mention = |text: &str| Mention {
+            agent: Some("blocking".into()),
+            message: text.into(),
+        };
+        // Occupy the only worker.
+        dispatcher
+            .submit(message_at("o/r", 1), mention("first"), "blocking")
+            .await
+            .unwrap();
+        wait_for_counter(&agent.runs, 1).await;
+
+        // A same-thread follow-up whose delivery never completes until allowed.
+        dispatcher
+            .submit(message_at("o/r", 1), mention("follow"), "blocking")
+            .await
+            .unwrap();
+        wait_for_counter(&agent.follow_ups_started, 1).await;
+
+        // Two more conversations accepted while the scheduler is stuck.
+        dispatcher
+            .submit(message_at("o/r", 2), mention("two"), "blocking")
+            .await
+            .unwrap();
+        dispatcher
+            .submit(message_at("o/r", 3), mention("three"), "blocking")
+            .await
+            .unwrap();
+        wait_for_capacity(&dispatcher, |c| c.queued == 3).await;
+        assert_eq!(
+            dispatcher.capacity(),
+            Capacity {
+                workers: 1,
+                busy: 1,
+                queued: 3,
+            },
+            "the follow-up and both buffered jobs are waiting"
+        );
+
+        // Delivering the follow-up removes it from the count, once.
+        agent.follow_up_gate.notify_one();
+        wait_for_capacity(&dispatcher, |c| c.queued == 2).await;
+        let merged = dispatcher.capacity();
+        assert_eq!((merged.busy, merged.queued), (1, 2));
+
+        // Finishing the first run starts the next conversation, then the last.
+        agent.run_release.notify_one();
+        wait_for_drain(&sessions).await;
+        wait_for_capacity(&dispatcher, |c| c.busy == 0 && c.queued == 0).await;
+        assert_eq!(agent.runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            agent
+                .follow_ups_started
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    /// Recovered jobs are waiting until they start, then leave the count once
+    /// each.
+    #[tokio::test]
+    async fn recovered_jobs_count_as_queued_until_they_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, log, release) = gated_config(dir.path(), 1);
+        let config = Arc::new(config);
+        let registry = isolated_registry(&config, &["gate"]);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+
+        for (number, token) in [(1, "TOKEN_A"), (2, "TOKEN_B")] {
+            let job = Job {
+                id: Uuid::new_v4(),
+                message: message_at("o/r", number),
+                mention: Mention {
+                    agent: Some("gate".into()),
+                    message: token.into(),
+                },
+                agent: "gate".into(),
+                user_id: Some("default".into()),
+                created_at: Utc::now(),
+                status_comment: None,
+                waiting: false,
+            };
+            sessions.save_job(&job).unwrap();
+        }
+
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry,
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        wait_for_log(&log, "start:TOKEN_A").await;
+        assert_eq!(
+            dispatcher.capacity(),
+            Capacity {
+                workers: 1,
+                busy: 1,
+                queued: 1,
+            }
+        );
+
+        release_token(&release, "TOKEN_A");
+        wait_for_log(&log, "start:TOKEN_B").await;
+        assert_eq!(
+            dispatcher.capacity(),
+            Capacity {
+                workers: 1,
+                busy: 1,
+                queued: 0,
+            }
+        );
+
+        release_token(&release, "TOKEN_B");
+        wait_for_drain(&sessions).await;
+        wait_for_capacity(&dispatcher, |c| c.busy == 0).await;
+        assert_eq!(dispatcher.capacity().queued, 0);
+    }
+
+    async fn wait_for_counter(counter: &std::sync::atomic::AtomicUsize, expected: usize) {
+        for _ in 0..500 {
+            if counter.load(std::sync::atomic::Ordering::SeqCst) == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("counter never reached {expected}");
+    }
+
+    async fn wait_for_capacity(dispatcher: &Dispatcher, done: impl Fn(&Capacity) -> bool) {
+        for _ in 0..500 {
+            if done(&dispatcher.capacity()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "capacity never reached the expected state: {:?}",
+            dispatcher.capacity()
+        );
     }
 
     /// Forge API whose successful result comment blocks until the test releases

@@ -2429,6 +2429,11 @@ async fn admin_resets_only_the_selected_agent_cooldown() {
         .unwrap();
     let html = std::str::from_utf8(&body).unwrap();
     assert!(html.contains("Reset cooldown"));
+    assert!(html.contains("Remaining capacity"));
+    assert!(
+        html.contains("0 of 1 worker slot busy, 1 free; no jobs queued."),
+        "{html}"
+    );
     assert!(html.contains("capacity limit"));
     assert!(!h.agents.is_available("custom"));
 
