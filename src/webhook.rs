@@ -101,17 +101,154 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn root(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({
-        "name": "forge-bot",
-        "version": env!("CARGO_PKG_VERSION"),
-        "forges": state.adapters.keys().collect::<Vec<_>>(),
-        "agents": state.agents.names(),
-        "mention": state.config.trigger(),
-        "status": "/status",
-        "admin": "/admin",
-        "notifications": "/notifications",
-    }))
+/// Index of the browser pages. Clients that prefer HTML (see
+/// [`accepts_html`]) get an HTML page linking to every GET page; other clients
+/// keep the JSON summary. Both representations vary on `Accept`, so shared
+/// caches never hand one representation to a client that asked for the other.
+async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !accepts_html(&headers) {
+        return (
+            [(header::VARY, "Accept")],
+            Json(json!({
+                "name": "forge-bot",
+                "version": env!("CARGO_PKG_VERSION"),
+                "forges": state.adapters.keys().collect::<Vec<_>>(),
+                "agents": state.agents.names(),
+                "mention": state.config.trigger(),
+                "status": "/status",
+                "admin": "/admin",
+                "notifications": "/notifications",
+            })),
+        )
+            .into_response();
+    }
+
+    // Only link the CA download when the file exists, as the notifications
+    // page does, so the index never points at a 404.
+    let ca_cert = state
+        .config
+        .notifications
+        .ca_cert_path
+        .as_ref()
+        .is_some_and(|path| path.is_file());
+    let mut pages: Vec<(&str, &str)> = vec![
+        ("/status", "Live status of every known thread"),
+        ("/status.json", "Status snapshot as JSON"),
+        ("/admin", "Agent cooldowns and running threads"),
+        (
+            "/notifications",
+            "Browser and mobile notifications for humans",
+        ),
+        (
+            "/notifications/diagnostics",
+            "Notification browser diagnostics",
+        ),
+        ("/notifications.json", "Notification feed as JSON"),
+        ("/healthz", "Liveness check"),
+    ];
+    if ca_cert {
+        pages.push((
+            "/notifications/ca.crt",
+            "Certificate for installing the notification CA",
+        ));
+    }
+    let mut links = String::new();
+    for (path, description) in pages {
+        let path = status::escape_html(path);
+        links.push_str(&format!(
+            "<tr><td><a href=\"{path}\">{path}</a></td><td>{}</td></tr>",
+            status::escape_html(description)
+        ));
+    }
+    let forges = state
+        .adapters
+        .keys()
+        .map(|forge| status::escape_html(forge))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let agents = state
+        .agents
+        .names()
+        .iter()
+        .map(|agent| status::escape_html(agent))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (
+        [(header::VARY, "Accept")],
+        Html(
+            include_str!("../web/index.html")
+                .replace("{version}", env!("CARGO_PKG_VERSION"))
+                .replace("{mention}", &status::escape_html(state.config.trigger()))
+                .replace("{forges}", &forges)
+                .replace("{agents}", &agents)
+                .replace("{links}", &links),
+        ),
+    )
+        .into_response()
+}
+
+/// Whether the `Accept` header makes `text/html` the preferred representation.
+///
+/// Per RFC 9110 §12.5.1 the most specific matching media range decides: an
+/// exact `text/html` range beats `text/*`, and `*/*` is ignored so that
+/// generic clients (curl, API libraries) keep the JSON summary. Types and
+/// subtypes compare case-insensitively, parameters other than `q` are
+/// ignored, and a quality of zero (RFC 9110 §12.4.2) means "not acceptable".
+fn accepts_html(headers: &HeaderMap) -> bool {
+    let mut exact: Option<f32> = None;
+    let mut subtype_wildcard: Option<f32> = None;
+    for value in headers.get_all(header::ACCEPT) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for range in value.split(',') {
+            let mut parts = range.split(';');
+            let media_type = parts.next().unwrap_or_default().trim();
+            let Some(quality) = parse_quality(parts) else {
+                continue;
+            };
+            let slot = if media_type.eq_ignore_ascii_case("text/html") {
+                &mut exact
+            } else if media_type.eq_ignore_ascii_case("text/*") {
+                &mut subtype_wildcard
+            } else {
+                continue;
+            };
+            *slot = Some(slot.map_or(quality, |best| best.max(quality)));
+        }
+    }
+    exact.or(subtype_wildcard).is_some_and(|q| q > 0.0)
+}
+
+/// Reads the `q` parameter from a media range's parameters; a missing `q`
+/// means 1. Returns `None` for a malformed quality so the range is skipped.
+fn parse_quality<'a>(parameters: impl Iterator<Item = &'a str>) -> Option<f32> {
+    let mut quality = 1.0;
+    for parameter in parameters {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("q") {
+            continue;
+        }
+        quality = parse_qvalue(value.trim())?;
+    }
+    Some(quality)
+}
+
+/// RFC 9110 §12.4.2 `qvalue`: `0[.0-3 digits]` or `1[.0-3 zeros]`.
+fn parse_qvalue(value: &str) -> Option<f32> {
+    let (whole, fraction) = match value.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (value, None),
+    };
+    let fraction_ok =
+        |digit: fn(char) -> bool| fraction.is_none_or(|f| f.len() <= 3 && f.chars().all(digit));
+    match whole {
+        "0" if fraction_ok(|c| c.is_ascii_digit()) => value.parse().ok(),
+        "1" if fraction_ok(|c| c == '0') => value.parse().ok(),
+        _ => None,
+    }
 }
 
 /// Operator controls use the same registry as dispatch and fallback selection.
@@ -699,6 +836,46 @@ mod tests {
         assert!(!recent.insert("b"));
         assert!(!recent.insert("c"));
         assert!(!recent.insert("a")); // evicted
+    }
+
+    #[test]
+    fn accept_header_selects_html_by_media_range() {
+        let accept = |values: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(header::ACCEPT, HeaderValue::from_str(value).unwrap());
+            }
+            accepts_html(&headers)
+        };
+        // No header, generic clients and JSON requests keep the JSON summary.
+        assert!(!accept(&[]));
+        assert!(!accept(&["*/*"]));
+        assert!(!accept(&["application/json"]));
+        // Browsers and explicit HTML requests get the page.
+        assert!(accept(&["text/html"]));
+        assert!(accept(&["text/html,application/xhtml+xml,*/*;q=0.8"]));
+        assert!(accept(&["text/*"]));
+        assert!(accept(&["text/html;charset=utf-8"]));
+        assert!(accept(&["text/html;q=0.5"]));
+        assert!(accept(&["text/html;q=0.000, text/html;q=0.1"]));
+        assert!(accept(&["application/json", "text/html"]));
+        // Media types compare exactly, ignoring ASCII case.
+        assert!(accept(&["TEXT/HTML"]));
+        assert!(!accept(&["text/html-not-really"]));
+        assert!(!accept(&["text/htmlx, text/plain"]));
+        // A zero quality rejects HTML even when JSON is also acceptable.
+        assert!(!accept(&["application/json, text/html;q=0"]));
+        assert!(!accept(&["text/html;q=0.000"]));
+        assert!(!accept(&["text/html;Q=0"]));
+        // The most specific range wins over a wildcard.
+        assert!(!accept(&["text/*, text/html;q=0"]));
+        assert!(!accept(&["text/*;q=0, text/html;q=0"]));
+        assert!(accept(&["text/*;q=0, text/html"]));
+        // Malformed qualities are ignored rather than treated as acceptance.
+        assert!(!accept(&["text/html;q=2"]));
+        assert!(!accept(&["text/html;q=abc"]));
+        assert!(!accept(&["text/html;q=0.0001"]));
+        assert!(!accept(&["text/html;q=-1"]));
     }
 
     #[test]

@@ -1064,6 +1064,124 @@ async fn root_lists_forges_and_healthz_is_ok() {
 }
 
 #[tokio::test]
+async fn browser_index_links_every_sub_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_owned();
+    assert!(content_type.starts_with("text/html"), "{content_type}");
+    let html = body_text(response).await;
+    for path in [
+        "/status",
+        "/status.json",
+        "/admin",
+        "/notifications",
+        "/notifications/diagnostics",
+        "/notifications.json",
+        "/healthz",
+    ] {
+        assert!(
+            html.contains(&format!("href=\"{path}\"")),
+            "missing {path}: {html}"
+        );
+    }
+    assert!(html.contains("forgejo"), "{html}");
+    assert!(html.contains("custom"), "{html}");
+
+    // Clients that do not ask for HTML keep the JSON summary.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("accept", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(json["status"], "/status");
+}
+
+#[tokio::test]
+async fn root_negotiates_representation_and_varies_on_accept() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+
+    // (Accept header, expect HTML)
+    let cases = [
+        (Some("application/json, text/html;q=0"), false),
+        (Some("text/html-not-really"), false),
+        (Some("TEXT/HTML"), true),
+        (Some("text/html;q=0.5, application/json"), true),
+        (Some("*/*"), false),
+        (None, false),
+    ];
+    for (accept, expect_html) in cases {
+        let mut request = Request::builder().method("GET").uri("/");
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
+        let response = harness
+            .app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{accept:?}");
+        assert_eq!(
+            response.headers().get("vary").and_then(|v| v.to_str().ok()),
+            Some("Accept"),
+            "{accept:?}"
+        );
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let text = body_text(response).await;
+        if expect_html {
+            assert!(
+                content_type.starts_with("text/html"),
+                "{accept:?}: {content_type}"
+            );
+            assert!(text.contains("href=\"/status\""), "{accept:?}");
+        } else {
+            assert!(
+                content_type.starts_with("application/json"),
+                "{accept:?}: {content_type}"
+            );
+            let json: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["status"], "/status", "{accept:?}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn duplicate_deliveries_are_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(dir.path());

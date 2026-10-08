@@ -352,6 +352,13 @@ Quick repository hook: **Settings → Webhooks → Add webhook → Forgejo**, ta
 The endpoint also accepts GitHub (`/webhooks/github`) and GitLab
 (`/webhooks/gitlab`) webhooks, selected by URL path.
 
+## Index page
+
+`GET /` opens an index page in browsers (requests with `Accept: text/html`)
+that links to every browser page: status, admin, notifications, diagnostics,
+and the JSON snapshots and health check. Other clients still receive the JSON
+summary from `/`.
+
 ## Admin page
 
 `GET /admin` lists registered agents and their remaining cooldowns. Click
