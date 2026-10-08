@@ -32,7 +32,7 @@ jobs:
           echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
           # Probe the mirror for the channel named in rust-toolchain.toml.
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml | head -n1)
-          if [ -n "$RUST_MIRROR" ] && curl -fsSI --max-time 20 "$RUST_MIRROR/dist/channel-rust-$channel.toml" >/dev/null; then
+          if [ -n "$RUST_MIRROR" ] && curl -fsSIL --max-time 20 "$RUST_MIRROR/dist/channel-rust-$channel.toml" >/dev/null; then
             echo "Using Rust mirror: $RUST_MIRROR"
             echo "RUSTUP_DIST_SERVER=$RUST_MIRROR" >> "$GITHUB_ENV"
             echo "RUSTUP_UPDATE_ROOT=$RUST_MIRROR/rustup" >> "$GITHUB_ENV"
