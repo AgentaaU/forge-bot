@@ -208,18 +208,19 @@ impl CodexAppServerAgent {
         let thread_id = self
             .open_thread(process, live, key, context, deadline)
             .await?;
+        let effort = turn_effort(process, context, deadline).await;
 
         // Subscribe before `turn/start` so no part of the turn is missed.
         let mut events = process.subscribe();
+        let mut turn = json!({
+            "threadId": thread_id,
+            "input": [{ "type": "text", "text": prompt }],
+        });
+        if let Some(effort) = effort {
+            turn["effort"] = json!(effort);
+        }
         let response = process
-            .request(
-                "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "input": [{ "type": "text", "text": prompt }],
-                }),
-                deadline,
-            )
+            .request("turn/start", turn, deadline)
             .await
             .map_err(|error| BotError::Agent {
                 name: "codex".into(),
@@ -469,6 +470,81 @@ impl CodexAppServerAgent {
     }
 }
 
+/// Upper bound on `model/list` pages read while looking for a model default.
+const MAX_MODEL_PAGES: usize = 20;
+
+/// The `turn/start.effort` for this turn.
+///
+/// The app-server treats effort as sticky: it applies to this turn and every
+/// later one on the thread, and omitting it or sending null keeps the previous
+/// override. So a turn without an `/admin` effort must send the reset value
+/// explicitly. That is the configured default, or the model's default when
+/// none is configured. `None` (no effort sent) only when the server reports
+/// neither.
+async fn turn_effort(
+    process: &WireProcess,
+    context: &AgentContext,
+    deadline: Option<Instant>,
+) -> Option<String> {
+    if let Some(effort) = context.effort.as_deref().filter(|e| !e.is_empty()) {
+        return Some(effort.to_owned());
+    }
+    let model = context
+        .reported_model
+        .lock()
+        .expect("model mutex poisoned")
+        .clone();
+    default_effort(process, &context.workspace, model.as_deref(), deadline).await
+}
+
+/// The reasoning effort a thread uses without an override: the configured
+/// `model_reasoning_effort` for the workspace, else the model's own default.
+async fn default_effort(
+    process: &WireProcess,
+    workspace: &std::path::Path,
+    model: Option<&str>,
+    deadline: Option<Instant>,
+) -> Option<String> {
+    let mut config_params = json!({});
+    if !workspace.as_os_str().is_empty() {
+        config_params["cwd"] = json!(workspace.display().to_string());
+    }
+    let configured = process
+        .request("config/read", config_params, deadline)
+        .await
+        .ok()
+        .and_then(|result| {
+            result["config"]["model_reasoning_effort"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .filter(|effort| !effort.trim().is_empty());
+    if configured.is_some() {
+        return configured;
+    }
+
+    let model = model?;
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_MODEL_PAGES {
+        let mut params = json!({ "includeHidden": true });
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let page = process.request("model/list", params, deadline).await.ok()?;
+        let default = page["data"]
+            .as_array()?
+            .iter()
+            .find(|entry| entry["model"].as_str() == Some(model))
+            .and_then(|entry| entry["defaultReasoningEffort"].as_str())
+            .filter(|effort| !effort.trim().is_empty());
+        if let Some(default) = default {
+            return Some(default.to_owned());
+        }
+        cursor = Some(page["nextCursor"].as_str()?.to_owned());
+    }
+    None
+}
+
 /// Observe the server's effective model without selecting or guessing one.
 fn report_model(context: &AgentContext, response: &Value) {
     *context.reported_model.lock().expect("model mutex poisoned") = response["model"]
@@ -690,6 +766,131 @@ mod tests {
         assert!(logged.contains("thread/start"), "{logged}");
         assert!(logged.contains("thread/resume"), "{logged}");
         assert!(logged.contains("gpt-fast"), "{logged}");
+    }
+
+    fn turn_params(log: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|request| request["method"] == "turn/start")
+            .map(|request| request["params"].clone())
+            .collect()
+    }
+
+    /// The effective effort the server reported on each `thread/resume`.
+    fn resumed_efforts(effective_log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(effective_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sends_the_requested_effort_on_each_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        let sessions = Arc::new(SessionStore::load(dir.path()));
+        let mut config = base_config(&log);
+        config
+            .env
+            .insert("FAKE_CODEX_CONFIG_EFFORT".into(), "low".into());
+        let agent = agent(config, Arc::clone(&sessions));
+
+        let mut ctx = context(dir.path());
+        ctx.effort = Some("high".into());
+        assert!(agent.run(&request(), &ctx).await.unwrap().success);
+        // Without an effort the turn sends the configured default explicitly.
+        ctx.effort = None;
+        assert!(agent.run(&request(), &ctx).await.unwrap().success);
+
+        let turns = turn_params(&log);
+        assert_eq!(turns.len(), 2, "{turns:?}");
+        assert_eq!(turns[0]["effort"], "high");
+        assert_eq!(turns[1]["effort"], "low", "{turns:?}");
+    }
+
+    #[tokio::test]
+    async fn clearing_an_effort_restores_the_default_on_a_resumed_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        let effective_log = dir.path().join("effective.log");
+        let sessions = Arc::new(SessionStore::load(dir.path()));
+        let mut config = base_config(&log);
+        config
+            .env
+            .insert("FAKE_CODEX_CONFIG_EFFORT".into(), "low".into());
+        config.env.insert(
+            "FAKE_CODEX_STATE".into(),
+            dir.path().join("state.json").display().to_string(),
+        );
+        config.env.insert(
+            "FAKE_CODEX_EFFECTIVE_LOG".into(),
+            effective_log.display().to_string(),
+        );
+        let agent = agent(config, Arc::clone(&sessions));
+        let mut ctx = context(dir.path());
+
+        // Set `high`, then clear it. Each run is a new app-server process that
+        // resumes the same thread.
+        ctx.effort = Some("high".into());
+        assert!(agent.run(&request(), &ctx).await.unwrap().success);
+        ctx.effort = None;
+        assert!(agent.run(&request(), &ctx).await.unwrap().success);
+        assert!(agent.run(&request(), &ctx).await.unwrap().success);
+
+        // The resume before the clearing turn still sees `high`; after the
+        // clearing turn the thread is back on the configured `low`.
+        assert_eq!(resumed_efforts(&effective_log), ["high", "low"]);
+        let turns = turn_params(&log);
+        assert_eq!(turns[1]["effort"], "low", "{turns:?}");
+        assert_eq!(turns[2]["effort"], "low", "{turns:?}");
+        // The conversation itself was kept.
+        assert_eq!(
+            sessions.get("codex", "forgejo:o/r:1").as_deref(),
+            Some("thread-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_an_effort_falls_back_to_the_model_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        let effective_log = dir.path().join("effective.log");
+        let mut config = base_config(&log);
+        config
+            .env
+            .insert("FAKE_CODEX_MODEL_EFFORT".into(), "medium".into());
+        config.env.insert(
+            "FAKE_CODEX_STATE".into(),
+            dir.path().join("state.json").display().to_string(),
+        );
+        config.env.insert(
+            "FAKE_CODEX_EFFECTIVE_LOG".into(),
+            effective_log.display().to_string(),
+        );
+        let agent = agent(config, Arc::new(SessionStore::load(dir.path())));
+        let mut ctx = context(dir.path());
+
+        ctx.effort = Some("high".into());
+        assert!(agent.run(&request(), &ctx).await.unwrap().success);
+        // No `model_reasoning_effort` is configured, so the model's own default
+        // is restored.
+        ctx.effort = None;
+        assert!(agent.run(&request(), &ctx).await.unwrap().success);
+        assert!(agent.run(&request(), &ctx).await.unwrap().success);
+        assert_eq!(resumed_efforts(&effective_log), ["high", "medium"]);
+
+        // A model the server does not list has no known default: nothing is
+        // sent rather than a guessed value.
+        let mut unlisted = context(dir.path());
+        unlisted.model = Some("gpt-unlisted".into());
+        assert!(agent.run(&request(), &unlisted).await.unwrap().success);
+        let turns = turn_params(&log);
+        assert_eq!(turns.len(), 4, "{turns:?}");
+        assert_eq!(turns[1]["effort"], "medium", "{turns:?}");
+        assert!(turns[3].get("effort").is_none(), "{turns:?}");
     }
 
     #[tokio::test]

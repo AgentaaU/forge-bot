@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent::codex_app_server::CodexAppServerAgent;
-use crate::agent::command::{CommandAgent, SessionStyle};
+use crate::agent::command::{CommandAgent, EffortStyle, SessionStyle};
 use crate::agent::session::SessionStore;
 use crate::agent::{Agent, AgentContext, AgentOutcome, AgentRequest, SteerReceipt, wire};
 use crate::config::{AgentConfig, PromptDelivery};
@@ -48,7 +48,8 @@ pub fn build(config: &AgentConfig, sessions: Arc<SessionStore>) -> CodexAgent {
 pub fn build_one_shot(config: &AgentConfig, sessions: Arc<SessionStore>) -> CommandAgent {
     let agent = default_agent()
         .apply_config(config)
-        .arg("--dangerously-bypass-approvals-and-sandbox");
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .effort_style(EffortStyle::Config("model_reasoning_effort"));
 
     // `codex exec resume` rejects `--color`/`--sandbox`, so use the standalone
     // resume command while preserving the unconditional permission bypass.
@@ -126,6 +127,10 @@ impl Agent for CodexAgent {
             Some(app_server) => app_server.follow_up(request, context).await,
             None => Ok(None),
         }
+    }
+
+    fn supports_effort(&self) -> bool {
+        true
     }
 }
 

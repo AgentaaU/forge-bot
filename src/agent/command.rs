@@ -60,6 +60,63 @@ pub struct CommandAgent {
     /// before the prompt; adapters whose prompt-consuming flag must stay last
     /// (agy `--print`) pin it to that flag's index.
     model_at: Option<usize>,
+    /// How a per-run reasoning effort is passed. `None` means the adapter does
+    /// not support one and ignores [`AgentContext::effort`].
+    effort: Option<EffortStyle>,
+}
+
+/// How a CLI receives a reasoning effort level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortStyle {
+    /// `<flag> <level>`, e.g. `--effort high`.
+    Flag(&'static str),
+    /// `-c <key>="<level>"`, a config override such as Codex's
+    /// `model_reasoning_effort`.
+    Config(&'static str),
+}
+
+impl EffortStyle {
+    /// Whether `args` already sets this option, so the operator's choice wins.
+    fn is_set_in(self, args: &[String]) -> bool {
+        !self.option_spans(args).is_empty()
+    }
+
+    /// Index ranges of the complete option(s) in `args` that set this effort.
+    /// A flag and its value form one option; a config override may be spelled
+    /// `-c key=v`, `--config key=v`, `--config=key=v`, `-ckey=v` or `-c=key=v`.
+    fn option_spans(self, args: &[String]) -> Vec<std::ops::Range<usize>> {
+        let mut spans = Vec::new();
+        let mut index = 0;
+        while index < args.len() {
+            let width = match self {
+                EffortStyle::Flag(flag) if args[index] == flag => {
+                    if index + 1 < args.len() {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                EffortStyle::Flag(flag) if args[index].starts_with(&format!("{flag}=")) => 1,
+                EffortStyle::Flag(_) => 0,
+                EffortStyle::Config(key) => config_option_width(args, index, key),
+            };
+            if width == 0 {
+                index += 1;
+            } else {
+                spans.push(index..index + width);
+                index += width;
+            }
+        }
+        spans
+    }
+
+    /// The argument pair (or the single config override) for `level`.
+    fn arguments(self, level: &str) -> Vec<String> {
+        match self {
+            EffortStyle::Flag(flag) => vec![flag.to_owned(), level.to_owned()],
+            EffortStyle::Config(key) => vec!["-c".to_owned(), format!("{key}=\"{level}\"")],
+        }
+    }
 }
 
 /// How a [`CommandAgent`] continues the conversation for one thread.
@@ -262,6 +319,49 @@ pub(crate) fn model_arg(args: &[String], short: bool) -> Option<String> {
         .next_back()
 }
 
+/// Number of arguments (1 or 2) the config option starting at `index` spans
+/// when it sets `key`; 0 when it does not.
+fn config_option_width(args: &[String], index: usize, key: &str) -> usize {
+    let arg = args[index].as_str();
+    let sets_key = |value: &str| value.starts_with(&format!("{key}="));
+    if arg == "-c" || arg == "--config" {
+        return match args.get(index + 1) {
+            Some(value) if sets_key(value) => 2,
+            _ => 0,
+        };
+    }
+    // The value is attached to the flag, optionally after `=`.
+    let attached = arg
+        .strip_prefix("--config=")
+        .or_else(|| arg.strip_prefix("-c"))
+        .map(|rest| rest.strip_prefix('=').unwrap_or(rest));
+    match attached {
+        Some(value) if sets_key(value) => 1,
+        _ => 0,
+    }
+}
+
+/// Insert the run's reasoning effort unless the operator already set one. It
+/// goes in the same position as the model, so it never lands after a
+/// prompt-consuming flag.
+fn apply_effort(
+    args: &mut Vec<String>,
+    effort: Option<&str>,
+    style: Option<EffortStyle>,
+    at: Option<usize>,
+) {
+    let (Some(effort), Some(style)) = (effort.map(str::trim).filter(|e| !e.is_empty()), style)
+    else {
+        return;
+    };
+    if !style.is_set_in(args) {
+        let at = at.unwrap_or(args.len()).min(args.len());
+        for (offset, arg) in style.arguments(effort).into_iter().enumerate() {
+            args.insert(at + offset, arg);
+        }
+    }
+}
+
 /// Insert the addressed user's `--model <id>` unless the operator already
 /// configured one. `at` pins the insertion before a prompt-consuming flag
 /// (agy `--print`); `None` appends it just before the prompt.
@@ -288,7 +388,14 @@ impl CommandAgent {
             session: None,
             result_format: OutputFormat::Text,
             model_at: None,
+            effort: None,
         }
+    }
+
+    /// Pass [`AgentContext::effort`] to the CLI in the given style.
+    pub fn effort_style(mut self, style: EffortStyle) -> Self {
+        self.effort = Some(style);
+        self
     }
 
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
@@ -487,12 +594,29 @@ impl CommandAgent {
     pub fn arguments(&self) -> &[String] {
         &self.args
     }
+
+    /// The operator's own effort argument(s) from the configured args, kept
+    /// verbatim so they survive a resume that replaces those args.
+    fn operator_effort_args(&self) -> Vec<String> {
+        let Some(style) = self.effort else {
+            return Vec::new();
+        };
+        style
+            .option_spans(&self.args)
+            .into_iter()
+            .flat_map(|span| self.args[span].iter().cloned())
+            .collect()
+    }
 }
 
 #[async_trait::async_trait]
 impl Agent for CommandAgent {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn supports_effort(&self) -> bool {
+        self.effort.is_some()
     }
 
     async fn run(&self, request: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
@@ -521,11 +645,22 @@ impl Agent for CommandAgent {
             }
             None => args.extend(plan.args.iter().cloned()),
         }
+        // Replacing the base args drops the operator's own effort with them.
+        // Keep it, so the configured choice still wins over `/admin`.
+        if plan.replace_base {
+            args.extend(self.operator_effort_args());
+        }
 
         // Apply the addressed user's model before reading the effective model
         // for reporting. An explicit `--model` already in the configured args
         // wins, so operator intent is never overridden.
         apply_model(&mut args, context.model.as_deref(), self.model_at);
+        apply_effort(
+            &mut args,
+            context.effort.as_deref(),
+            self.effort,
+            self.model_at,
+        );
 
         let configured_model = match self.name.as_str() {
             "agy" => crate::agent::agy::configured_model(&args, self.env.get("HOME")),
@@ -881,6 +1016,68 @@ mod tests {
                 "value".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn apply_effort_uses_the_adapter_style_and_respects_an_explicit_choice() {
+        // A flag style adds the pair before the prompt.
+        let mut args = vec!["--print".to_owned()];
+        apply_effort(
+            &mut args,
+            Some(" high "),
+            Some(EffortStyle::Flag("--effort")),
+            None,
+        );
+        assert_eq!(args, ["--print", "--effort", "high"]);
+
+        // A config style uses `-c key="level"`, as Codex expects.
+        let mut args = vec!["exec".to_owned()];
+        apply_effort(
+            &mut args,
+            Some("xhigh"),
+            Some(EffortStyle::Config("model_reasoning_effort")),
+            None,
+        );
+        assert_eq!(args, ["exec", "-c", "model_reasoning_effort=\"xhigh\""]);
+
+        // The operator's own flag or override is never replaced.
+        let mut args = vec!["--thinking=low".to_owned()];
+        apply_effort(
+            &mut args,
+            Some("high"),
+            Some(EffortStyle::Flag("--thinking")),
+            None,
+        );
+        assert_eq!(args, ["--thinking=low"]);
+        let mut args = vec!["-c".to_owned(), "model_reasoning_effort=\"low\"".to_owned()];
+        apply_effort(
+            &mut args,
+            Some("high"),
+            Some(EffortStyle::Config("model_reasoning_effort")),
+            None,
+        );
+        assert_eq!(args.len(), 2);
+
+        // No effort, a blank effort, or an adapter without a style: no change.
+        for (effort, style) in [
+            (None, Some(EffortStyle::Flag("--effort"))),
+            (Some("  "), Some(EffortStyle::Flag("--effort"))),
+            (Some("high"), None),
+        ] {
+            let mut args = vec!["exec".to_owned()];
+            apply_effort(&mut args, effort, style, None);
+            assert_eq!(args, ["exec"]);
+        }
+
+        // A pinned index sits with the model, before a prompt-consuming flag.
+        let mut args = vec!["--print".to_owned()];
+        apply_effort(
+            &mut args,
+            Some("low"),
+            Some(EffortStyle::Flag("--effort")),
+            Some(0),
+        );
+        assert_eq!(args, ["--effort", "low", "--print"]);
     }
 
     #[test]
@@ -1251,6 +1448,149 @@ if out:
             lines[1].starts_with("exec resume tid-123 -o "),
             "{}",
             lines[1]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_resume_keeps_the_operators_effort_over_admin() {
+        const FAKE_CODEX: &str = r#"#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+out = None
+for i, a in enumerate(args):
+    if a == "-o":
+        out = args[i + 1]
+with open(os.environ["FAKE_LOG"], "a") as f:
+    f.write(" ".join(args) + "\n")
+prompt = sys.stdin.read()
+with open(os.environ["FAKE_PROMPTS"], "a") as f:
+    import json
+    f.write(json.dumps(prompt) + "\n")
+print('{"type":"thread.started","thread_id":"tid-123"}')
+from pathlib import Path
+sessions = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "09" / "28"
+sessions.mkdir(parents=True, exist_ok=True)
+(sessions / "rollout-2026-09-28T00-00-00-tid-123.jsonl").write_text('{"type":"turn_context","payload":{"model":"test/codex-model"}}\n')
+if out:
+    with open(out, "w") as f:
+        f.write("CODEX-REPLY")
+"#;
+        let codex_low = "model_reasoning_effort=\"low\"";
+        let codex_high = "model_reasoning_effort=\"high\"";
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        // Every spelling of the operator's override, plus no override at all.
+        // `/admin` asks for `high` in every case.
+        let forms: [Option<Vec<String>>; 6] = [
+            Some(vec!["-c".into(), codex_low.into()]),
+            Some(vec!["--config".into(), codex_low.into()]),
+            Some(vec![format!("--config={codex_low}")]),
+            Some(vec![format!("-c{codex_low}")]),
+            Some(vec![format!("-c={codex_low}")]),
+            None,
+        ];
+        for operator_effort in forms {
+            let dir = tempfile::tempdir().unwrap();
+            let script = write_executable(dir.path(), "fake_codex.py", FAKE_CODEX);
+            let log = dir.path().join("args.log");
+            let store = Arc::new(SessionStore::load(dir.path()));
+            let prompts = dir.path().join("prompts.jsonl");
+            let mut args = vec!["exec".to_owned()];
+            if let Some(effort) = &operator_effort {
+                args.extend(effort.clone());
+            }
+            let config = crate::config::AgentConfig {
+                command: Some(script.display().to_string()),
+                args: Some(args),
+                ..crate::config::AgentConfig::default()
+            };
+            let agent = crate::agent::codex::build_one_shot(&config, Arc::clone(&store))
+                .env("FAKE_LOG", log.display().to_string())
+                .env("FAKE_PROMPTS", prompts.display().to_string())
+                .env("CODEX_HOME", dir.path().display().to_string());
+            let context = AgentContext {
+                effort: Some("high".into()),
+                ..context_for(dir.path())
+            };
+
+            assert!(agent.run(&request, &context).await.unwrap().success);
+            assert!(agent.run(&request, &context).await.unwrap().success);
+
+            let received: Vec<String> = std::fs::read_to_string(&prompts)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(received, vec![build_prompt(&request, &context); 2]);
+
+            let logged = std::fs::read_to_string(&log).unwrap();
+            let lines: Vec<&str> = logged.lines().collect();
+            assert_eq!(lines.len(), 2, "{logged}");
+            // Creation and continuation must both keep the operator's option
+            // intact, and only fall back to `/admin` without one.
+            let (expected, rejected) = match &operator_effort {
+                Some(effort) => (effort.join(" "), codex_high),
+                None => (codex_high.to_owned(), codex_low),
+            };
+            for line in &lines {
+                assert!(line.contains(&expected), "{line}");
+                assert!(!line.contains(rejected), "{line}");
+            }
+            assert!(lines[1].starts_with("exec resume tid-123 "), "{}", lines[1]);
+        }
+    }
+
+    #[test]
+    fn effort_options_are_recognized_in_every_config_spelling() {
+        let style = EffortStyle::Config("model_reasoning_effort");
+        let value = "model_reasoning_effort=\"low\"";
+        let spellings: [Vec<String>; 5] = [
+            vec!["-c".into(), value.into()],
+            vec!["--config".into(), value.into()],
+            vec![format!("--config={value}")],
+            vec![format!("-c{value}")],
+            vec![format!("-c={value}")],
+        ];
+        for spelling in spellings {
+            let mut args = vec!["exec".to_owned()];
+            args.extend(spelling.clone());
+            args.push("--json".into());
+            assert!(style.is_set_in(&args), "{args:?}");
+            assert_eq!(style.option_spans(&args).len(), 1, "{args:?}");
+            // An admin effort must not be injected next to the operator's.
+            let mut applied = args.clone();
+            apply_effort(&mut applied, Some("high"), Some(style), None);
+            assert_eq!(applied, args, "{args:?}");
+        }
+
+        // A bare value that is not an option (e.g. a prompt) is not an override.
+        let orphan = vec!["exec".to_owned(), "resume".into(), value.into()];
+        assert!(!style.is_set_in(&orphan));
+        // Another key sharing the prefix is not this option.
+        let other = vec![
+            "--config".to_owned(),
+            "model_reasoning_effort_x=\"low\"".into(),
+        ];
+        assert!(!style.is_set_in(&other));
+    }
+
+    #[test]
+    fn operator_effort_options_survive_as_whole_options() {
+        let style = EffortStyle::Config("model_reasoning_effort");
+        let value = "model_reasoning_effort=\"low\"";
+        let agent = CommandAgent::new("codex", "codex")
+            .args(["exec", "--config", value, "--json"])
+            .effort_style(style);
+        assert_eq!(agent.operator_effort_args(), ["--config", value]);
+        let agent = CommandAgent::new("codex", "codex")
+            .args(["exec", "--config=model_reasoning_effort=\"low\""])
+            .effort_style(style);
+        assert_eq!(
+            agent.operator_effort_args(),
+            ["--config=model_reasoning_effort=\"low\""]
         );
     }
 }

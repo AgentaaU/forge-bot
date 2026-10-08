@@ -32,6 +32,16 @@ use crate::location::ForgeKind;
 
 pub use registry::{AgentRegistry, UnavailableReason};
 
+/// Reasoning effort levels the operator may choose in `/admin`. Every
+/// supported adapter (Claude `--effort`, Pi `--thinking`, Codex
+/// `model_reasoning_effort`) accepts all of them.
+pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
+
+/// Whether `value` is one of [`EFFORT_LEVELS`].
+pub fn is_effort_level(value: &str) -> bool {
+    EFFORT_LEVELS.contains(&value)
+}
+
 /// The only thing the gateway sends to an agent, exactly as in the design:
 /// where the request came from and what was asked.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,8 +94,13 @@ pub struct AgentContext {
     /// Stable user id this run belongs to. It namespaces workspaces, sessions
     /// and replies.
     pub user_id: Option<String>,
-    /// Model ID to pass to the agent, from the addressed user's `agent_model`.
+    /// Model ID to pass to the agent, from the addressed user's `agent_model`
+    /// or its `/admin` override.
     pub model: Option<String>,
+    /// Reasoning effort requested for this run through `/admin`. `None` leaves
+    /// the agent's own default. Only adapters reporting
+    /// [`Agent::supports_effort`] receive it.
+    pub effort: Option<String>,
 }
 
 /// Bounded output buffer for a run in progress. It is never persisted.
@@ -300,6 +315,12 @@ pub trait Agent: Send + Sync {
     ) -> Result<Option<SteerReceipt>> {
         Ok(None)
     }
+
+    /// Whether this adapter applies [`AgentContext::effort`]. `/admin` only
+    /// accepts an effort for an agent that reports support.
+    fn supports_effort(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +354,7 @@ mod tests {
             host_user: None,
             user_id: None,
             model: None,
+            effort: None,
         };
         let env = ctx.environment(&request);
         assert!(

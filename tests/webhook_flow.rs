@@ -2655,3 +2655,161 @@ async fn admin_terminate_rejects_threads_that_are_not_running() {
         .unwrap();
     assert!(response.status().is_client_error());
 }
+
+#[tokio::test]
+async fn admin_sets_each_agent_users_model_and_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness_with(dir.path(), |config| {
+        // `claude` supports effort; `custom` does not. The default user runs
+        // `claude`, the reviewer runs `custom`, and a human is not an agent.
+        config.agent_sequence = vec!["claude".into(), "custom".into()];
+        config.agents.overrides.insert(
+            "claude".into(),
+            AgentConfig {
+                command: Some("cat".into()),
+                ..Default::default()
+            },
+        );
+        config.users.insert(
+            "reviewer".into(),
+            UserConfig {
+                role: UserRole::Reviewer,
+                host_user: "reviewer".into(),
+                agent: Some("custom".into()),
+                agent_model: Some("review-model".into()),
+                token: None,
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                role: UserRole::Human,
+                host_user: String::new(),
+                agent: None,
+                agent_model: None,
+                token: None,
+            },
+        );
+    });
+
+    let get_admin = |app: axum::Router| async move {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    };
+    let post = |app: axum::Router, body: Body, json: bool| async move {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/admin/agent-settings");
+        if json {
+            request = request.header("content-type", "application/json");
+        }
+        app.oneshot(request.body(body).unwrap()).await.unwrap()
+    };
+
+    let html = get_admin(h.app.clone()).await;
+    assert!(html.contains("Agent models and effort"), "{html}");
+    assert!(html.contains("data-user=\"default\""), "{html}");
+    assert!(html.contains("data-user=\"reviewer\""), "{html}");
+    assert!(html.contains("placeholder=\"review-model\""), "{html}");
+    assert!(html.contains("Not supported by this agent"), "{html}");
+    assert!(!html.contains("data-user=\"alice\""), "{html}");
+
+    let rejected = [
+        (json!({"user": "missing"}), StatusCode::NOT_FOUND),
+        (
+            json!({"user": "alice", "model": "x"}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            json!({"user": "default", "model": "has space"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"user": "default", "model": "m".repeat(201)}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"user": "default", "effort": "max"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"user": "reviewer", "effort": "high"}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (body, expected) in rejected {
+        let response = post(h.app.clone(), Body::from(body.to_string()), true).await;
+        assert_eq!(response.status(), expected, "{body}");
+    }
+    // Only the JSON body reaches the handler, so a cross-origin form cannot
+    // change a model or effort.
+    let response = post(
+        h.app.clone(),
+        Body::from("user=default&model=gpt-form"),
+        false,
+    )
+    .await;
+    assert!(response.status().is_client_error());
+    assert!(!get_admin(h.app.clone()).await.contains("gpt-form"));
+
+    let response = post(
+        h.app.clone(),
+        Body::from(json!({"user": "default", "model": " gpt-fast ", "effort": "high"}).to_string()),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = post(
+        h.app.clone(),
+        Body::from(json!({"user": "reviewer", "model": "review-2"}).to_string()),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let html = get_admin(h.app.clone()).await;
+    assert!(html.contains("value=\"gpt-fast\""), "{html}");
+    assert!(
+        html.contains("<option value=\"high\" selected>high</option>"),
+        "{html}"
+    );
+    assert!(html.contains("value=\"review-2\""), "{html}");
+    let saved = std::fs::read_to_string(dir.path().join("agent-settings.json")).unwrap();
+    assert!(
+        saved.contains("gpt-fast") && saved.contains("review-2"),
+        "{saved}"
+    );
+
+    // A save that cannot be persisted is reported and changes nothing.
+    let tmp = dir.path().join("agent-settings.json.tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    let response = post(
+        h.app.clone(),
+        Body::from(json!({"user": "default", "model": "gpt-lost"}).to_string()),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!get_admin(h.app.clone()).await.contains("gpt-lost"));
+    std::fs::remove_dir(&tmp).unwrap();
+
+    // An empty save restores the configured defaults.
+    let response = post(
+        h.app.clone(),
+        Body::from(json!({"user": "default"}).to_string()),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let html = get_admin(h.app.clone()).await;
+    assert!(!html.contains("gpt-fast"), "{html}");
+}

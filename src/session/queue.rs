@@ -31,7 +31,7 @@ use crate::mention::{Mention, extract_mention};
 use crate::notify::{Notifier, RecentComments, delivery_key};
 use crate::policy::Policy;
 use crate::session::status::{self, ThreadStatus};
-use crate::session::{Job, SessionStore};
+use crate::session::{Job, SessionStore, UserAgentSettings};
 use crate::workspace::WorkspaceManager;
 
 /// Routes jobs from webhooks to agents.
@@ -591,6 +591,17 @@ impl Dispatcher {
 
     /// Terminate the run in flight for conversation `key`.
     ///
+    /// Operator overrides (model, effort) for an agent user, set from `/admin`.
+    pub fn user_settings(&self, user_id: &str) -> UserAgentSettings {
+        self.inner.sessions.user_settings(user_id)
+    }
+
+    /// Replace an agent user's overrides. They apply from the next run; runs
+    /// already in flight keep the settings they started with.
+    pub fn set_user_settings(&self, user_id: &str, settings: UserAgentSettings) -> Result<()> {
+        self.inner.sessions.set_user_settings(user_id, settings)
+    }
+
     /// The job future is dropped, which kills the agent process and its
     /// cgroup, records the run as failed and tells the thread. Returns `false`
     /// when nothing is running for `key`. Jobs waiting in the queue are not
@@ -1095,6 +1106,7 @@ impl Inner {
             host_user,
             user_id: user_id.clone(),
             model: None,
+            effort: None,
             reviewer: self
                 .identities
                 .reviewer_for(&user.login)
@@ -1119,9 +1131,19 @@ impl Inner {
         // unclassified reason.
         let mut previous_reason: Option<UnavailableReason> = None;
 
+        // `/admin` overrides win over the configured model and apply only to
+        // the addressed user's own agent, like `agent_model`.
+        let overrides = user_id
+            .as_deref()
+            .map(|id| self.sessions.user_settings(id))
+            .unwrap_or_default();
+
         for (index, name) in candidates.iter().enumerate() {
             context.model = (name == model_agent)
-                .then(|| user.agent_model.clone())
+                .then(|| overrides.model.clone().or_else(|| user.agent_model.clone()))
+                .flatten();
+            context.effort = (name == model_agent)
+                .then(|| overrides.effort.clone())
                 .flatten();
             used_agent = name.clone();
             running_agent = name.clone();
@@ -1171,6 +1193,9 @@ impl Inner {
                     break;
                 }
             };
+            if context.effort.is_some() && !agent.supports_effort() {
+                tracing::warn!(agent = %name, "agent does not support the configured effort; using its default");
+            }
 
             if let Err(error) = self.sessions.set_running_agent(&key, job.id, name) {
                 tracing::warn!(%error, "failed to persist running agent");
@@ -3198,6 +3223,105 @@ mod tests {
                     .unwrap()
                     .trim()
                     .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_settings_override_the_users_model_and_effort() {
+        /// Records the model and effort each run was handed.
+        struct Recorder {
+            supports_effort: bool,
+            seen: Mutex<Vec<(Option<String>, Option<String>)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::agent::Agent for Recorder {
+            fn name(&self) -> &str {
+                "recorder"
+            }
+
+            fn supports_effort(&self) -> bool {
+                self.supports_effort
+            }
+
+            async fn run(
+                &self,
+                _request: &crate::agent::AgentRequest,
+                context: &AgentContext,
+            ) -> Result<crate::agent::AgentOutcome> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((context.model.clone(), context.effort.clone()));
+                Ok(crate::agent::AgentOutcome::success("done", Duration::ZERO))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.policy.allow_all = true;
+        config.agent_sequence = vec!["recorder".into()];
+        let user = config.users.get_mut("default").unwrap();
+        user.agent = Some("recorder".into());
+        user.agent_model = Some("configured-model".into());
+        let config = Arc::new(config);
+
+        for supports_effort in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let recorder = Arc::new(Recorder {
+                supports_effort,
+                seen: Mutex::new(Vec::new()),
+            });
+            let mut registry = AgentRegistry::from_config(&config);
+            registry.insert_for_test("recorder", recorder.clone());
+            let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+            let dispatcher = Dispatcher::new(
+                config.clone(),
+                Arc::new(registry),
+                sessions.clone(),
+                Arc::new(NoopForgeApi),
+                Policy::new(&config.policy),
+            )
+            .unwrap();
+            let submit = |dispatcher: Arc<Dispatcher>| async move {
+                dispatcher
+                    .submit(
+                        message("o/r"),
+                        Mention {
+                            agent: None,
+                            message: "go".into(),
+                        },
+                        "recorder",
+                    )
+                    .await
+                    .unwrap();
+            };
+
+            // Without an override the configured model applies and no effort is set.
+            submit(dispatcher.clone()).await;
+            wait_for_drain(&sessions).await;
+
+            dispatcher
+                .set_user_settings(
+                    "default",
+                    crate::session::UserAgentSettings {
+                        model: Some("override-model".into()),
+                        effort: Some("high".into()),
+                    },
+                )
+                .unwrap();
+            submit(dispatcher.clone()).await;
+            wait_for_drain(&sessions).await;
+
+            let seen = recorder.seen.lock().unwrap().clone();
+            assert_eq!(
+                seen,
+                vec![
+                    (Some("configured-model".into()), None),
+                    (Some("override-model".into()), Some("high".into())),
+                ],
+                "supports_effort = {supports_effort}"
             );
         }
     }

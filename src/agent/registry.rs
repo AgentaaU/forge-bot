@@ -412,6 +412,33 @@ mod tests {
     use crate::config::AgentConfig;
 
     #[test]
+    fn only_adapters_that_take_an_effort_flag_support_one() {
+        let mut config = Config::default();
+        config.agents.overrides.insert(
+            "pi".into(),
+            AgentConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+        let registry = AgentRegistry::from_config(&config);
+        for (name, expected) in [
+            ("codex", true),
+            ("claude", true),
+            ("pi", true),
+            ("pi-rpc", true),
+            ("kimi", false),
+            ("agy", false),
+        ] {
+            assert_eq!(
+                registry.get(name).unwrap().supports_effort(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn registers_builtins_except_the_opt_in_pi() {
         let registry = AgentRegistry::from_config(&Config::default());
         for name in BUILTIN_AGENTS {

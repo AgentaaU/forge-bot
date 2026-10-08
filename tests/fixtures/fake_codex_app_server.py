@@ -22,6 +22,15 @@ Environment:
 * ``FAKE_CODEX_STEER_DELAY`` delays the ``turn/steer`` acknowledgment.
 * ``FAKE_CODEX_STEER_EXIT=1`` records the steer and exits without answering it.
 * ``FAKE_CODEX_PID_FILE`` records this process's pid so tests can check it stops.
+* ``FAKE_CODEX_CONFIG_EFFORT`` is the configured ``model_reasoning_effort``
+  (returned by ``config/read``); unset means none is configured.
+* ``FAKE_CODEX_MODEL_EFFORT`` is the default effort of ``codex-default``
+  (``model/list``), used when none is configured. Defaults to ``medium``.
+* ``FAKE_CODEX_STATE`` persists the thread's effort override across processes.
+  Like Codex, a ``turn/start`` with an effort sets the override, while one
+  without it (or with null) keeps the previous one.
+* ``FAKE_CODEX_EFFECTIVE_LOG`` appends the effective ``reasoningEffort`` each
+  ``thread/resume`` reports.
 """
 
 import json
@@ -41,6 +50,10 @@ exit_after_turn_start = os.environ.get("FAKE_CODEX_EXIT_AFTER_TURN_START") == "1
 steer_delay = float(os.environ.get("FAKE_CODEX_STEER_DELAY", "0"))
 steer_exit = os.environ.get("FAKE_CODEX_STEER_EXIT") == "1"
 pid_file = os.environ.get("FAKE_CODEX_PID_FILE")
+config_effort = os.environ.get("FAKE_CODEX_CONFIG_EFFORT") or None
+model_effort = os.environ.get("FAKE_CODEX_MODEL_EFFORT", "medium")
+state_path = os.environ.get("FAKE_CODEX_STATE")
+effective_log = os.environ.get("FAKE_CODEX_EFFECTIVE_LOG")
 if pid_file:
     with open(pid_file, "w") as handle:
         handle.write(str(os.getpid()))
@@ -58,8 +71,22 @@ def respond(request_id, result):
     send({"id": request_id, "result": result})
 
 
+def load_override():
+    if state_path and os.path.exists(state_path):
+        with open(state_path) as handle:
+            return json.load(handle).get("effort")
+    return None
+
+
+def effective_effort():
+    return load_override() or config_effort or model_effort
+
+
 def respond_thread(request_id, params, resume=False):
-    result = {"thread": {"id": "thread-1"}}
+    result = {"thread": {"id": "thread-1"}, "reasoningEffort": effective_effort()}
+    if resume and effective_log:
+        with open(effective_log, "a") as handle:
+            handle.write(result["reasoningEffort"] + "\n")
     if os.environ.get("FAKE_CODEX_OMIT_MODEL") != "1":
         model = params.get("model", "codex-default")
         if resume:
@@ -116,6 +143,13 @@ for line in sys.stdin:
     if method == "initialize":
         respond(request_id, {"codexHome": "/tmp/codex", "platformFamily": "unix",
                              "platformOs": "linux", "userAgent": "fake"})
+    elif method == "config/read":
+        respond(request_id, {"config": {"model_reasoning_effort": config_effort},
+                             "origins": {}, "layers": None})
+    elif method == "model/list":
+        respond(request_id, {"data": [{"model": "codex-default",
+                                       "defaultReasoningEffort": model_effort}],
+                             "nextCursor": None})
     elif method == "thread/start":
         respond_thread(request_id, params)
     elif method == "thread/resume":
@@ -127,6 +161,9 @@ for line in sys.stdin:
         if fail_turn:
             send({"id": request_id, "error": {"code": -32600, "message": "turn start failed"}})
             continue
+        if state_path and isinstance(params.get("effort"), str):
+            with open(state_path, "w") as handle:
+                json.dump({"effort": params["effort"]}, handle)
         send({"method": "turn/started",
               "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}})
         respond(request_id, {"turn": {"id": "turn-1", "status": "inProgress", "items": []}})

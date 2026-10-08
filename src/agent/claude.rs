@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::agent::command::{CommandAgent, SessionStyle};
+use crate::agent::command::{CommandAgent, EffortStyle, SessionStyle};
 use crate::agent::session::SessionStore;
 use crate::config::{AgentConfig, PromptDelivery};
 
@@ -28,6 +28,7 @@ pub fn build(config: &AgentConfig, sessions: Arc<SessionStore>) -> CommandAgent 
         .apply_config(config)
         .dangerously_skip_permissions(auto)
         .with_json_output()
+        .effort_style(EffortStyle::Flag("--effort"))
         .session(
             SessionStyle {
                 create_args: vec!["--session-id".into(), "{session}".into()],

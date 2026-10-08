@@ -50,6 +50,15 @@ const SCRUBBED_ENV: &[&str] = &[
     "VISUAL",
 ];
 
+/// Per-user settings that select which `pi` process a run may reuse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchSettings<'a> {
+    /// `--model` for the process, from the user's model.
+    pub model: Option<&'a str>,
+    /// `--thinking` for the process, from the user's effort.
+    pub effort: Option<&'a str>,
+}
+
 /// Arguments for a `pi --mode rpc` process.
 ///
 /// `session_id` is only used when sessions are persisted (`no_session =
@@ -59,6 +68,7 @@ fn rpc_arguments(
     config: &PiRpcConfig,
     session_id: Option<&str>,
     model: Option<&str>,
+    effort: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec!["--mode".to_owned(), "rpc".to_owned()];
     if config.approve {
@@ -77,6 +87,15 @@ fn rpc_arguments(
     {
         args.push("--model".to_owned());
         args.push(model.to_owned());
+    }
+    // Likewise a per-user reasoning effort, unless the operator set `--thinking`.
+    if let Some(effort) = effort.map(str::trim).filter(|effort| !effort.is_empty())
+        && !args
+            .iter()
+            .any(|arg| arg == "--thinking" || arg.starts_with("--thinking="))
+    {
+        args.push("--thinking".to_owned());
+        args.push(effort.to_owned());
     }
     args
 }
@@ -211,7 +230,7 @@ impl PiRpcClient {
         session_id: Option<&str>,
         executor: &crate::executor::Executor,
         host_user: Option<&str>,
-        model: Option<&str>,
+        settings: LaunchSettings<'_>,
     ) -> Result<Self> {
         let mut env: Vec<(String, String)> = config
             .env
@@ -221,7 +240,7 @@ impl PiRpcClient {
         env.extend(credentials.iter().cloned());
         let spec = ExecSpec {
             program: config.command.clone(),
-            args: rpc_arguments(config, session_id, model),
+            args: rpc_arguments(config, session_id, settings.model, settings.effort),
             env,
             cwd: (!workspace.as_os_str().is_empty()).then(|| workspace.to_path_buf()),
             host_user: host_user.map(str::to_owned),
@@ -687,6 +706,8 @@ struct PoolEntry {
     /// Model this process was started with, so a differently configured
     /// process is never reused.
     model: Option<String>,
+    /// Reasoning effort this process was started with, for the same reason.
+    effort: Option<String>,
     client: Option<PiRpcClient>,
     /// Writer for the live process. Kept on the entry while `client` is
     /// checked out by a run in flight, so a follow-up can be injected without
@@ -765,7 +786,7 @@ impl PoolInner {
         credentials: &[(String, String)],
         executor: &crate::executor::Executor,
         host_user: Option<&str>,
-        model: Option<&str>,
+        settings: LaunchSettings<'_>,
     ) -> Result<PoolGuard> {
         let deadline = (self.config.timeout_secs != 0)
             .then(|| Instant::now() + Duration::from_secs(self.config.timeout_secs));
@@ -788,7 +809,8 @@ impl PoolInner {
                 let reusable = |entry: &PoolEntry| {
                     entry.workspace == workspace
                         && entry.host_user.as_deref() == host_user
-                        && entry.model.as_deref() == model
+                        && entry.model.as_deref() == settings.model
+                        && entry.effort.as_deref() == settings.effort
                         && !entry.busy
                         && entry.client.is_some()
                 };
@@ -875,7 +897,7 @@ impl PoolInner {
                         session_id.as_deref(),
                         executor,
                         host_user,
-                        model,
+                        settings,
                     )?;
                     let pid = client.pid();
                     let writer = Some(client.writer());
@@ -885,7 +907,8 @@ impl PoolInner {
                         pid,
                         workspace: workspace.to_path_buf(),
                         host_user: host_user.map(str::to_owned),
-                        model: model.map(str::to_owned),
+                        model: settings.model.map(str::to_owned),
+                        effort: settings.effort.map(str::to_owned),
                         client: None,
                         writer,
                         busy: true,
@@ -1073,7 +1096,10 @@ impl Agent for PiPoolAgent {
                 &context.credentials,
                 context.executor.as_ref(),
                 context.host_user.as_deref(),
-                context.model.as_deref(),
+                LaunchSettings {
+                    model: context.model.as_deref(),
+                    effort: context.effort.as_deref(),
+                },
             )
             .await?;
         let prompt = build_prompt(request, context);
@@ -1149,6 +1175,10 @@ impl Agent for PiPoolAgent {
         }
     }
 
+    fn supports_effort(&self) -> bool {
+        true
+    }
+
     async fn follow_up(
         &self,
         request: &AgentRequest,
@@ -1212,7 +1242,7 @@ mod tests {
             no_session: false,
             ..Default::default()
         };
-        let args = rpc_arguments(&config, Some("session-123"), None);
+        let args = rpc_arguments(&config, Some("session-123"), None, None);
         assert_eq!(&args[..2], ["--mode", "rpc"]);
         assert!(args.contains(&"--approve".to_owned()));
         assert!(args.contains(&"--session-id".to_owned()));
@@ -1223,7 +1253,7 @@ mod tests {
     #[test]
     fn rpc_arguments_apply_a_per_user_model() {
         let config = PiRpcConfig::default();
-        let args = rpc_arguments(&config, None, Some("gpt-fast"));
+        let args = rpc_arguments(&config, None, Some("gpt-fast"), None);
         assert!(args.windows(2).any(|w| w == ["--model", "gpt-fast"]));
 
         // An operator-configured model wins.
@@ -1231,9 +1261,27 @@ mod tests {
             args: vec!["--model".into(), "operator".into()],
             ..Default::default()
         };
-        let args = rpc_arguments(&config, None, Some("gpt-fast"));
+        let args = rpc_arguments(&config, None, Some("gpt-fast"), None);
         assert!(!args.contains(&"gpt-fast".to_owned()));
         assert!(args.contains(&"operator".to_owned()));
+    }
+
+    #[test]
+    fn rpc_arguments_apply_a_per_user_effort() {
+        let config = PiRpcConfig::default();
+        let args = rpc_arguments(&config, None, None, Some("high"));
+        assert!(args.windows(2).any(|w| w == ["--thinking", "high"]));
+        assert!(!rpc_arguments(&config, None, None, Some("  ")).contains(&"--thinking".to_owned()));
+        assert!(!rpc_arguments(&config, None, None, None).contains(&"--thinking".to_owned()));
+
+        // An operator-configured thinking level wins.
+        let config = PiRpcConfig {
+            args: vec!["--thinking=off".into()],
+            ..Default::default()
+        };
+        let args = rpc_arguments(&config, None, None, Some("high"));
+        assert!(!args.contains(&"high".to_owned()));
+        assert!(args.contains(&"--thinking=off".to_owned()));
     }
 
     #[test]
@@ -1242,7 +1290,7 @@ mod tests {
             no_session: true,
             ..Default::default()
         };
-        let args = rpc_arguments(&config, Some("session-123"), None);
+        let args = rpc_arguments(&config, Some("session-123"), None, None);
         assert!(args.contains(&"--no-session".to_owned()));
         assert!(!args.iter().any(|arg| arg == "--session-id"));
     }
@@ -1296,6 +1344,7 @@ mod tests {
             workspace: PathBuf::from("/tmp"),
             host_user: None,
             model: None,
+            effort: None,
             client: None,
             writer: None,
             busy: false,
@@ -1308,6 +1357,7 @@ mod tests {
             workspace: PathBuf::from("/tmp"),
             host_user: None,
             model: None,
+            effort: None,
             client: None,
             writer: None,
             busy: true,
@@ -1330,6 +1380,7 @@ mod tests {
             workspace: PathBuf::from("/tmp"),
             host_user: None,
             model: None,
+            effort: None,
             client: None,
             writer: None,
             busy: true,
@@ -1454,7 +1505,7 @@ mod tests {
                 &[],
                 &crate::executor::Executor::direct(),
                 None,
-                None,
+                LaunchSettings::default(),
             )
             .await
             .unwrap();
@@ -1471,7 +1522,7 @@ mod tests {
                     &[],
                     &crate::executor::Executor::direct(),
                     None,
-                    None,
+                    LaunchSettings::default(),
                 )
                 .await
         });
@@ -1514,7 +1565,7 @@ mod tests {
                 &[],
                 &crate::executor::Executor::direct(),
                 None,
-                None,
+                LaunchSettings::default(),
             )
             .await
             .unwrap();
@@ -1526,7 +1577,7 @@ mod tests {
                 &[],
                 &crate::executor::Executor::direct(),
                 None,
-                None,
+                LaunchSettings::default(),
             )
             .await
             .unwrap();
@@ -1541,7 +1592,7 @@ mod tests {
                 &[],
                 &crate::executor::Executor::direct(),
                 None,
-                None,
+                LaunchSettings::default(),
             )
             .await
             .unwrap();
@@ -1843,7 +1894,7 @@ mod tests {
                 &[],
                 &crate::executor::Executor::direct(),
                 None,
-                None,
+                LaunchSettings::default(),
             )
             .await
             .unwrap();
@@ -1860,7 +1911,7 @@ mod tests {
                 &[],
                 &crate::executor::Executor::direct(),
                 None,
-                None,
+                LaunchSettings::default(),
             )
             .await
             .unwrap();
@@ -1888,7 +1939,7 @@ mod tests {
                 &[],
                 &crate::executor::Executor::direct(),
                 None,
-                None,
+                LaunchSettings::default(),
             )
             .await
             .unwrap();
@@ -1903,7 +1954,7 @@ mod tests {
                 &[],
                 &crate::executor::Executor::direct(),
                 None,
-                None,
+                LaunchSettings::default(),
             )
             .await
             .unwrap();

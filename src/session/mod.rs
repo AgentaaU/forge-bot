@@ -22,7 +22,7 @@ use crate::mention::Mention;
 
 pub use queue::Dispatcher;
 pub use status::{ThreadState, ThreadStatus};
-pub use store::{RunRecord, Session, SessionStore};
+pub use store::{RunRecord, Session, SessionStore, UserAgentSettings};
 
 /// One unit of work handed to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 //! On-disk session and job persistence.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -75,11 +75,48 @@ impl Session {
     }
 }
 
+/// File (under the store directory) holding the operator's per-user agent
+/// overrides set from `/admin`.
+const USER_SETTINGS_FILE: &str = "agent-settings.json";
+
+/// Operator overrides for one configured agent user, set from `/admin`. A
+/// `None` field falls back to the user's configuration (`agent_model`) or to
+/// the agent's own default (effort).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserAgentSettings {
+    /// Model ID that replaces the user's `agent_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort level for the user's configured agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl UserAgentSettings {
+    /// Whether no override is set.
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.effort.is_none()
+    }
+}
+
 /// Persists sessions and pending jobs under a directory.
 pub struct SessionStore {
     dir: PathBuf,
     sessions: Mutex<HashMap<String, Session>>,
     live_output: Mutex<HashMap<Uuid, LiveOutput>>,
+    user_settings: Mutex<BTreeMap<String, UserAgentSettings>>,
+}
+
+/// Read the saved overrides. A missing file means none; an unreadable one is
+/// logged and ignored so a bad file cannot stop the bot from starting.
+fn load_user_settings(path: &Path) -> BTreeMap<String, UserAgentSettings> {
+    match std::fs::read(path) {
+        Ok(raw) => serde_json::from_slice(&raw).unwrap_or_else(|error| {
+            tracing::warn!(file = %path.display(), %error, "ignoring unreadable agent settings");
+            BTreeMap::new()
+        }),
+        Err(_) => BTreeMap::new(),
+    }
 }
 
 impl SessionStore {
@@ -109,10 +146,12 @@ impl SessionStore {
             }
         }
 
+        let user_settings = load_user_settings(&dir.join(USER_SETTINGS_FILE));
         let store = Self {
             dir,
             sessions: Mutex::new(sessions),
             live_output: Mutex::new(HashMap::new()),
+            user_settings: Mutex::new(user_settings),
         };
         // A run can only be executing in the process that started it, so any
         // run persisted without an end time when the store opens is stale.
@@ -361,6 +400,49 @@ impl SessionStore {
         // document.
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, raw)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// The operator's overrides for `user_id`; empty when none were set.
+    pub fn user_settings(&self, user_id: &str) -> UserAgentSettings {
+        self.user_settings
+            .lock()
+            .expect("user settings mutex poisoned")
+            .get(user_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Replace the overrides for `user_id` and persist them. Empty settings
+    /// remove the entry, so the user falls back to its configuration.
+    pub fn set_user_settings(&self, user_id: &str, settings: UserAgentSettings) -> Result<()> {
+        let mut all = self
+            .user_settings
+            .lock()
+            .expect("user settings mutex poisoned");
+        let previous = all.get(user_id).cloned();
+        if settings.is_empty() {
+            all.remove(user_id);
+        } else {
+            all.insert(user_id.to_owned(), settings);
+        }
+        if let Err(error) = self.persist_user_settings(&all) {
+            // Keep memory and disk in agreement: a failed write must not leave
+            // an override that a restart would silently lose.
+            match previous {
+                Some(previous) => all.insert(user_id.to_owned(), previous),
+                None => all.remove(user_id),
+            };
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist_user_settings(&self, all: &BTreeMap<String, UserAgentSettings>) -> Result<()> {
+        let path = self.dir.join(USER_SETTINGS_FILE);
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(all)?)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
@@ -667,5 +749,85 @@ mod tests {
 
         assert_eq!(store.evict_stale(Duration::ZERO).unwrap(), 0);
         assert!(store.get(&key).is_some());
+    }
+}
+
+#[cfg(test)]
+mod user_settings_tests {
+    use super::*;
+
+    fn settings(model: &str, effort: &str) -> UserAgentSettings {
+        UserAgentSettings {
+            model: Some(model.into()),
+            effort: Some(effort.into()),
+        }
+    }
+
+    #[test]
+    fn settings_persist_across_reopen_and_empty_settings_clear_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        assert!(store.user_settings("default").is_empty());
+
+        store
+            .set_user_settings("default", settings("gpt-fast", "high"))
+            .unwrap();
+        store
+            .set_user_settings("reviewer", UserAgentSettings::default())
+            .unwrap();
+        drop(store);
+
+        let reopened = SessionStore::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.user_settings("default"),
+            settings("gpt-fast", "high")
+        );
+        // Empty settings were never stored, so the user keeps its configuration.
+        assert!(reopened.user_settings("reviewer").is_empty());
+
+        reopened
+            .set_user_settings("default", UserAgentSettings::default())
+            .unwrap();
+        let reopened = SessionStore::open(dir.path()).unwrap();
+        assert!(reopened.user_settings("default").is_empty());
+    }
+
+    #[test]
+    fn unreadable_settings_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(USER_SETTINGS_FILE), "not json").unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        assert!(store.user_settings("default").is_empty());
+    }
+
+    #[test]
+    fn failed_save_restores_the_previous_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        store
+            .set_user_settings("default", settings("old", "low"))
+            .unwrap();
+
+        // A directory where the temporary file belongs makes the write fail.
+        let tmp = dir.path().join("agent-settings.json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(
+            store
+                .set_user_settings("default", settings("new", "high"))
+                .is_err()
+        );
+        assert!(
+            store
+                .set_user_settings("fresh", settings("new", "high"))
+                .is_err()
+        );
+        assert_eq!(store.user_settings("default"), settings("old", "low"));
+        assert!(store.user_settings("fresh").is_empty());
+
+        std::fs::remove_dir(&tmp).unwrap();
+        store
+            .set_user_settings("default", settings("new", "high"))
+            .unwrap();
+        assert_eq!(store.user_settings("default"), settings("new", "high"));
     }
 }

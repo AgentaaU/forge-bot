@@ -289,7 +289,11 @@ Every operation for a run uses the addressed user's identity:
 * **Model**: `agent_model` is passed as `--model <id>` unless the adapter's
   configured `args` already set one. It applies to the user's configured
   `agent` (or the registry default when `agent` is omitted). Alternate
-  adapters and automatic fallbacks keep their own model defaults.
+  adapters and automatic fallbacks keep their own model defaults. A model set
+  on the [admin page](#admin-page) replaces `agent_model` for that user.
+* **Effort**: set only from the admin page, never by default. It is passed to
+  the same adapters and under the same rule as the model, and an operator's own
+  effort flag in `args` always wins.
 * **Recovery**: `user_id` is persisted with the job, so a restarted bot resumes
   the job under the same account and refuses an id that no longer exists.
 
@@ -380,6 +384,27 @@ for the thread are not removed and start once the worker frees up. The page uses
 `{"key":"forgejo:owner/repo:issue:12"}`; the key is the one shown by
 `/status.json`. It returns 404 when the thread is not running, including a run
 that has already produced its outcome, which can no longer be terminated.
+
+The **Agent models and effort** table lists every configured agent user (human
+recipients are omitted). For each user an operator can set:
+
+* **Model**: replaces that user's `agent_model` for its next runs. An empty
+  value restores the configured model (or the agent's own default).
+* **Effort**: a reasoning effort of `low`, `medium`, `high` or `xhigh`. The
+  default leaves the choice to the agent. Only adapters that accept an effort
+  offer the control: `codex` (`-c model_reasoning_effort`, or `turn/start` on
+  the app-server path), `claude` (`--effort`), and `pi` / `pi-rpc`
+  (`--thinking`). The control is disabled for other agents. A request for an
+  effort the user's agent does not support returns 400.
+
+Each save is `POST /admin/agent-settings` with a JSON body such as
+`{"user":"forge-reviewer","model":"gpt-fast","effort":"high"}`; an empty `model`
+or `effort` clears that override. Unknown or human users return 404, and an
+invalid model or effort returns 400. Overrides are written to
+`agent-settings.json` in the session directory, so they survive restarts, and
+they apply only to the user's configured agent, not to `--agent=` fallbacks.
+Changing them does not affect a run already in progress. As with the other
+controls, protect the page with reverse proxy authentication.
 
 ## Status page
 

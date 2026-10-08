@@ -14,16 +14,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 
-use crate::agent::AgentRegistry;
+use crate::agent::{AgentRegistry, EFFORT_LEVELS, is_effort_level};
 use crate::auto_trigger::AutoTrigger;
 use crate::config::Config;
 use crate::error::BotError;
 use crate::forge::ForgeAdapter;
 use crate::notify::{RecentComments, delivery_key};
-use crate::session::Dispatcher;
-use crate::session::ThreadState;
 use crate::session::statistics;
 use crate::session::status;
+use crate::session::{Dispatcher, ThreadState, UserAgentSettings};
 
 /// Shared state for the webhook server.
 #[derive(Clone)]
@@ -75,6 +74,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin", get(admin_page))
         .route("/admin/reset-cooldown", post(reset_cooldown))
         .route("/admin/terminate-thread", post(terminate_thread))
+        .route("/admin/agent-settings", post(save_agent_settings))
         .route("/status", get(status_page))
         .route("/status/details", get(status_details))
         .route("/status.json", get(status_json))
@@ -138,7 +138,10 @@ async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response {
         ("/status", "Live status of every known thread"),
         ("/status.json", "Status snapshot as JSON"),
         ("/statistics", "Token use per model, repository and thread"),
-        ("/admin", "Agent cooldowns and running threads"),
+        (
+            "/admin",
+            "Agent cooldowns, models, effort and running threads",
+        ),
         (
             "/notifications",
             "Browser and mobile notifications for humans",
@@ -279,11 +282,13 @@ async fn admin_page(State(state): State<AppState>) -> Html<String> {
             name = name
         ));
     }
+    let user_rows = agent_user_rows(&state);
     let thread_rows = running_thread_rows(&state);
     Html(format!(
         include_str!("../web/admin.html"),
         capacity = worker_capacity_summary(&state.dispatcher.capacity()),
         rows = rows,
+        user_rows = user_rows,
         thread_rows = thread_rows
     ))
 }
@@ -310,6 +315,66 @@ fn worker_capacity_summary(capacity: &crate::session::queue::Capacity) -> String
         capacity.free(),
         queued,
     )
+}
+
+/// Longest model ID an operator may enter. Real identifiers are far shorter;
+/// the cap only bounds what a single request can store.
+const MAX_MODEL_LEN: usize = 200;
+
+/// One row per configured agent user, with its current overrides and the
+/// controls to change them. Human recipients never run an agent, so they are
+/// left out.
+fn agent_user_rows(state: &AppState) -> String {
+    let mut rows = String::new();
+    for (id, user) in &state.config.users {
+        if !user.role.is_agent() {
+            continue;
+        }
+        let agent = user
+            .agent
+            .clone()
+            .unwrap_or_else(|| state.agents.default_name().to_owned());
+        let settings = state.dispatcher.user_settings(id);
+        let supported = state
+            .agents
+            .get(&agent)
+            .is_ok_and(|agent| agent.supports_effort());
+        let effort_options = effort_options(settings.effort.as_deref(), supported);
+        rows.push_str(&format!(
+            include_str!("../web/admin-user-row.html"),
+            user = status::escape_html(id),
+            agent = status::escape_html(&agent),
+            model = status::escape_html(settings.model.as_deref().unwrap_or_default()),
+            model_default = status::escape_html(
+                user.agent_model
+                    .as_deref()
+                    .unwrap_or("the agent's default model"),
+            ),
+            effort_disabled = if supported { "" } else { " disabled" },
+            effort_options = effort_options,
+        ));
+    }
+    rows
+}
+
+/// `<option>`s for the effort select. The empty choice keeps the agent's own
+/// default. An agent without effort support gets one disabled explanation.
+fn effort_options(current: Option<&str>, supported: bool) -> String {
+    if !supported {
+        return "<option value=\"\">Not supported by this agent</option>".to_owned();
+    }
+    let mut options = String::from("<option value=\"\">Agent default</option>");
+    for level in EFFORT_LEVELS {
+        let selected = if current == Some(level) {
+            " selected"
+        } else {
+            ""
+        };
+        options.push_str(&format!(
+            "<option value=\"{level}\"{selected}>{level}</option>"
+        ));
+    }
+    options
 }
 
 /// One row per thread with an agent run in flight, each with a terminate
@@ -361,6 +426,76 @@ async fn terminate_thread(
         return (StatusCode::NOT_FOUND, "thread is not running\n").into_response();
     }
     tracing::info!(key = %request.key, "thread terminated by admin");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct AgentSettingsRequest {
+    user: String,
+    /// Empty restores the configured `agent_model`.
+    #[serde(default)]
+    model: String,
+    /// Empty restores the agent's own effort default.
+    #[serde(default)]
+    effort: String,
+}
+
+// JSON-only, like the other admin controls, so a cross-origin form cannot
+// change which model or effort a user's runs get.
+async fn save_agent_settings(
+    State(state): State<AppState>,
+    Json(request): Json<AgentSettingsRequest>,
+) -> Response {
+    let Some(user) = state
+        .config
+        .users
+        .get(&request.user)
+        .filter(|user| user.role.is_agent())
+    else {
+        return (StatusCode::NOT_FOUND, "unknown agent user\n").into_response();
+    };
+    let model = request.model.trim();
+    if model.len() > MAX_MODEL_LEN || model.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return (StatusCode::BAD_REQUEST, "invalid model\n").into_response();
+    }
+    let effort = request.effort.trim();
+    if !effort.is_empty() {
+        if !is_effort_level(effort) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("effort must be one of {}\n", EFFORT_LEVELS.join(", ")),
+            )
+                .into_response();
+        }
+        let agent = user
+            .agent
+            .clone()
+            .unwrap_or_else(|| state.agents.default_name().to_owned());
+        if !state
+            .agents
+            .get(&agent)
+            .is_ok_and(|agent| agent.supports_effort())
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("agent `{agent}` does not support an effort level\n"),
+            )
+                .into_response();
+        }
+    }
+    let settings = UserAgentSettings {
+        model: (!model.is_empty()).then(|| model.to_owned()),
+        effort: (!effort.is_empty()).then(|| effort.to_owned()),
+    };
+    if let Err(error) = state.dispatcher.set_user_settings(&request.user, settings) {
+        tracing::warn!(user = %request.user, %error, "failed to save agent settings");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to save agent settings\n",
+        )
+            .into_response();
+    }
+    tracing::info!(user = %request.user, "agent settings changed by admin");
     StatusCode::NO_CONTENT.into_response()
 }
 
