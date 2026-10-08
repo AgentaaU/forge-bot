@@ -18,6 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Set up pinned Rust toolchain
+        env:
+          # Rust dist mirror tried first (USTC by default). Override with the
+          # repository variable RUST_MIRROR. If it is unreachable, the step
+          # falls back to the official static.rust-lang.org servers.
+          RUST_MIRROR: ${{ vars.RUST_MIRROR || 'https://mirrors.ustc.edu.cn/rust-static' }}
         run: |
           # Each job gets fresh homes, avoiding concurrent writes and stale installs.
           rust_home=$(mktemp -d "$RUNNER_TEMP/forge-bot-rust.XXXXXX")
@@ -25,6 +30,16 @@ jobs:
           export RUSTUP_HOME="$rust_home/rustup"
           echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
+          # Probe the mirror for the channel named in rust-toolchain.toml.
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml | head -n1)
+          if [ -n "$RUST_MIRROR" ] && curl -fsSI --max-time 20 "$RUST_MIRROR/dist/channel-rust-$channel.toml" >/dev/null; then
+            echo "Using Rust mirror: $RUST_MIRROR"
+            echo "RUSTUP_DIST_SERVER=$RUST_MIRROR" >> "$GITHUB_ENV"
+            echo "RUSTUP_UPDATE_ROOT=$RUST_MIRROR/rustup" >> "$GITHUB_ENV"
+            export RUSTUP_DIST_SERVER="$RUST_MIRROR" RUSTUP_UPDATE_ROOT="$RUST_MIRROR/rustup"
+          else
+            echo "Rust mirror unavailable or disabled; using official servers."
+          fi
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
           export PATH="$CARGO_HOME/bin:$PATH"
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
