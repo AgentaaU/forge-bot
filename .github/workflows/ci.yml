@@ -23,6 +23,10 @@ jobs:
           # repository variable RUST_MIRROR. If it is unreachable, the step
           # falls back to the official static.rust-lang.org servers.
           RUST_MIRROR: ${{ vars.RUST_MIRROR || 'https://mirrors.ustc.edu.cn/rust-static' }}
+          # Crates.io sparse index mirror (USTC by default). Override with the
+          # repository variable CRATES_MIRROR. If it or its download host is
+          # unreachable, cargo keeps using the official crates.io registry.
+          CRATES_MIRROR: ${{ vars.CRATES_MIRROR || 'https://mirrors.ustc.edu.cn/crates.io-index' }}
         run: |
           # Each job gets fresh homes, avoiding concurrent writes and stale installs.
           rust_home=$(mktemp -d "$RUNNER_TEMP/forge-bot-rust.XXXXXX")
@@ -40,11 +44,33 @@ jobs:
           else
             echo "Rust mirror unavailable or disabled; using official servers."
           fi
+          # Fetch the index config once. Any failure here (unreachable, HTTP
+          # error, disconnect, unparsable body) falls back to crates.io. The
+          # fetch sits in an `if` condition so the runner's `bash -e -o pipefail`
+          # does not abort the setup step.
+          crates_index="${CRATES_MIRROR%/}"
+          crates_dl=""
+          if [ -n "$crates_index" ] && crates_config=$(curl -fsSL --max-time 20 "$crates_index/config.json"); then
+            crates_dl=$(printf '%s\n' "$crates_config" | sed -n 's/.*"dl": *"\([^"]*\)".*/\1/p' | head -n1)
+          fi
+          # Probe the download host using a crate version that has existed
+          # since 2015. Only a fully reachable mirror is used.
+          if [ -n "$crates_dl" ] && curl -fsSIL --max-time 20 "$crates_dl/serde/1.0.0/download" >/dev/null; then
+            echo "Using crates mirror: $crates_index"
+            mkdir -p "$CARGO_HOME"
+            # Cargo ignores CARGO_SOURCE_* env vars for source replacement,
+            # so the mirror is written to the per-job CARGO_HOME config.
+            printf '[source.crates-io]\nreplace-with = "forge-bot-mirror"\n\n[source.forge-bot-mirror]\nregistry = "sparse+%s/"\n' "$crates_index" > "$CARGO_HOME/config.toml"
+          else
+            echo "Crates mirror unavailable, unparsable, or disabled; using crates.io."
+          fi
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
           export PATH="$CARGO_HOME/bin:$PATH"
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
           rustup install --no-self-update
           rustup show active-toolchain
+      - name: Crates mirror fallback check
+        run: python3 contrib/test-ci-crates-mirror.py
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
