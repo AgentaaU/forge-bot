@@ -112,6 +112,16 @@ impl CgroupGuard {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Stop every process in the run's cgroup now, without waiting for the
+    /// guard to be dropped. Used when a run is cancelled while its agent is
+    /// still alive.
+    pub fn kill(&self) {
+        if cfg!(test) {
+            return;
+        }
+        let _ = std::fs::write(self.path.join("cgroup.kill"), "1");
+    }
 }
 
 impl Drop for CgroupGuard {

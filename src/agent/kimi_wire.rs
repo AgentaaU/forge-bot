@@ -20,7 +20,7 @@ use tokio::sync::broadcast;
 use tokio::time::Instant;
 
 use crate::agent::prompt::{build_follow_up_prompt, build_prompt};
-use crate::agent::wire::{self, WireProcess};
+use crate::agent::wire::{self, LiveRegistration, WireProcess};
 use crate::agent::{
     AgentContext, AgentOutcome, AgentRequest, SteerReceipt, TokenUsage, conversation_key,
 };
@@ -159,21 +159,16 @@ impl KimiWireAgent {
             process: Arc::clone(&process),
             active: Mutex::new(false),
         });
-        self.live
-            .lock()
-            .expect("kimi live mutex poisoned")
-            .insert(map_key.clone(), Arc::clone(&live));
-
-        let result = self
-            .run_turn(&process, &live, &prompt, context, started)
-            .await;
-
-        self.live
-            .lock()
-            .expect("kimi live mutex poisoned")
-            .remove(&map_key);
-        process.kill();
-        result
+        // Registered only for the prompt. Cancelling this future drops the
+        // registration, which unregisters and kills the process.
+        let _registration = LiveRegistration::new(
+            &self.live,
+            map_key.clone(),
+            Arc::clone(&live),
+            Arc::clone(&process),
+        );
+        self.run_turn(&process, &live, &prompt, context, started)
+            .await
     }
 
     async fn run_turn(
@@ -744,6 +739,41 @@ mod tests {
             assert!(logged.contains(id), "{id} missing from {logged}");
         }
         process.kill();
+    }
+
+    /// Cancelling the run (an operator terminating the thread) must stop the
+    /// wire process and unregister it, so a held prompt cannot be steered.
+    #[tokio::test]
+    async fn cancelling_a_held_prompt_stops_its_process_and_unregisters_it() {
+        use crate::agent::wire::test_support::{read_pid, wait_until_exited};
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut cfg = config(&dir.path().join("log.jsonl"));
+        cfg.env
+            .insert("FAKE_KIMI_WAIT_FOR_STEER".into(), "1".into());
+        cfg.env
+            .insert("FAKE_KIMI_PID_FILE".into(), pid_file.display().to_string());
+        let agent = Arc::new(KimiWireAgent::new(&cfg));
+        let ctx = context(dir.path());
+        let run = {
+            let agent = Arc::clone(&agent);
+            let request = request();
+            let ctx = ctx.clone();
+            tokio::spawn(async move { agent.run(&request, &ctx).await })
+        };
+        wait_for_active_prompt(&agent, &ctx).await;
+        let pid = read_pid(&pid_file).await;
+
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            agent.live_agents(),
+            0,
+            "the cancelled process stays registered"
+        );
+        assert!(agent.follow_up(&request(), &ctx).await.unwrap().is_none());
+        wait_until_exited(pid).await;
     }
 
     #[tokio::test]

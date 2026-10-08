@@ -7,6 +7,8 @@ button {{ padding: .5rem .8rem; cursor: pointer; }}
 </style></head><body><nav><a href="/status">Status</a> · <a href="/notifications">Notifications</a></nav>
 <h1>Agent administration</h1><p>Reset a cooldown to make an agent eligible for automatic selection immediately. This does not cancel running jobs.</p>
 <table><thead><tr><th>Agent</th><th>Availability</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table>
+<h2>Running threads</h2><p>Terminate stops the agent run in flight for a thread, and the thread is told so. Mentions already queued for that thread still run afterwards.</p>
+<table><thead><tr><th>Thread</th><th>Agent</th><th>Running since</th><th>Action</th></tr></thead><tbody>{thread_rows}</tbody></table>
 <p id="result" role="status" aria-live="polite"></p><p><a href="/admin">Refresh availability</a></p>
 <script>
 document.querySelectorAll('button[data-agent]').forEach(button => {{
@@ -23,6 +25,23 @@ document.querySelectorAll('button[data-agent]').forEach(button => {{
             result.textContent = 'Cooldown reset for ' + button.dataset.agent + '.';
         }} catch (error) {{ result.textContent = error.message; }}
         finally {{ button.disabled = false; }}
+    }});
+}});
+document.querySelectorAll('button[data-key]').forEach(button => {{
+    button.addEventListener('click', async () => {{
+        if (!window.confirm('Terminate the running agent for this thread?')) return;
+        button.disabled = true;
+        const result = document.getElementById('result');
+        try {{
+            const response = await fetch('/admin/terminate-thread', {{
+                method: 'POST', headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{key: button.dataset.key}})
+            }});
+            if (response.status === 404) throw new Error('That thread is no longer running.');
+            if (!response.ok) throw new Error('Terminate failed (' + response.status + ')');
+            button.closest('tr').children[2].textContent = 'Terminated';
+            result.textContent = 'Terminated the run for ' + button.dataset.key + '.';
+        }} catch (error) {{ result.textContent = error.message; button.disabled = false; }}
     }});
 }});
 </script></body></html>

@@ -11,6 +11,8 @@ assistant message.
 tests can assert on session management. ``FAKE_PI_CANCEL_ONCE`` is a
 comma-separated list of session commands that fail once with
 ``data.cancelled = true`` before succeeding, to exercise the error paths.
+
+``FAKE_PI_PID_FILE`` records this process's pid so tests can check it stops.
 """
 
 import json
@@ -27,6 +29,10 @@ stream_text = os.environ.get("FAKE_PI_STREAM_TEXT")
 prompt_log = os.environ.get("FAKE_PI_PROMPT_LOG")
 command_log = os.environ.get("FAKE_PI_COMMAND_LOG")
 session_log = os.environ.get("FAKE_PI_SESSION_LOG")
+pid_file = os.environ.get("FAKE_PI_PID_FILE")
+if pid_file:
+    with open(pid_file, "w") as handle:
+        handle.write(str(os.getpid()))
 
 argv = sys.argv[1:]
 session_id = os.environ.get("FAKE_PI_SESSION_ID")

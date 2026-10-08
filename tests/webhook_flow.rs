@@ -2355,3 +2355,58 @@ async fn admin_resets_only_the_selected_agent_cooldown() {
         assert!(!h.agents.is_available("codex"));
     }
 }
+
+#[tokio::test]
+async fn admin_terminate_rejects_threads_that_are_not_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(dir.path());
+    let response = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = std::str::from_utf8(&body).unwrap();
+    assert!(html.contains("Running threads"));
+    assert!(!html.contains("Terminate thread</button>"));
+
+    // A form post cannot stop a run; only the JSON body reaches the handler.
+    let response = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/terminate-thread")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"key": "forgejo:o/r:issue:1"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/terminate-thread")
+                .body(Body::from("key=forgejo:o/r:issue:1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error());
+}

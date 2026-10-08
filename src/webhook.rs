@@ -21,6 +21,7 @@ use crate::error::BotError;
 use crate::forge::ForgeAdapter;
 use crate::notify::{RecentComments, delivery_key};
 use crate::session::Dispatcher;
+use crate::session::ThreadState;
 use crate::session::status;
 
 /// Shared state for the webhook server.
@@ -72,6 +73,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/admin", get(admin_page))
         .route("/admin/reset-cooldown", post(reset_cooldown))
+        .route("/admin/terminate-thread", post(terminate_thread))
         .route("/status", get(status_page))
         .route("/status/details", get(status_details))
         .route("/status.json", get(status_json))
@@ -136,7 +138,64 @@ async fn admin_page(State(state): State<AppState>) -> Html<String> {
             name = name
         ));
     }
-    Html(format!(include_str!("../web/admin.html"), rows = rows))
+    let thread_rows = running_thread_rows(&state);
+    Html(format!(
+        include_str!("../web/admin.html"),
+        rows = rows,
+        thread_rows = thread_rows
+    ))
+}
+
+/// One row per thread with an agent run in flight, each with a terminate
+/// button keyed by the thread's conversation key.
+fn running_thread_rows(state: &AppState) -> String {
+    let threads = match state.dispatcher.threads() {
+        Ok(threads) => threads,
+        Err(error) => {
+            tracing::warn!(%error, "failed to list threads for the admin page");
+            return String::new();
+        }
+    };
+    let now = chrono::Utc::now();
+    let mut rows = String::new();
+    for thread in threads
+        .iter()
+        .filter(|thread| thread.state == ThreadState::Running)
+    {
+        let number = thread.number.map(|n| format!(" #{n}")).unwrap_or_default();
+        let since = thread
+            .running_since
+            .map(|since| status::humanize_age(now, since))
+            .unwrap_or_else(|| "—".to_owned());
+        rows.push_str(&format!(
+            include_str!("../web/admin-thread-row.html"),
+            location = status::escape_html(&thread.location),
+            repository = status::escape_html(&thread.repository),
+            number = status::escape_html(&number),
+            kind = status::escape_html(&thread.thread_type),
+            agent = status::escape_html(&thread.agent),
+            since = status::escape_html(&since),
+            key = status::escape_html(&thread.key),
+        ));
+    }
+    rows
+}
+
+#[derive(serde::Deserialize)]
+struct TerminateThread {
+    key: String,
+}
+
+// Same JSON-only guard as cooldown resets: a cross-origin form cannot stop a run.
+async fn terminate_thread(
+    State(state): State<AppState>,
+    Json(request): Json<TerminateThread>,
+) -> Response {
+    if !state.dispatcher.terminate(&request.key) {
+        return (StatusCode::NOT_FOUND, "thread is not running\n").into_response();
+    }
+    tracing::info!(key = %request.key, "thread terminated by admin");
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(serde::Deserialize)]

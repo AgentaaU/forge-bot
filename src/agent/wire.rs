@@ -82,6 +82,56 @@ pub fn is_uncertain(error: &BotError) -> bool {
     matches!(error, BotError::Agent { reason, .. } if reason.contains(UNCERTAIN_MARKER))
 }
 
+/// Registration of a live persistent-agent process for the duration of one
+/// run.
+///
+/// Creating it publishes `session` under `key` in the adapter's registry, so a
+/// follow-up can steer the turn. Dropping it, whether the run finished or its
+/// future was cancelled mid-turn, unregisters that session (only if it is still
+/// the one registered) and kills the process and its cgroup. Without this a
+/// cancelled run would leave a live process that later follow-ups could reach.
+pub struct LiveRegistration<'a, T> {
+    registry: &'a Mutex<HashMap<String, Arc<T>>>,
+    key: String,
+    session: Arc<T>,
+    process: Arc<WireProcess>,
+}
+
+impl<'a, T> LiveRegistration<'a, T> {
+    pub fn new(
+        registry: &'a Mutex<HashMap<String, Arc<T>>>,
+        key: String,
+        session: Arc<T>,
+        process: Arc<WireProcess>,
+    ) -> Self {
+        registry
+            .lock()
+            .expect("live registry mutex poisoned")
+            .insert(key.clone(), Arc::clone(&session));
+        Self {
+            registry,
+            key,
+            session,
+            process,
+        }
+    }
+}
+
+impl<T> Drop for LiveRegistration<'_, T> {
+    fn drop(&mut self) {
+        {
+            let mut registry = self.registry.lock().expect("live registry mutex poisoned");
+            if registry
+                .get(&self.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.session))
+            {
+                registry.remove(&self.key);
+            }
+        }
+        self.process.kill();
+    }
+}
+
 /// A live, bidirectional JSON process.
 pub struct WireProcess {
     label: String,
@@ -101,8 +151,9 @@ pub struct WireProcess {
     /// Set once the reader task sees EOF, so a request that arrives after the
     /// process is gone fails immediately instead of waiting forever.
     exited: Arc<AtomicBool>,
-    /// Keeps the run's cgroup alive for as long as the process is.
-    _cgroup: Option<crate::executor::CgroupGuard>,
+    /// The run's cgroup. Killed with the process, and removed once the process
+    /// is dropped.
+    cgroup: Option<crate::executor::CgroupGuard>,
 }
 
 impl WireProcess {
@@ -191,7 +242,7 @@ impl WireProcess {
             events,
             closed,
             exited,
-            _cgroup: cgroup,
+            cgroup,
         }))
     }
 
@@ -334,13 +385,17 @@ impl WireProcess {
             )
     }
 
-    /// Terminate the child (and, through the cgroup guard, its descendants).
+    /// Terminate the child and every process in its cgroup, so descendants
+    /// (build tools, hooks) do not outlive a cancelled run.
     pub fn kill(&self) {
         let _ = self
             .child
             .lock()
             .expect("wire child mutex poisoned")
             .start_kill();
+        if let Some(cgroup) = &self.cgroup {
+            cgroup.kill();
+        }
     }
 
     fn forget(&self, id: &str) {
@@ -642,5 +697,50 @@ mod tests {
     fn id_string_normalises_numbers() {
         assert_eq!(id_string(&json!(7)), "7");
         assert_eq!(id_string(&json!("abc")), "abc");
+    }
+}
+
+/// Helpers shared by the persistent-adapter tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::time::Duration;
+
+    /// Whether `pid` still names a process that is running. A zombie counts as
+    /// exited: it has been killed and only awaits reaping.
+    pub(crate) fn process_running(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // The state field follows the parenthesised command name.
+        let state = stat
+            .rsplit(')')
+            .next()
+            .and_then(|rest| rest.trim_start().chars().next());
+        !matches!(state, None | Some('Z') | Some('X'))
+    }
+
+    /// Wait until the fake agent with `pid` has been stopped.
+    pub(crate) async fn wait_until_exited(pid: u32) {
+        for _ in 0..200 {
+            if !process_running(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("process {pid} is still running after cancellation");
+    }
+
+    /// Wait for a fake agent to record its pid in `path`.
+    pub(crate) async fn read_pid(path: &std::path::Path) -> u32 {
+        for _ in 0..500 {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fake agent did not record its pid in {}", path.display());
     }
 }

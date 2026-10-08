@@ -18,6 +18,7 @@ Environment:
 * ``FAKE_KIMI_EXIT_ON_PROMPT=1`` records the prompt and exits without answering.
 * ``FAKE_KIMI_STEER_DELAY`` delays the ``steer`` acknowledgment.
 * ``FAKE_KIMI_STEER_EXIT=1`` records the steer and exits without answering it.
+* ``FAKE_KIMI_PID_FILE`` records this process's pid so tests can check it stops.
 """
 
 import json
@@ -37,6 +38,10 @@ prompt_log = os.environ.get("FAKE_KIMI_PROMPT_LOG")
 exit_on_prompt = os.environ.get("FAKE_KIMI_EXIT_ON_PROMPT") == "1"
 steer_delay = float(os.environ.get("FAKE_KIMI_STEER_DELAY", "0"))
 steer_exit = os.environ.get("FAKE_KIMI_STEER_EXIT") == "1"
+pid_file = os.environ.get("FAKE_KIMI_PID_FILE")
+if pid_file:
+    with open(pid_file, "w") as handle:
+        handle.write(str(os.getpid()))
 
 prompt_id = None
 prompt_open = False

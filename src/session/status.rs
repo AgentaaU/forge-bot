@@ -576,7 +576,7 @@ pub fn escape_html(input: &str) -> String {
 }
 
 /// Render a timestamp as roughly how long ago it was, e.g. `3m ago`.
-fn humanize_age(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
+pub fn humanize_age(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
     let seconds = (now - then).num_seconds().max(0);
     if seconds < 60 {
         format!("{seconds}s ago")

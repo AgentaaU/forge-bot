@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::agent::capacity::is_capacity_limited;
@@ -63,6 +63,16 @@ struct Inner {
     /// Conversation key -> agent currently running for it, so a follow-up can
     /// be delivered into the live run instead of queueing a second one.
     running: Mutex<HashMap<String, RunningAgent>>,
+    /// Conversation key -> the job currently executing for it and the signal
+    /// that terminates it. Populated when a job is spawned and cleared when it
+    /// ends, so [`Dispatcher::terminate`] only reaches in-flight runs.
+    active: Mutex<HashMap<String, ActiveRun>>,
+}
+
+/// An in-flight job that an operator can terminate.
+struct ActiveRun {
+    job_id: Uuid,
+    cancel: oneshot::Sender<()>,
 }
 
 /// The agent currently running a conversation, with the context it was given.
@@ -161,6 +171,7 @@ impl Dispatcher {
             notified: Mutex::new(RecentComments::new(1024)),
             tx,
             running: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
         });
 
         // Recover jobs that were queued when the process stopped.
@@ -483,6 +494,25 @@ impl Dispatcher {
     pub fn live_output(&self, job_id: Uuid) -> Option<crate::agent::LiveOutput> {
         self.inner.sessions.live_output(job_id)
     }
+
+    /// Terminate the run in flight for conversation `key`.
+    ///
+    /// The job future is dropped, which kills the agent process and its
+    /// cgroup, records the run as failed and tells the thread. Returns `false`
+    /// when nothing is running for `key`. Jobs waiting in the queue are not
+    /// removed; the scheduler starts the next one once the slot frees.
+    pub fn terminate(&self, key: &str) -> bool {
+        // Removal and the signal happen under one lock. The send is a
+        // nonblocking oneshot, so the lock is never held across a wait, and a
+        // completion that takes the lock next sees either an empty entry (the
+        // run is already settled) or a delivered signal, never a removed entry
+        // whose signal is still in flight.
+        let mut active = self.inner.active.lock().expect("active run mutex poisoned");
+        match active.remove(key) {
+            Some(run) => run.cancel.send(()).is_ok(),
+            None => false,
+        }
+    }
 }
 
 /// Receive jobs and run them with bounded concurrency.
@@ -591,15 +621,58 @@ async fn eviction_loop(inner: Arc<Inner>) {
 }
 
 /// Run one job and report the conversation back to the scheduler when done.
+///
+/// The job runs until it reaches its outcome or an operator terminates it.
+/// Termination drops the job future, so the agent process and its cgroup are
+/// stopped by their guards before the run is recorded as terminated. The run
+/// stops being cancellable as soon as its outcome is committed (see
+/// [`Inner::claim_outcome`]), so a completed run can never be overwritten.
 fn spawn_job(inner: &Arc<Inner>, job: Job, key: String, done_tx: &mpsc::UnboundedSender<String>) {
     let inner = inner.clone();
+    let job_id = job.id;
+    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    inner
+        .active
+        .lock()
+        .expect("active run mutex poisoned")
+        .insert(
+            key.clone(),
+            ActiveRun {
+                job_id,
+                cancel: cancel_tx,
+            },
+        );
     let done = DoneGuard {
-        key: Some(key),
+        key: Some(key.clone()),
         tx: done_tx.clone(),
     };
     tokio::spawn(async move {
         let _done = done;
-        inner.handle(job).await;
+        let terminated = job.clone();
+        // A dropped sender means the outcome was committed (or the entry was
+        // removed), not that the run was terminated: keep running the handler.
+        let cancel = async {
+            if (&mut cancel_rx).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        let finished = tokio::select! {
+            () = inner.handle(job) => true,
+            () = cancel => false,
+        };
+        // Settle under the lock that `terminate` uses. Removing our entry here
+        // means any later termination finds nothing; a signal sent before this
+        // point is observed by the `try_recv`, so it cannot be lost.
+        let cancelled = {
+            let mut active = inner.active.lock().expect("active run mutex poisoned");
+            if active.get(&key).is_some_and(|run| run.job_id == job_id) {
+                active.remove(&key);
+            }
+            !finished || cancel_rx.try_recv().is_ok()
+        };
+        if cancelled {
+            inner.terminated(&terminated).await;
+        }
     });
 }
 
@@ -1208,7 +1281,29 @@ impl Inner {
         self.reply(message, &body, user_id).await;
     }
 
+    /// Commit this run to the outcome it is about to record. Returns `false`
+    /// when an administrator already terminated the run; that termination is
+    /// then the recorded outcome and the caller must not overwrite it.
+    ///
+    /// The check and the removal share the `active` lock with
+    /// [`Dispatcher::terminate`], so exactly one of the two wins. Once this
+    /// returns `true` the run can no longer be terminated, which keeps a
+    /// completed run's result from being replaced while its reply is posted.
+    fn claim_outcome(&self, job: &Job) -> bool {
+        let key = job.session_key();
+        let mut active = self.active.lock().expect("active run mutex poisoned");
+        if active.get(&key).is_some_and(|run| run.job_id == job.id) {
+            active.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
     async fn finish(&self, key: &str, job: &Job, agent: &str, outcome: &AgentOutcome) {
+        if !self.claim_outcome(job) {
+            return;
+        }
         self.persist_outcome(key, job, agent, outcome);
 
         // A successful agent normally posts its own reply, so result comments
@@ -1243,6 +1338,9 @@ impl Inner {
     /// The reply names the reason each configured agent is out of rotation
     /// when the registry knows it (issue #94).
     async fn finish_no_agent(&self, key: &str, job: &Job) {
+        if !self.claim_outcome(job) {
+            return;
+        }
         let message = no_available_agent_message(&self.agents.unavailable_agents());
         let outcome = AgentOutcome::failure(&message, Default::default());
         self.persist_outcome(key, job, &job.agent, &outcome);
@@ -1274,6 +1372,29 @@ impl Inner {
         if let Err(error) = self.sessions.remove_job(job.id) {
             tracing::warn!(%error, "failed to remove persisted job");
         }
+    }
+
+    /// Record and announce a run stopped by [`Dispatcher::terminate`]. The
+    /// agent process is already gone when this runs.
+    async fn terminated(&self, job: &Job) {
+        let key = job.session_key();
+        let agent = self
+            .sessions
+            .get(&key)
+            .and_then(|session| {
+                session
+                    .runs
+                    .iter()
+                    .rev()
+                    .find(|run| run.job_id == job.id)
+                    .map(|run| run.agent.clone())
+            })
+            .unwrap_or_else(|| job.agent.clone());
+        let outcome = AgentOutcome::failure("terminated by an administrator", Default::default());
+        self.persist_outcome(&key, job, &agent, &outcome);
+        let body = format!("🛑 Run terminated by an administrator. Agent **{agent}** was stopped.");
+        self.reply(&job.message, &body, job.user_id.as_deref())
+            .await;
     }
 
     async fn reply(&self, message: &ForgeMessage, body: &str, user_id: Option<&str>) {
@@ -3908,7 +4029,24 @@ echo "end:$token" >> "$AGENT_LOG"
         std::path::PathBuf,
         std::path::PathBuf,
     ) {
-        let (config, log, release) = gated_config(dir, workers);
+        gated_dispatcher_with_api(dir, workers, Arc::new(NoopForgeApi), false)
+    }
+
+    /// [`gated_dispatcher`] with a chosen forge API, and optionally with result
+    /// comments enabled so a successful run posts its own reply.
+    fn gated_dispatcher_with_api(
+        dir: &std::path::Path,
+        workers: usize,
+        api: Arc<dyn ForgeApi>,
+        result_replies: bool,
+    ) -> (
+        Arc<Dispatcher>,
+        Arc<SessionStore>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let (mut config, log, release) = gated_config(dir, workers);
+        config.reply.result = result_replies;
         let config = Arc::new(config);
         let registry = isolated_registry(&config, &["gate"]);
         let sessions = Arc::new(SessionStore::open(dir).unwrap());
@@ -3916,7 +4054,7 @@ echo "end:$token" >> "$AGENT_LOG"
             config.clone(),
             registry,
             sessions.clone(),
-            Arc::new(NoopForgeApi),
+            api,
             Policy::new(&config.policy),
         )
         .unwrap();
@@ -4104,6 +4242,247 @@ echo "end:$token" >> "$AGENT_LOG"
             first_start < first_end && first_end < second_start,
             "runs must be ordered and not overlap: {contents}"
         );
+    }
+
+    /// Terminating a thread stops its run, records it as failed, and frees the
+    /// worker slot so the next queued mention starts. Idle threads report
+    /// nothing to terminate.
+    #[tokio::test]
+    async fn terminate_stops_the_running_thread_and_frees_its_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dispatcher, sessions, log, release) = gated_dispatcher(dir.path(), 1);
+        assert!(
+            !dispatcher.terminate("o/r:issue:7"),
+            "nothing is running yet"
+        );
+
+        submit_token(&dispatcher, "o/r", 7, "TOKEN_A").await;
+        wait_for_log(&log, "start:TOKEN_A").await;
+        let key = sessions
+            .list()
+            .into_iter()
+            .find(|session| session.is_running())
+            .expect("the first thread is running")
+            .key;
+        submit_token(&dispatcher, "o/r", 8, "TOKEN_B").await;
+        wait_for_log(&log, "start:TOKEN_A").await;
+
+        assert!(dispatcher.terminate(&key));
+        assert!(
+            !dispatcher.terminate(&key),
+            "a run can only be stopped once"
+        );
+
+        // The queued thread takes the freed worker without any release.
+        wait_for_log(&log, "start:TOKEN_B").await;
+        release_token(&release, "TOKEN_B");
+        wait_for_drain(&sessions).await;
+
+        let session = sessions
+            .get(&key)
+            .expect("terminated thread keeps its history");
+        assert!(!session.is_running());
+        let run = session.runs.last().unwrap();
+        assert_eq!(run.success, Some(false));
+        assert_eq!(
+            run.summary.as_deref(),
+            Some("terminated by an administrator")
+        );
+        let contents = std::fs::read_to_string(&log).unwrap();
+        assert!(!contents.contains("end:TOKEN_A"), "{contents}");
+    }
+
+    /// Forge API whose successful result comment blocks until the test releases
+    /// it, so a run can be terminated while its outcome is already committed.
+    #[derive(Default)]
+    struct BlockingResultApi {
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        replies: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ForgeApi for BlockingResultApi {
+        async fn post_comment(&self, _location: &url::Url, body: &str) -> crate::error::Result<()> {
+            self.replies.lock().unwrap().push(body.to_owned());
+            Ok(())
+        }
+
+        async fn reply(&self, _message: &ForgeMessage, body: &str) -> crate::error::Result<()> {
+            if body.contains("✅ finished") {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+            self.replies.lock().unwrap().push(body.to_owned());
+            Ok(())
+        }
+    }
+
+    /// Once a successful run has committed its outcome, a terminate request
+    /// made while its result comment is still being posted must be rejected,
+    /// and the completed outcome must survive.
+    #[tokio::test]
+    async fn termination_cannot_overwrite_a_committed_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = Arc::new(BlockingResultApi::default());
+        let (dispatcher, sessions, _log, release) =
+            gated_dispatcher_with_api(dir.path(), 1, api.clone(), true);
+
+        // The gate agent completes at once: its release file already exists.
+        release_token(&release, "TOKEN_A");
+        submit_token(&dispatcher, "o/r", 7, "TOKEN_A").await;
+        tokio::time::timeout(Duration::from_secs(10), api.reached.notified())
+            .await
+            .expect("the successful result comment was never posted");
+
+        let key = sessions
+            .list()
+            .into_iter()
+            .next()
+            .expect("the thread has a session")
+            .key;
+        assert!(
+            !dispatcher.terminate(&key),
+            "a run with a committed outcome must not be terminable"
+        );
+
+        api.release.notify_one();
+        wait_for_drain(&sessions).await;
+        for _ in 0..200 {
+            if api
+                .replies
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("✅ finished"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let session = sessions.get(&key).expect("the thread keeps its history");
+        let run = session.runs.last().unwrap();
+        assert_eq!(run.success, Some(true), "{run:?}");
+        assert_ne!(
+            run.summary.as_deref(),
+            Some("terminated by an administrator")
+        );
+        let replies = api.replies.lock().unwrap();
+        assert!(
+            !replies
+                .iter()
+                .any(|body| body.contains("terminated by an administrator")),
+            "{replies:?}"
+        );
+    }
+
+    /// Termination racing the run's own completion must record exactly one
+    /// terminal outcome. Whichever side wins, the run gets one outcome, one
+    /// reply matching it, and its pending job is removed. A completion that
+    /// slipped between a removed registration and its signal used to leave the
+    /// run unfinished with the job still pending.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn termination_racing_completion_records_exactly_one_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = Arc::new(RecordingApi::default());
+        let (dispatcher, sessions, _log, release) =
+            gated_dispatcher_with_api(dir.path(), 1, api.clone(), true);
+
+        for number in 1..=60u64 {
+            let token = format!("TOKEN_{number}");
+            // The agent completes immediately; termination races that finish.
+            release_token(&release, &token);
+            let suffix = format!(":o/r:issue:{number}");
+            let key_for = |sessions: &SessionStore| {
+                sessions
+                    .list()
+                    .into_iter()
+                    .map(|session| session.key)
+                    .find(|key| key.ends_with(&suffix))
+            };
+            submit_token(&dispatcher, "o/r", number, &token).await;
+
+            let spinner = {
+                let dispatcher = dispatcher.clone();
+                let sessions = sessions.clone();
+                let suffix = suffix.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let found = sessions
+                            .list()
+                            .into_iter()
+                            .map(|session| session.key)
+                            .find(|key| key.ends_with(&suffix));
+                        if let Some(key) = found {
+                            if dispatcher.terminate(&key) {
+                                return true;
+                            }
+                            let settled = sessions
+                                .get(&key)
+                                .and_then(|session| {
+                                    session.runs.last().map(|run| run.finished_at.is_some())
+                                })
+                                .unwrap_or(false);
+                            if settled {
+                                return false;
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            let terminated = tokio::time::timeout(Duration::from_secs(20), spinner)
+                .await
+                .expect("termination loop stalled")
+                .unwrap();
+            wait_for_drain(&sessions).await;
+
+            let key = key_for(&sessions).expect("the thread keeps its history");
+            let session = sessions.get(&key).expect("the thread keeps its history");
+            let run = session.runs.last().unwrap();
+            assert!(
+                run.finished_at.is_some(),
+                "run {number} never settled: {run:?}"
+            );
+            if terminated {
+                assert_eq!(run.success, Some(false), "run {number}: {run:?}");
+                assert_eq!(
+                    run.summary.as_deref(),
+                    Some("terminated by an administrator")
+                );
+            } else {
+                assert_eq!(run.success, Some(true), "run {number}: {run:?}");
+            }
+
+            // Exactly one terminal reply for this run, matching its outcome.
+            let mut terminal = Vec::new();
+            for _ in 0..200 {
+                terminal = api
+                    .comments()
+                    .into_iter()
+                    .filter(|body| {
+                        body.contains("✅ finished")
+                            || body.contains("terminated by an administrator")
+                    })
+                    .collect::<Vec<_>>();
+                if terminal.len() > (number as usize) - 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let latest = terminal.last().cloned().unwrap_or_default();
+            assert_eq!(
+                latest.contains("terminated by an administrator"),
+                terminated,
+                "run {number} reply does not match its outcome: {latest}"
+            );
+            assert_eq!(
+                terminal.len(),
+                number as usize,
+                "run {number} did not produce exactly one terminal reply: {terminal:?}"
+            );
+        }
     }
 
     /// A mention that arrives while its conversation is busy must not claim the

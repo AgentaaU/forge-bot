@@ -362,6 +362,16 @@ unaffected. The page uses `POST /admin/reset-cooldown` with a JSON body such as
 Protect `/admin` and `/admin/reset-cooldown` with reverse proxy authentication,
 as with the other non-webhook routes, or keep the server on a trusted network.
 
+The **Running threads** table lists every thread with an agent run in flight.
+**Terminate thread** stops that run: the agent process and its cgroup are
+killed, the run is recorded as failed with the summary `terminated by an
+administrator`, and the thread gets a comment saying so. Mentions already queued
+for the thread are not removed and start once the worker frees up. The page uses
+`POST /admin/terminate-thread` with a JSON body such as
+`{"key":"forgejo:owner/repo:issue:12"}`; the key is the one shown by
+`/status.json`. It returns 404 when the thread is not running, including a run
+that has already produced its outcome, which can no longer be terminated.
+
 ## Status page
 
 While the server is running, `GET /status` renders a self-refreshing HTML page

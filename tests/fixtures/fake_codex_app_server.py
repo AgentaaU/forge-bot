@@ -21,6 +21,7 @@ Environment:
   without emitting ``turn/completed``.
 * ``FAKE_CODEX_STEER_DELAY`` delays the ``turn/steer`` acknowledgment.
 * ``FAKE_CODEX_STEER_EXIT=1`` records the steer and exits without answering it.
+* ``FAKE_CODEX_PID_FILE`` records this process's pid so tests can check it stops.
 """
 
 import json
@@ -39,6 +40,10 @@ delay = float(os.environ.get("FAKE_CODEX_DELAY", "0"))
 exit_after_turn_start = os.environ.get("FAKE_CODEX_EXIT_AFTER_TURN_START") == "1"
 steer_delay = float(os.environ.get("FAKE_CODEX_STEER_DELAY", "0"))
 steer_exit = os.environ.get("FAKE_CODEX_STEER_EXIT") == "1"
+pid_file = os.environ.get("FAKE_CODEX_PID_FILE")
+if pid_file:
+    with open(pid_file, "w") as handle:
+        handle.write(str(os.getpid()))
 
 turn_open = False
 steered = []

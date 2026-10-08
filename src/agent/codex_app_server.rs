@@ -21,7 +21,7 @@ use tokio::time::Instant;
 
 use crate::agent::prompt::{build_follow_up_prompt, build_prompt};
 use crate::agent::session::SessionStore;
-use crate::agent::wire::{self, WireProcess};
+use crate::agent::wire::{self, LiveRegistration, WireProcess};
 use crate::agent::{
     AgentContext, AgentOutcome, AgentRequest, LiveOutput, SteerReceipt, TokenUsage,
     conversation_key,
@@ -158,20 +158,19 @@ impl CodexAppServerAgent {
             thread_id: Mutex::new(None),
             active_turn: Mutex::new(None),
         });
-        self.live
-            .lock()
-            .expect("codex live mutex poisoned")
-            .insert(map_key.clone(), Arc::clone(&live));
-
-        let mut result = self
-            .run_turn(&process, &live, &prompt, &key, context, started)
-            .await;
-
-        self.live
-            .lock()
-            .expect("codex live mutex poisoned")
-            .remove(&map_key);
-        process.kill();
+        // Registered only for the turn. If this future is cancelled (a
+        // terminated thread) the registration is dropped with it, which
+        // unregisters and kills the process before the cancellation returns.
+        let mut result = {
+            let _registration = LiveRegistration::new(
+                &self.live,
+                map_key.clone(),
+                Arc::clone(&live),
+                Arc::clone(&process),
+            );
+            self.run_turn(&process, &live, &prompt, &key, context, started)
+                .await
+        };
         if let Ok(outcome) = &mut result {
             outcome.model = context
                 .reported_model
@@ -782,6 +781,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("codex turn did not become active");
+    }
+
+    /// Cancelling the run (an operator terminating the thread) must stop the
+    /// app-server process and unregister it. A turn that is still held open
+    /// must not stay steerable or running after the cancellation returns.
+    #[tokio::test]
+    async fn cancelling_a_held_turn_stops_its_process_and_unregisters_it() {
+        use crate::agent::wire::test_support::{read_pid, wait_until_exited};
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut config = base_config(&dir.path().join("log.jsonl"));
+        config
+            .env
+            .insert("FAKE_CODEX_WAIT_FOR_STEER".into(), "1".into());
+        config
+            .env
+            .insert("FAKE_CODEX_PID_FILE".into(), pid_file.display().to_string());
+        let agent = Arc::new(agent(config, Arc::new(SessionStore::load(dir.path()))));
+        let ctx = context(dir.path());
+        let run = {
+            let agent = Arc::clone(&agent);
+            let request = request();
+            let ctx = ctx.clone();
+            tokio::spawn(async move { agent.run(&request, &ctx).await })
+        };
+        wait_for_active_turn(&agent, &ctx).await;
+        let pid = read_pid(&pid_file).await;
+
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+
+        assert_eq!(
+            agent.live_agents(),
+            0,
+            "the cancelled process stays registered"
+        );
+        assert!(agent.follow_up(&request(), &ctx).await.unwrap().is_none());
+        wait_until_exited(pid).await;
     }
 
     #[tokio::test]

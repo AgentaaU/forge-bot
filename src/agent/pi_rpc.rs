@@ -88,9 +88,9 @@ pub struct PiRpcClient {
     lines: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     workspace: PathBuf,
-    /// Guard that kills the run's cgroup when this client is dropped or
-    /// killed. `None` for the test-only direct executor.
-    _cgroup: Option<crate::executor::CgroupGuard>,
+    /// The run's cgroup. Killed with the client, and removed when the client
+    /// is dropped. `None` for the test-only direct executor.
+    cgroup: Option<crate::executor::CgroupGuard>,
 }
 
 /// A cloneable handle for injecting commands into a live `pi --mode rpc`
@@ -280,7 +280,7 @@ impl PiRpcClient {
             lines: BufReader::new(stdout).lines(),
             next_id: 1,
             workspace: workspace.to_path_buf(),
-            _cgroup: cgroup,
+            cgroup,
         })
     }
 
@@ -301,9 +301,12 @@ impl PiRpcClient {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Terminate the child.
+    /// Terminate the child and every process in its cgroup.
     pub fn kill(&mut self) {
         let _ = self.child.start_kill();
+        if let Some(cgroup) = &self.cgroup {
+            cgroup.kill();
+        }
     }
 
     fn next_request_id(&mut self) -> String {
@@ -835,6 +838,7 @@ impl PoolInner {
                         client,
                         reset_session,
                         session_ready: !reset_session,
+                        completed: false,
                     });
                 }
 
@@ -895,6 +899,7 @@ impl PoolInner {
                         client: Some(client),
                         reset_session: false,
                         session_ready: true,
+                        completed: false,
                     });
                 }
             }
@@ -934,6 +939,11 @@ pub struct PoolGuard {
     /// interrupted reset) kills the process instead of returning it, so a
     /// retry can never prompt the previous conversation's session.
     session_ready: bool,
+    /// Set only once the prompt has completed. A guard dropped before that
+    /// (a cancelled run whose prompt may still be active) kills the process
+    /// instead of returning it to the pool, so a later run can never reuse a
+    /// process that is still working on the previous prompt.
+    completed: bool,
 }
 
 impl PoolGuard {
@@ -964,7 +974,14 @@ impl Drop for PoolGuard {
                 let kept = match client {
                     Some(client) => {
                         let mut client = client;
-                        if self.reset_session && !self.session_ready {
+                        if !self.completed {
+                            // Never returned to the pool: the run ended before
+                            // its prompt completed (failed or cancelled), so
+                            // the process may still be busy with it.
+                            client.kill();
+                            entry.client = None;
+                            false
+                        } else if self.reset_session && !self.session_ready {
                             // Never returned to the pool: the process was
                             // reused but never moved onto the new
                             // conversation's session, so returning it would
@@ -1117,6 +1134,7 @@ impl Agent for PiPoolAgent {
             .await
         {
             Ok((text, usage)) => {
+                guard.completed = true;
                 let mut outcome = AgentOutcome::success(text, started.elapsed());
                 outcome.model = model;
                 outcome.usage = (usage.prompt_tokens > 0).then_some(usage);
@@ -1333,6 +1351,12 @@ mod tests {
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_pi_rpc.py").into()
     }
 
+    /// Return a checkout to the pool the way a finished run does.
+    fn release(mut guard: PoolGuard) {
+        guard.completed = true;
+        drop(guard);
+    }
+
     #[tokio::test]
     async fn busy_thread_spawns_another_agent_then_reuses_idle_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -1455,7 +1479,7 @@ mod tests {
         assert!(!waiter.is_finished());
         assert_eq!(agent.live_agents(), 1);
 
-        drop(first);
+        release(first);
         let second = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .unwrap()
@@ -1507,7 +1531,7 @@ mod tests {
             .await
             .unwrap();
         let other_id = other.id;
-        drop(other);
+        release(other);
 
         let reused = agent
             .inner
@@ -1524,7 +1548,7 @@ mod tests {
         assert_eq!(reused.id, other_id);
         assert_eq!(agent.live_agents(), 2);
         assert_eq!(agent.conversation_binding("thread"), Some(other_id));
-        drop(bound);
+        release(bound);
     }
 
     #[tokio::test]
@@ -1736,6 +1760,70 @@ mod tests {
         assert_eq!(sessions[2], first);
     }
 
+    /// Cancelling a run mid-prompt (an operator terminating the thread) must
+    /// kill its process. A process still working on the prompt must not go
+    /// back to the pool, where the next run would reuse it.
+    #[tokio::test]
+    async fn cancelling_an_active_prompt_kills_its_process_instead_of_pooling_it() {
+        use crate::agent::wire::test_support::{read_pid, wait_until_exited};
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let prompt_log = dir.path().join("prompt.log");
+
+        let mut config = PiRpcConfig {
+            command: fake_pi_command(),
+            ..Default::default()
+        };
+        config
+            .env
+            .insert("FAKE_PI_WAIT_FOR_STEER".into(), "1".into());
+        config
+            .env
+            .insert("FAKE_PI_PID_FILE".into(), pid_file.display().to_string());
+        config.env.insert(
+            "FAKE_PI_PROMPT_LOG".into(),
+            prompt_log.display().to_string(),
+        );
+        let agent = Arc::new(PiPoolAgent::new(&config, store(), 3));
+
+        let request = AgentRequest {
+            location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
+            message: "go".into(),
+        };
+        let context = AgentContext {
+            workspace: dir.path().to_path_buf(),
+            forge: Some(ForgeKind::Forgejo),
+            repository: "o/r".into(),
+            issue_number: Some(1),
+            ..Default::default()
+        };
+        let run = {
+            let agent = Arc::clone(&agent);
+            let request = request.clone();
+            let context = context.clone();
+            tokio::spawn(async move { agent.run(&request, &context).await })
+        };
+        // The prompt is held open once the fake records it.
+        for _ in 0..500 {
+            if prompt_log.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(prompt_log.exists(), "the prompt never reached pi");
+        let pid = read_pid(&pid_file).await;
+
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+
+        assert_eq!(agent.live_agents(), 0, "the busy process was pooled");
+        assert!(
+            agent.follow_up(&request, &context).await.unwrap().is_none(),
+            "a cancelled prompt must not accept steers"
+        );
+        wait_until_exited(pid).await;
+    }
+
     #[tokio::test]
     async fn replays_a_conversation_on_its_own_process() {
         let dir = tempfile::tempdir().unwrap();
@@ -1760,7 +1848,7 @@ mod tests {
             .await
             .unwrap();
         let first_id = first.id;
-        drop(first);
+        release(first);
 
         // The same conversation always comes back to its own process, so its
         // session stays warm.
@@ -1805,7 +1893,7 @@ mod tests {
             .await
             .unwrap();
         let first_id = first.id;
-        drop(first);
+        release(first);
 
         let second = agent
             .inner
