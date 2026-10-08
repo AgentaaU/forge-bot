@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>forge-bot — statistics</title>
+<style>
+:root {{ color-scheme: light dark; }}
+body {{ font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 2rem; }}
+h1 {{ font-size: 1.35rem; margin: 0 0 .75rem; }}
+h2 {{ font-size: 1.05rem; margin: 2rem 0 .5rem; }}
+p.sub {{ color: #888; margin: 0 0 1.25rem; }}
+table {{ border-collapse: collapse; width: 100%; font-size: .92rem; }}
+th, td {{ text-align: left; padding: .5rem .65rem; border-bottom: 1px solid #8883; vertical-align: top; }}
+th {{ font-weight: 600; }}
+td.repo {{ color: #888; font-size: .85rem; }}
+td:nth-child(n+3), th:nth-child(n+3) {{ font-variant-numeric: tabular-nums; }}
+tr.empty td {{ text-align: center; color: #888; padding: 2rem; }}
+a {{ color: inherit; }}
+nav {{ margin: 0 0 1rem; }}
+</style>
+</head>
+<body>
+<nav><a href="/status">Status</a> · <a href="/statistics">Statistics</a> · <a href="/admin">Admin</a></nav>
+<h1>forge-bot — token statistics</h1>
+<p class="sub">Prompt tokens billed by each agent run, grouped by model. Cached tokens are the part of the prompt served from the provider's prompt cache. Runs whose agent reported no usage count as runs but add no tokens. Refreshes every 60s.</p>
+
+<h2>By model</h2>
+<table>
+<thead><tr><th>Model</th><th>Runs</th><th>Runs with usage</th><th>Prompt tokens</th><th>Cached tokens</th><th>Cache hit</th></tr></thead>
+<tbody>
+{models}
+</tbody>
+</table>
+
+<h2>By repository</h2>
+<table>
+<thead><tr><th>Repository</th><th>Model</th><th>Runs</th><th>Runs with usage</th><th>Prompt tokens</th><th>Cached tokens</th><th>Cache hit</th></tr></thead>
+<tbody>
+{repositories}
+</tbody>
+</table>
+
+<h2>By thread</h2>
+<table>
+<thead><tr><th>Thread</th><th>Repository</th><th>Model</th><th>Runs</th><th>Runs with usage</th><th>Prompt tokens</th><th>Cached tokens</th><th>Cache hit</th></tr></thead>
+<tbody>
+{threads}
+</tbody>
+</table>
+</body>
+</html>

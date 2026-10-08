@@ -22,6 +22,7 @@ use crate::forge::ForgeAdapter;
 use crate::notify::{RecentComments, delivery_key};
 use crate::session::Dispatcher;
 use crate::session::ThreadState;
+use crate::session::statistics;
 use crate::session::status;
 
 /// Shared state for the webhook server.
@@ -77,6 +78,7 @@ pub fn router(state: AppState) -> Router {
         .route("/status", get(status_page))
         .route("/status/details", get(status_details))
         .route("/status.json", get(status_json))
+        .route("/statistics", get(statistics_page))
         .route("/notifications", get(notifications_page))
         .route("/notifications.json", get(notifications_json))
         .route("/notifications.webmanifest", get(notifications_manifest))
@@ -116,6 +118,7 @@ async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response {
                 "agents": state.agents.names(),
                 "mention": state.config.trigger(),
                 "status": "/status",
+                "statistics": "/statistics",
                 "admin": "/admin",
                 "notifications": "/notifications",
             })),
@@ -134,6 +137,7 @@ async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let mut pages: Vec<(&str, &str)> = vec![
         ("/status", "Live status of every known thread"),
         ("/status.json", "Status snapshot as JSON"),
+        ("/statistics", "Token use per model, repository and thread"),
         ("/admin", "Agent cooldowns and running threads"),
         (
             "/notifications",
@@ -458,6 +462,15 @@ async fn status_json(State(state): State<AppState>, Query(query): Query<StatusQu
                 .into_response()
         }
     }
+}
+
+/// Prompt-token consumption per thread and repository, split by model.
+async fn statistics_page(State(state): State<AppState>) -> Response {
+    let sessions = state.dispatcher.sessions();
+    let stats = statistics::build(&sessions, |location| {
+        state.dispatcher.web_location(location)
+    });
+    fresh_html(statistics::render_html(&stats))
 }
 
 /// Optional search query for the status routes: a comment or issue/PR URL.

@@ -1310,6 +1310,128 @@ async fn status_page_renders_when_idle() {
 }
 
 #[tokio::test]
+async fn statistics_page_totals_tokens_by_model_thread_and_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions_dir = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    // Recent timestamps: sessions idle past the retention window are evicted
+    // when the dispatcher starts.
+    let now = chrono::Utc::now().to_rfc3339();
+    let run = |job: &str, model: Option<&str>, cache: Option<(u64, u64)>| {
+        json!({
+            "job_id": job,
+            "agent": "custom",
+            "started_at": now,
+            "finished_at": now,
+            "success": true,
+            "summary": "done",
+            "model": model,
+            "cache": cache.map(|(prompt_tokens, cached_tokens)| {
+                json!({"prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens})
+            }),
+        })
+    };
+    let session = |key: &str, number: u64, runs: Vec<Value>| {
+        json!({
+            "key": key,
+            "repository": "shylock/forge-bot",
+            "location": format!("http://forge.local:3000/shylock/forge-bot/issues/{number}"),
+            "agent": "custom",
+            "created_at": now,
+            "updated_at": now,
+            "runs": runs,
+        })
+    };
+    std::fs::write(
+        sessions_dir.join("one.json"),
+        session(
+            "forgejo:shylock/forge-bot:issue:1",
+            1,
+            vec![
+                run(
+                    "00000000-0000-4000-8000-000000000001",
+                    Some("model-<x>"),
+                    Some((1_234_567, 1_000_000)),
+                ),
+                run("00000000-0000-4000-8000-000000000002", None, None),
+            ],
+        )
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        sessions_dir.join("two.json"),
+        session(
+            "forgejo:shylock/forge-bot:pr:2",
+            2,
+            vec![run(
+                "00000000-0000-4000-8000-000000000003",
+                Some("model-<x>"),
+                Some((100, 0)),
+            )],
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let harness = harness(dir.path());
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/statistics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let html = body_text(response).await;
+    assert!(html.contains("forge-bot — token statistics"), "{html}");
+    // Model names are escaped, and the per-model total adds both threads.
+    assert!(html.contains("model-&lt;x&gt;"), "{html}");
+    assert!(html.contains("1,234,667"), "{html}");
+    assert!(html.contains("1,000,000"), "{html}");
+    assert!(html.contains("81.0%"), "{html}");
+    assert!(html.contains("unknown"), "{html}");
+    assert!(
+        html.contains("href=\"http://forge.local:3000/shylock/forge-bot/issues/1\""),
+        "{html}"
+    );
+    assert!(html.contains("forgejo:shylock/forge-bot:pr:2"), "{html}");
+}
+
+#[tokio::test]
+async fn statistics_page_renders_when_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/statistics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    assert!(html.contains("No runs recorded yet."), "{html}");
+}
+
+#[tokio::test]
 async fn details_show_output_while_the_agent_is_running() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness_with(dir.path(), |config| {

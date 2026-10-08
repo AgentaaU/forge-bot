@@ -9,6 +9,7 @@
 //! feel like a conversation.
 
 pub mod queue;
+pub mod statistics;
 pub mod status;
 pub mod store;
 

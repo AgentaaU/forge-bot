@@ -560,6 +560,22 @@ impl Dispatcher {
         self.inner.sessions.get(key)
     }
 
+    /// Every persisted session, for the token statistics page.
+    pub fn sessions(&self) -> Vec<crate::session::Session> {
+        self.inner.sessions.list()
+    }
+
+    /// Map a stored thread location to the public web URL, as the status page
+    /// does, so links keep working when the API and web hosts differ.
+    pub fn web_location(&self, location: &str) -> String {
+        match self.inner.config.forges.forgejo.as_ref() {
+            Some(forgejo) => {
+                status::public_location(location, &forgejo.base_url, forgejo.web_base())
+            }
+            None => location.to_owned(),
+        }
+    }
+
     pub fn live_output(&self, job_id: Uuid) -> Option<crate::agent::LiveOutput> {
         self.inner.sessions.live_output(job_id)
     }

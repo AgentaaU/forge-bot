@@ -408,6 +408,14 @@ read the selected model from their CLI arguments or configuration. A dash means
 no model was available.
 The JSON snapshot includes `model` as a nullable field.
 
+`GET /statistics` counts prompt tokens billed by agent runs and the part served
+from the provider's prompt cache. It shows totals per model, then per repository
+and per thread, with each row split by model and a cache-hit percentage. The
+figures come from the same retained thread history as the status page, so they
+cover only threads still kept under `[session] retention_secs`. Runs whose agent
+reported no usage are counted as runs but add no tokens; runs without a recorded
+model appear as `unknown`. Output tokens are not recorded.
+
 The page has a search box: paste a comment or issue/pull-request URL (for
 example `https://forgejo.example.com/owner/repo/pulls/460#issuecomment-10561`)
 to filter the table to that thread. The same filter is available to scripts as
