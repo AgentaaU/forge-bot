@@ -126,17 +126,8 @@ async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response {
             .into_response();
     }
 
-    // Only link the CA download when the file exists, as the notifications
-    // page does, so the index never points at a 404.
-    let ca_cert = state
-        .config
-        .notifications
-        .ca_cert_path
-        .as_ref()
-        .is_some_and(|path| path.is_file());
-    let mut pages: Vec<(&str, &str)> = vec![
+    let pages = [
         ("/status", "Live status of every known thread"),
-        ("/status.json", "Status snapshot as JSON"),
         ("/statistics", "Token use per model, repository and thread"),
         (
             "/admin",
@@ -146,19 +137,8 @@ async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response {
             "/notifications",
             "Browser and mobile notifications for humans",
         ),
-        (
-            "/notifications/diagnostics",
-            "Notification browser diagnostics",
-        ),
-        ("/notifications.json", "Notification feed as JSON"),
         ("/healthz", "Liveness check"),
     ];
-    if ca_cert {
-        pages.push((
-            "/notifications/ca.crt",
-            "Certificate for installing the notification CA",
-        ));
-    }
     let mut links = String::new();
     for (path, description) in pages {
         let path = status::escape_html(path);

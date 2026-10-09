@@ -1064,9 +1064,14 @@ async fn root_lists_forges_and_healthz_is_ok() {
 }
 
 #[tokio::test]
-async fn browser_index_links_every_sub_page() {
+async fn browser_index_links_user_pages_only() {
     let dir = tempfile::tempdir().unwrap();
-    let harness = harness(dir.path());
+    // A configured, existing CA must not add a certificate link to the index.
+    let cert = dir.path().join("ca.crt");
+    std::fs::write(&cert, "test CA certificate").unwrap();
+    let harness = harness_with(dir.path(), |config| {
+        config.notifications.ca_cert_path = Some(cert);
+    });
 
     let response = harness
         .app
@@ -1092,17 +1097,23 @@ async fn browser_index_links_every_sub_page() {
     let html = body_text(response).await;
     for path in [
         "/status",
-        "/status.json",
+        "/statistics",
         "/admin",
         "/notifications",
-        "/notifications/diagnostics",
-        "/notifications.json",
         "/healthz",
     ] {
         assert!(
             html.contains(&format!("href=\"{path}\"")),
             "missing {path}: {html}"
         );
+    }
+    for path in [
+        "/status.json",
+        "/notifications/diagnostics",
+        "/notifications.json",
+        "/notifications/ca.crt",
+    ] {
+        assert!(!html.contains(path), "unexpected {path}: {html}");
     }
     assert!(html.contains("forgejo"), "{html}");
     assert!(html.contains("custom"), "{html}");
