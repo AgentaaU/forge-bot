@@ -1606,6 +1606,7 @@ mod tests {
     async fn starts_a_new_session_for_a_new_conversation_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let command_log = dir.path().join("commands.log");
+        let session_log = dir.path().join("sessions.log");
 
         let mut config = PiRpcConfig {
             command: fake_pi_command(),
@@ -1615,6 +1616,10 @@ mod tests {
         config.env.insert(
             "FAKE_PI_COMMAND_LOG".into(),
             command_log.display().to_string(),
+        );
+        config.env.insert(
+            "FAKE_PI_SESSION_LOG".into(),
+            session_log.display().to_string(),
         );
         let agent = PiPoolAgent::new(&config, store(), 3);
 
@@ -1652,6 +1657,9 @@ mod tests {
         let logged = std::fs::read_to_string(&command_log).unwrap();
         assert!(logged.contains("new_session"), "{logged}");
         assert!(!logged.contains("switch_session"), "{logged}");
+        let prompted_sessions = read_sessions(&session_log);
+        assert_eq!(prompted_sessions.len(), 2);
+        assert_ne!(prompted_sessions[0], prompted_sessions[1]);
     }
 
     #[tokio::test]

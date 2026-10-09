@@ -8,6 +8,7 @@ Notifications carry ``method``/``params`` with no ``id``.
 Environment:
 
 * ``FAKE_CODEX_LOG`` writes every request line as JSON.
+* ``FAKE_CODEX_THREADS`` persists distinct thread ids across processes.
 * ``FAKE_CODEX_OMIT_MODEL=1`` omits model metadata from thread responses.
 * ``FAKE_CODEX_RESUME_MODEL`` overrides the model reported on resume.
 * ``FAKE_CODEX_WAIT_FOR_STEER=1`` holds the turn open after its first delta
@@ -54,6 +55,8 @@ config_effort = os.environ.get("FAKE_CODEX_CONFIG_EFFORT") or None
 model_effort = os.environ.get("FAKE_CODEX_MODEL_EFFORT", "medium")
 state_path = os.environ.get("FAKE_CODEX_STATE")
 effective_log = os.environ.get("FAKE_CODEX_EFFECTIVE_LOG")
+threads_path = os.environ.get("FAKE_CODEX_THREADS")
+thread_id = "thread-1"
 if pid_file:
     with open(pid_file, "w") as handle:
         handle.write(str(os.getpid()))
@@ -83,7 +86,16 @@ def effective_effort():
 
 
 def respond_thread(request_id, params, resume=False):
-    result = {"thread": {"id": "thread-1"}, "reasoningEffort": effective_effort()}
+    global thread_id
+    if resume:
+        thread_id = params["threadId"]
+    elif threads_path:
+        threads = load_threads()
+        thread_id = "thread-" + str(len(threads) + 1)
+        threads.append(thread_id)
+        with open(threads_path, "w") as handle:
+            json.dump(threads, handle)
+    result = {"thread": {"id": thread_id}, "reasoningEffort": effective_effort()}
     if resume and effective_log:
         with open(effective_log, "a") as handle:
             handle.write(result["reasoningEffort"] + "\n")
@@ -95,16 +107,23 @@ def respond_thread(request_id, params, resume=False):
     respond(request_id, result)
 
 
+def load_threads():
+    if threads_path and os.path.exists(threads_path):
+        with open(threads_path) as handle:
+            return json.load(handle)
+    return ["thread-1"] if not threads_path else []
+
+
 def finish_turn(turn_status=None):
     final = turn_status or status
     text = "CODEX-REPLY"
     if steered:
         text = "steered: " + " ".join(steered)
     send({"method": "item/agentMessage/delta",
-          "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "i1",
+          "params": {"threadId": thread_id, "turnId": "turn-1", "itemId": "i1",
                      "delta": "REPLY"}})
     send({"method": "thread/tokenUsage/updated",
-          "params": {"threadId": "thread-1", "turnId": "turn-1",
+          "params": {"threadId": thread_id, "turnId": "turn-1",
                      "tokenUsage": {"last": {"inputTokens": 1000, "cachedInputTokens": 750,
                                              "outputTokens": 5, "reasoningOutputTokens": 0,
                                              "totalTokens": 1005},
@@ -116,7 +135,7 @@ def finish_turn(turn_status=None):
     if final == "failed":
         turn["error"] = {"message": "the model refused the request"}
     send({"method": "turn/completed",
-          "params": {"threadId": "thread-1", "turn": turn}})
+          "params": {"threadId": thread_id, "turn": turn}})
 
 
 for line in sys.stdin:
@@ -153,7 +172,7 @@ for line in sys.stdin:
     elif method == "thread/start":
         respond_thread(request_id, params)
     elif method == "thread/resume":
-        if params.get("threadId") == "thread-1":
+        if params.get("threadId") in load_threads():
             respond_thread(request_id, params, resume=True)
         else:
             send({"id": request_id, "error": {"code": -32600, "message": "unknown thread"}})
@@ -165,18 +184,18 @@ for line in sys.stdin:
             with open(state_path, "w") as handle:
                 json.dump({"effort": params["effort"]}, handle)
         send({"method": "turn/started",
-              "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}})
+              "params": {"threadId": thread_id, "turn": {"id": "turn-1"}}})
         respond(request_id, {"turn": {"id": "turn-1", "status": "inProgress", "items": []}})
         if exit_after_turn_start:
             sys.exit(0)
         time.sleep(delay)
         send({"method": "item/agentMessage/delta",
-              "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "i1",
+              "params": {"threadId": thread_id, "turnId": "turn-1", "itemId": "i1",
                          "delta": "CODEX-"}})
         if approval:
             waiting_approval = True
             send({"method": "item/commandExecution/requestApproval", "id": "srv-approval",
-                  "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "i1"}})
+                  "params": {"threadId": thread_id, "turnId": "turn-1", "itemId": "i1"}})
             continue
         if wait_for_steer:
             turn_open = True

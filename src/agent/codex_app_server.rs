@@ -768,6 +768,67 @@ mod tests {
         assert!(logged.contains("gpt-fast"), "{logged}");
     }
 
+    #[tokio::test]
+    async fn new_conversations_start_distinct_sessions_and_resume_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log.jsonl");
+        let sessions = Arc::new(SessionStore::load(dir.path()));
+        let mut config = base_config(&log);
+        config.env.insert(
+            "FAKE_CODEX_THREADS".into(),
+            dir.path().join("threads.json").display().to_string(),
+        );
+        let agent = agent(config, Arc::clone(&sessions));
+
+        // Both forge conversations use the same workspace and adapter. Each
+        // must start its own backend thread, then resume only that thread.
+        for number in [1, 2, 1, 2] {
+            let mut ctx = context(dir.path());
+            ctx.issue_number = Some(number);
+            let mut req = request();
+            req.location = format!("https://forge.example.com/o/r/issues/{number}")
+                .parse()
+                .unwrap();
+            assert!(agent.run(&req, &ctx).await.unwrap().success);
+        }
+
+        let first = sessions.get("codex", "forgejo:o/r:1").unwrap();
+        let second = sessions.get("codex", "forgejo:o/r:2").unwrap();
+        assert_ne!(first, second);
+        let calls: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|call| {
+                matches!(
+                    call["method"].as_str(),
+                    Some("thread/start" | "thread/resume")
+                )
+            })
+            .collect();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0]["method"], "thread/start");
+        assert_eq!(calls[1]["method"], "thread/start");
+        for (call, expected) in calls[2..].iter().zip([&first, &second]) {
+            assert_eq!(call["method"], "thread/resume");
+            assert_eq!(call["params"]["threadId"].as_str(), Some(expected.as_str()));
+        }
+        let turns = turn_params(&log);
+        let ids: Vec<_> = turns
+            .iter()
+            .map(|turn| turn["threadId"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                first.as_str(),
+                second.as_str(),
+                first.as_str(),
+                second.as_str()
+            ]
+        );
+    }
+
     fn turn_params(log: &std::path::Path) -> Vec<Value> {
         std::fs::read_to_string(log)
             .unwrap()

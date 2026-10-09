@@ -111,8 +111,12 @@ Implemented:
   (`session_per_conversation`). The one-shot `pi` adapter is kept but disabled
   by default (`[agents.pi] enabled = true`)
 - [x] Per-thread agent sessions: one conversation per `owner/repo` issue or PR,
-  resumed by `pi-rpc` and the one-shot `codex`/`pi`/`claude` adapters, so the
-  model context (and its prompt cache) is reused across comments
+  resumed by `pi-rpc`, `codex app-server`, and the one-shot
+  `codex`/`pi`/`claude` adapters, so the model context (and its prompt cache) is
+  reused across comments. Codex starts a new backend thread for a new forge
+  conversation, even in the same workspace, and resumes that conversation's
+  saved thread on later comments. A PR linked to an issue shares the issue's
+  conversation and session.
 - [x] Same-thread follow-ups: a second mention while a run is in flight is
   merged into that same run instead of waiting for it to settle and becoming
   the next turn. `pi-rpc` receives it as a `steer`, the default `codex`
