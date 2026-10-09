@@ -6,13 +6,36 @@ table {{ width: 100%; border-collapse: collapse; }} th, td {{ text-align: left; 
 button {{ padding: .5rem .8rem; cursor: pointer; }}
 </style></head><body><nav><a href="/status">Status</a> · <a href="/notifications">Notifications</a></nav>
 <h1>Agent administration</h1><h2>Remaining capacity</h2><p id="capacity">{capacity}</p><p>Reset a cooldown to make an agent eligible for automatic selection immediately. This does not cancel running jobs.</p>
-<table><thead><tr><th>Agent</th><th>Availability</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table>
+<p>Move agents up or down to set automatic selection priority (highest first). Changes apply immediately in memory; restarting restores the configured order. Explicit agent choices take precedence.</p>
+<table id="agent-ranking"><thead><tr><th>Agent</th><th>Availability</th><th>Action</th><th>Priority</th></tr></thead><tbody>{rows}</tbody></table>
 <h2>Running threads</h2><p>Terminate stops the agent run in flight for a thread, and the thread is told so. Mentions already queued for that thread still run afterwards.</p>
 <table><thead><tr><th>Thread</th><th>Agent</th><th>Running since</th><th>Action</th></tr></thead><tbody>{thread_rows}</tbody></table>
 <h2>Agent models and effort</h2><p>Set the model and reasoning effort for an agent user's next runs. The default model choice restores its configured <code>agent_model</code>; the default effort leaves the agent's own choice. Choices include configured and recently reported models for the same agent; choose Custom model to enter another model ID. Changes are saved across restarts and do not affect runs already in progress.</p>
 <table><thead><tr><th>User</th><th>Agent</th><th>Model</th><th>Effort</th><th>Action</th></tr></thead><tbody>{user_rows}</tbody></table>
 <p id="result" role="status" aria-live="polite"></p><p><a href="/admin">Refresh availability</a></p>
 <script>
+document.querySelectorAll('button[data-move]').forEach(button => {{
+    button.addEventListener('click', async () => {{
+        const table = document.getElementById('agent-ranking');
+        const rows = Array.from(table.querySelectorAll('tr[data-ranked]'));
+        const index = rows.indexOf(button.closest('tr'));
+        const target = index + (button.dataset.move === 'up' ? -1 : 1);
+        if (target < 0 || target >= rows.length) return;
+        [rows[index], rows[target]] = [rows[target], rows[index]];
+        table.querySelectorAll('button[data-move]').forEach(control => control.disabled = true);
+        const result = document.getElementById('result');
+        try {{
+            const response = await fetch('/admin/agent-ranking', {{
+                method: 'POST', headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{agents: rows.map(row => row.dataset.name)}})
+            }});
+            if (!response.ok) throw new Error('Ranking failed (' + response.status + ')');
+            // Default-dependent user model and effort controls must be rebuilt too.
+            window.location.reload();
+        }} catch (error) {{ result.textContent = error.message; }}
+        finally {{ table.querySelectorAll('button[data-move]').forEach(control => control.disabled = false); }}
+    }});
+}});
 document.querySelectorAll('button[data-agent]').forEach(button => {{
     button.addEventListener('click', async () => {{
         button.disabled = true;

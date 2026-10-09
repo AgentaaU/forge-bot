@@ -343,6 +343,11 @@ impl Dispatcher {
         let key = SessionStore::key(&message, user_id.as_deref());
         let waiting = self.inner.thread_is_busy(&key);
         let mut job = Job {
+            model_agent: Some(
+                user.agent
+                    .clone()
+                    .unwrap_or_else(|| self.inner.agents.default_name()),
+            ),
             id: Uuid::new_v4(),
             message,
             mention,
@@ -497,7 +502,7 @@ impl Dispatcher {
     }
 
     /// The agent selected for mentions without an explicit adapter name.
-    pub fn default_agent_name(&self) -> &str {
+    pub fn default_agent_name(&self) -> String {
         self.inner.agents.default_name()
     }
 
@@ -1041,12 +1046,15 @@ impl Inner {
             .credentials_for(job.message.forge, token.as_deref());
         let host_user = (!user.host_user.is_empty()).then(|| user.host_user.clone());
         // A user's model belongs to its configured adapter (or the registry
-        // default when omitted). Provider-specific IDs must not be injected
-        // into explicit alternate adapters or automatic fallbacks.
-        let model_agent = user
-            .agent
-            .as_deref()
-            .unwrap_or_else(|| self.agents.default_name());
+        // default captured when enqueued, when omitted). Older records without
+        // a stored binding use the startup default, never the explicit execution
+        // adapter or a newly ranked default. Provider-specific IDs must not be
+        // injected into alternate adapters or automatic fallbacks.
+        let model_agent = job
+            .model_agent
+            .clone()
+            .or_else(|| user.agent.clone())
+            .unwrap_or_else(|| self.agents.configured_default_name().to_owned());
         let workspace = match self
             .workspaces
             .prepare(
@@ -1170,10 +1178,10 @@ impl Inner {
             .unwrap_or_default();
 
         for (index, name) in candidates.iter().enumerate() {
-            context.model = (name == model_agent)
+            context.model = (name == &model_agent)
                 .then(|| overrides.model.clone().or_else(|| user.agent_model.clone()))
                 .flatten();
-            context.effort = (name == model_agent)
+            context.effort = (name == &model_agent)
                 .then(|| overrides.effort.clone())
                 .flatten();
             used_agent = name.clone();
@@ -2062,6 +2070,7 @@ mod tests {
         // earlier human mention with `--agent=custom` would have.
         let user = dispatcher.inner.recipient_for(&auto);
         let job = Job {
+            model_agent: None,
             id: Uuid::new_v4(),
             message: auto.clone(),
             mention: Mention {
@@ -2084,6 +2093,7 @@ mod tests {
         removed.number = Some(2);
         let user = dispatcher.inner.recipient_for(&removed);
         let job = Job {
+            model_agent: None,
             id: Uuid::new_v4(),
             message: removed.clone(),
             mention: Mention {
@@ -2407,6 +2417,7 @@ mod tests {
     #[test]
     fn permission_failure_is_user_facing() {
         let job = Job {
+            model_agent: None,
             id: Uuid::new_v4(),
             message: message("o/r"),
             mention: Mention {
@@ -2736,6 +2747,7 @@ mod tests {
     #[test]
     fn merged_notice_names_the_trigger() {
         let auto_job = |event: &str| Job {
+            model_agent: None,
             id: Uuid::new_v4(),
             message: ForgeMessage {
                 forge: crate::location::ForgeKind::Forgejo,
@@ -2809,6 +2821,7 @@ mod tests {
         .unwrap();
 
         let job = Job {
+            model_agent: None,
             id: Uuid::new_v4(),
             message: message("o/r"),
             mention: Mention {
@@ -3283,6 +3296,261 @@ mod tests {
                     .trim()
                     .is_empty()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_legacy_jobs_keep_settings_on_the_default_owner() {
+        struct Probe {
+            name: &'static str,
+            seen: Mutex<Vec<(Option<String>, Option<String>)>>,
+        }
+        #[async_trait::async_trait]
+        impl Agent for Probe {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn supports_effort(&self) -> bool {
+                true
+            }
+            async fn run(&self, _: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((context.model.clone(), context.effort.clone()));
+                Ok(AgentOutcome::success("done", Duration::ZERO))
+            }
+        }
+        for configured_agent in [None, Some("primary")] {
+            for admin_override in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut config = test_config(dir.path());
+                config.session.recover = true;
+                config.agent_sequence = vec!["primary".into(), "secondary".into()];
+                let user = config.users.get_mut("default").unwrap();
+                user.agent = configured_agent.map(str::to_owned);
+                user.agent_model = Some("primary-provider-model".into());
+                for name in ["primary", "secondary"] {
+                    config.agents.overrides.insert(
+                        name.into(),
+                        crate::config::AgentConfig {
+                            command: Some("true".into()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                // Write old-format jobs and settings, then reopen the store so
+                // Dispatcher::new exercises actual on-disk recovery.
+                let store = SessionStore::open(dir.path()).unwrap();
+                if admin_override {
+                    store
+                        .set_user_settings(
+                            "default",
+                            UserAgentSettings {
+                                model: Some("admin-primary-model".into()),
+                                effort: Some("high".into()),
+                            },
+                        )
+                        .unwrap();
+                }
+                for (number, agent) in [(1, "secondary"), (2, "primary")] {
+                    let pending = Job {
+                        id: Uuid::new_v4(),
+                        message: message_at("o/r", number),
+                        mention: Mention {
+                            agent: Some(agent.into()),
+                            message: "recovered".into(),
+                        },
+                        agent: agent.into(),
+                        model_agent: None,
+                        user_id: Some("default".into()),
+                        created_at: Utc::now(),
+                        status_comment: None,
+                        waiting: false,
+                    };
+                    let mut old_json = serde_json::to_value(&pending).unwrap();
+                    old_json.as_object_mut().unwrap().remove("model_agent");
+                    std::fs::write(
+                        dir.path().join("jobs").join(format!("{}.json", pending.id)),
+                        serde_json::to_vec(&old_json).unwrap(),
+                    )
+                    .unwrap();
+                }
+                drop(store);
+                let primary = Arc::new(Probe {
+                    name: "primary",
+                    seen: Mutex::new(Vec::new()),
+                });
+                let secondary = Arc::new(Probe {
+                    name: "secondary",
+                    seen: Mutex::new(Vec::new()),
+                });
+                let config = Arc::new(config);
+                let mut registry = AgentRegistry::from_config(&config);
+                registry.insert_for_test("primary", primary.clone());
+                registry.insert_for_test("secondary", secondary.clone());
+                // Legacy ownership must come from startup configuration, even
+                // if the live default has changed by the time recovery runs.
+                assert!(registry.set_ranking(vec!["secondary".into(), "primary".into()]));
+                let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+                let _dispatcher = Dispatcher::new(
+                    config.clone(),
+                    Arc::new(registry),
+                    sessions.clone(),
+                    Arc::new(NoopForgeApi),
+                    Policy::new(&config.policy),
+                )
+                .unwrap();
+                wait_for_drain(&sessions).await;
+                assert_eq!(
+                    *secondary.seen.lock().unwrap(),
+                    vec![(None, None)],
+                    "explicit alternate must retain defaults: configured={configured_agent:?}, admin={admin_override}"
+                );
+                let expected = if admin_override {
+                    (Some("admin-primary-model".into()), Some("high".into()))
+                } else {
+                    (Some("primary-provider-model".into()), None)
+                };
+                assert_eq!(*primary.seen.lock().unwrap(), vec![expected]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_ranking_changes_preserve_model_and_effort_binding() {
+        struct Probe {
+            name: &'static str,
+            seen: Mutex<Vec<(Option<String>, Option<String>)>>,
+        }
+        #[async_trait::async_trait]
+        impl Agent for Probe {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn supports_effort(&self) -> bool {
+                true
+            }
+            async fn run(&self, _: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((context.model.clone(), context.effort.clone()));
+                if self.name == "primary" {
+                    Ok(AgentOutcome::failure("failed", Duration::ZERO))
+                } else {
+                    Ok(AgentOutcome::success("done", Duration::ZERO))
+                }
+            }
+        }
+        for configured_agent in [None, Some("primary")] {
+            for admin_override in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut config = test_config(dir.path());
+                config.policy.allow_all = true;
+                config.session.workers = 1;
+                config.agent_sequence = vec!["primary".into(), "secondary".into()];
+                let user = config.users.get_mut("default").unwrap();
+                user.agent = configured_agent.map(str::to_owned);
+                user.agent_model = Some("primary-provider-model".into());
+                for name in ["primary", "secondary"] {
+                    config.agents.overrides.insert(
+                        name.into(),
+                        crate::config::AgentConfig {
+                            command: Some("true".into()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                let config = Arc::new(config);
+                let blocker = Arc::new(BlockingFollowUpAgent::new());
+                let primary = Arc::new(Probe {
+                    name: "primary",
+                    seen: Mutex::new(Vec::new()),
+                });
+                let secondary = Arc::new(Probe {
+                    name: "secondary",
+                    seen: Mutex::new(Vec::new()),
+                });
+                let mut registry = AgentRegistry::from_config(&config);
+                registry.insert_for_test("blocking", blocker.clone());
+                registry.insert_for_test("primary", primary.clone());
+                registry.insert_for_test("secondary", secondary.clone());
+                let registry = Arc::new(registry);
+                let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+                let dispatcher = Dispatcher::new(
+                    config.clone(),
+                    registry.clone(),
+                    sessions.clone(),
+                    Arc::new(NoopForgeApi),
+                    Policy::new(&config.policy),
+                )
+                .unwrap();
+                if admin_override {
+                    dispatcher
+                        .set_user_settings(
+                            "default",
+                            UserAgentSettings {
+                                model: Some("admin-primary-model".into()),
+                                effort: Some("high".into()),
+                            },
+                        )
+                        .unwrap();
+                }
+                dispatcher
+                    .submit(
+                        message_at("o/r", 1),
+                        Mention {
+                            agent: Some("blocking".into()),
+                            message: "block".into(),
+                        },
+                        "blocking",
+                    )
+                    .await
+                    .unwrap();
+                wait_for_counter(&blocker.runs, 1).await;
+                dispatcher
+                    .submit(
+                        message_at("o/r", 2),
+                        Mention {
+                            agent: None,
+                            message: "automatic".into(),
+                        },
+                        "primary",
+                    )
+                    .await
+                    .unwrap();
+                // Explicit secondary must also keep primary's settings out, even
+                // if secondary becomes the default before this job starts.
+                dispatcher
+                    .submit(
+                        message_at("o/r", 3),
+                        Mention {
+                            agent: Some("secondary".into()),
+                            message: "explicit".into(),
+                        },
+                        "secondary",
+                    )
+                    .await
+                    .unwrap();
+                assert!(registry.set_ranking(vec![
+                    "secondary".into(),
+                    "primary".into(),
+                    "blocking".into()
+                ]));
+                blocker.run_release.notify_one();
+                wait_for_drain(&sessions).await;
+                let expected = if admin_override {
+                    (Some("admin-primary-model".into()), Some("high".into()))
+                } else {
+                    (Some("primary-provider-model".into()), None)
+                };
+                assert_eq!(*primary.seen.lock().unwrap(), vec![expected]);
+                assert_eq!(
+                    *secondary.seen.lock().unwrap(),
+                    vec![(None, None), (None, None)]
+                );
+            }
         }
     }
 
@@ -4761,6 +5029,7 @@ echo "end:$token" >> "$AGENT_LOG"
 
         for (number, token) in [(1, "TOKEN_A"), (2, "TOKEN_B")] {
             let job = Job {
+                model_agent: None,
                 id: Uuid::new_v4(),
                 message: message_at("o/r", number),
                 mention: Mention {
@@ -5323,6 +5592,7 @@ echo "end:$token" >> "$AGENT_LOG"
         // restart with a job still in flight would.
         for (index, token) in ["TOKEN_A", "TOKEN_B"].into_iter().enumerate() {
             let mut job = Job {
+                model_agent: None,
                 id: Uuid::new_v4(),
                 message: message_at("o/r", 7),
                 mention: Mention {

@@ -510,6 +510,7 @@ mod tests {
 
     fn job() -> Job {
         Job {
+            model_agent: None,
             id: Uuid::new_v4(),
             message: ForgeMessage {
                 forge: ForgeKind::Forgejo,
@@ -535,6 +536,18 @@ mod tests {
             status_comment: None,
             waiting: false,
         }
+    }
+
+    #[test]
+    fn pending_jobs_preserve_settings_adapter_and_accept_older_records() {
+        let mut pending = job();
+        pending.model_agent = Some("primary".into());
+        let mut value = serde_json::to_value(&pending).unwrap();
+        let restored: Job = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored.model_agent.as_deref(), Some("primary"));
+        value.as_object_mut().unwrap().remove("model_agent");
+        let legacy: Job = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.model_agent, None);
     }
 
     #[test]

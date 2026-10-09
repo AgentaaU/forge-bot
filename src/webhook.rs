@@ -73,6 +73,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/admin", get(admin_page))
         .route("/admin/reset-cooldown", post(reset_cooldown))
+        .route("/admin/agent-ranking", post(save_agent_ranking))
         .route("/admin/terminate-thread", post(terminate_thread))
         .route("/admin/agent-settings", post(save_agent_settings))
         .route("/status", get(status_page))
@@ -241,7 +242,16 @@ fn parse_qvalue(value: &str) -> Option<f32> {
 /// Operator controls use the same registry as dispatch and fallback selection.
 async fn admin_page(State(state): State<AppState>) -> Html<String> {
     let mut rows = String::new();
-    for name in state.agents.names() {
+    let ranked = state.agents.ordered_names();
+    let mut names = ranked.clone();
+    names.extend(
+        state
+            .agents
+            .names()
+            .into_iter()
+            .filter(|name| !ranked.contains(name)),
+    );
+    for name in names {
         let cooldown = state.agents.cooldown_remaining(&name);
         let availability = match cooldown {
             Some(remaining) => format!(
@@ -255,10 +265,20 @@ async fn admin_page(State(state): State<AppState>) -> Html<String> {
             ),
             None => "Available".to_owned(),
         };
+        let priority = ranked.iter().position(|candidate| candidate == &name)
+            .map(|index| format!("<span>{}</span> <button data-move=\"up\">Move up</button> <button data-move=\"down\">Move down</button>", index + 1))
+            .unwrap_or_else(|| "Outside automatic selection".to_owned());
+        let ranked_attribute = if ranked.contains(&name) {
+            "data-ranked"
+        } else {
+            ""
+        };
         let name = status::escape_html(&name);
         rows.push_str(&format!(
             include_str!("../web/admin-row.html"),
             availability = availability,
+            priority = priority,
+            ranked_attribute = ranked_attribute,
             name = name
         ));
     }
@@ -271,6 +291,25 @@ async fn admin_page(State(state): State<AppState>) -> Html<String> {
         user_rows = user_rows,
         thread_rows = thread_rows
     ))
+}
+
+#[derive(serde::Deserialize)]
+struct AgentRankingRequest {
+    agents: Vec<String>,
+}
+
+async fn save_agent_ranking(
+    State(state): State<AppState>,
+    Json(request): Json<AgentRankingRequest>,
+) -> Response {
+    if !state.agents.set_ranking(request.agents) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "ranking must contain every automatic-selection agent exactly once\n",
+        )
+            .into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// One sentence describing worker slots, so an operator can see whether new
@@ -337,7 +376,7 @@ fn agent_user_rows(state: &AppState) -> String {
                             && candidate
                                 .agent
                                 .as_deref()
-                                .unwrap_or(state.agents.default_name())
+                                .unwrap_or(&state.agents.default_name())
                                 == agent
                     })
                     .flat_map(|(candidate_id, candidate)| {

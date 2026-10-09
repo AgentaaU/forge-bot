@@ -2690,6 +2690,7 @@ async fn admin_reported_models_follow_the_reporting_adapter_not_the_queued_adapt
         );
     });
     let mut job = Job {
+        model_agent: None,
         id: uuid::Uuid::new_v4(),
         message: ForgeMessage {
             forge: ForgeKind::Forgejo,
@@ -2930,4 +2931,145 @@ async fn admin_sets_each_agent_users_model_and_effort() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let html = get_admin(h.app.clone()).await;
     assert!(!html.contains("gpt-fast"), "{html}");
+}
+
+#[tokio::test]
+async fn admin_ranking_updates_selection_and_rejects_invalid_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness_with(dir.path(), |config| {
+        config.agent_sequence = vec!["custom".into(), "codex".into()];
+    });
+    for (agents, expected) in [
+        (json!(["codex", "custom"]), StatusCode::NO_CONTENT),
+        (json!(["custom"]), StatusCode::BAD_REQUEST),
+        (json!(["custom", "custom"]), StatusCode::BAD_REQUEST),
+        (json!(["custom", "missing"]), StatusCode::BAD_REQUEST),
+    ] {
+        let response = h
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/agent-ranking")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"agents": agents}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(h.agents.ordered_names(), ["codex", "custom"]);
+        assert_eq!(h.agents.default_name(), "codex");
+    }
+    h.agents
+        .mark_unavailable("codex", Duration::from_secs(3600));
+    assert_eq!(h.agents.available_names(), ["custom"]);
+    assert!(h.agents.resolve(Some("custom")).is_ok());
+    let response = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("Move up"));
+    assert!(
+        html.find("data-ranked data-name=\"codex\"").unwrap()
+            < html.find("data-ranked data-name=\"custom\"").unwrap()
+    );
+    let response = h
+        .app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/agent-ranking")
+                .body(Body::from("agents=custom"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error());
+    assert_eq!(h.agents.ordered_names(), ["codex", "custom"]);
+    let fresh = harness_with(dir.path(), |config| {
+        config.agent_sequence = vec!["custom".into(), "codex".into()];
+    });
+    assert_eq!(fresh.agents.ordered_names(), ["custom", "codex"]);
+}
+
+#[tokio::test]
+async fn ranking_refreshes_default_dependent_user_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness_with(dir.path(), |config| {
+        config.agent_sequence = vec!["custom".into(), "claude".into()];
+        config.users.get_mut("default").unwrap().agent = None;
+        config.users.insert(
+            "reviewer".into(),
+            UserConfig {
+                role: UserRole::Reviewer,
+                host_user: "reviewer".into(),
+                agent: Some("claude".into()),
+                agent_model: Some("claude-provider-model".into()),
+                token: None,
+            },
+        );
+    });
+    let admin = |app: axum::Router| async move {
+        body_text(
+            app.oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await
+    };
+    let before = admin(h.app.clone()).await;
+    assert!(before.contains("<td>default</td><td>custom</td>"));
+    assert!(before.contains("<select data-effort disabled>"));
+    let default_row = before
+        .split("<td>default</td>")
+        .nth(1)
+        .unwrap()
+        .split("</tr>")
+        .next()
+        .unwrap();
+    assert!(!default_row.contains("claude-provider-model"));
+    let response = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/agent-ranking")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"agents": ["claude", "custom"]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let after = admin(h.app.clone()).await;
+    assert!(after.contains("<td>default</td><td>claude</td>"));
+    assert!(!after.contains("<select data-effort disabled>"));
+    assert!(after.contains("window.location.reload()"));
+    let default_row = after
+        .split("<td>default</td>")
+        .nth(1)
+        .unwrap()
+        .split("</tr>")
+        .next()
+        .unwrap();
+    assert!(default_row.contains("claude-provider-model"));
+    assert!(after.contains("<option value=\"high\""));
 }

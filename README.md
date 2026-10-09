@@ -376,7 +376,16 @@ lists registered agents and their remaining cooldowns. Click
 immediately, without restarting the bot. Other agents and running jobs are
 unaffected. The page uses `POST /admin/reset-cooldown` with a JSON body such as
 `{"agent":"codex"}`; unknown agents return 404. Cooldowns are held in memory.
-Protect `/admin` and `/admin/reset-cooldown` with reverse proxy authentication,
+Use **Move up** and **Move down** in the capacity table to rank automatic
+selection candidates, highest first. The ranking controls the default adapter
+and fallback order; explicitly chosen and user-configured adapters still lead
+their invocations. Agents excluded by `agent_sequence` stay outside automatic
+selection. Rankings are held only in memory and reset to configuration on
+restart. `POST /admin/agent-ranking` accepts `{"agents":["codex","pi-rpc"]}`
+with every current automatic-selection candidate exactly once; invalid lists
+return 400 without changing the ranking.
+
+Protect `/admin`, `/admin/agent-ranking` and `/admin/reset-cooldown` with reverse proxy authentication,
 as with the other non-webhook routes, or keep the server on a trusted network.
 
 The **Running threads** table lists every thread with an agent run in flight.

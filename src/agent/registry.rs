@@ -70,6 +70,7 @@ pub struct AgentRegistry {
     agents: BTreeMap<String, Arc<dyn Agent>>,
     default: String,
     sequence: Vec<String>,
+    ranking: Mutex<Vec<String>>,
     /// Agent name -> cooldown window and the reason for it.
     unavailable: Mutex<HashMap<String, Unavailable>>,
 }
@@ -202,13 +203,23 @@ impl AgentRegistry {
         Self {
             agents,
             default,
+            ranking: Mutex::new(sequence.clone()),
             sequence,
             unavailable: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The first registered agent in the configured or built-in sequence.
-    pub fn default_name(&self) -> &str {
+    /// The first agent in the current in-memory preference order.
+    pub fn default_name(&self) -> String {
+        self.ordered_names()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.default.clone())
+    }
+
+    /// Startup default from configuration (or built-in order), unaffected by
+    /// admin ranking changes. Used to recover settings ownership for old jobs.
+    pub fn configured_default_name(&self) -> &str {
         &self.default
     }
 
@@ -226,6 +237,7 @@ impl AgentRegistry {
         self.agents.insert(name.to_owned(), agent);
         if !self.sequence.iter().any(|existing| existing == name) {
             self.sequence.push(name.to_owned());
+            self.ranking.get_mut().unwrap().push(name.to_owned());
         }
         if !self.agents.contains_key(&self.default) {
             self.default = name.to_owned();
@@ -236,7 +248,7 @@ impl AgentRegistry {
     pub fn resolve(&self, name: Option<&str>) -> Result<Arc<dyn Agent>> {
         match name {
             Some(name) if !name.is_empty() => self.get(name),
-            _ => self.get(&self.default),
+            _ => self.get(&self.default_name()),
         }
     }
 
@@ -259,11 +271,28 @@ impl AgentRegistry {
     }
 
     /// All registered agent names in the actual preference order the fallback
-    /// uses: the configured `agent_sequence` when set, otherwise the built-in
+    /// uses: the admin ranking, initialized from `agent_sequence` or the built-in
     /// order. Unlike [`Self::names`], this reflects `agent_sequence`, so callers
     /// can tell which agents were passed over between two candidates.
     pub fn ordered_names(&self) -> Vec<String> {
-        self.sequence.clone()
+        self.ranking
+            .lock()
+            .expect("agent ranking mutex poisoned")
+            .clone()
+    }
+
+    /// Reorder the existing automatic-selection candidates without changing configuration.
+    /// Reject incomplete, duplicate or unknown lists before changing shared state.
+    pub fn set_ranking(&self, names: Vec<String>) -> bool {
+        let mut expected = self.sequence.clone();
+        expected.sort();
+        let mut supplied = names.clone();
+        supplied.sort();
+        if supplied != expected {
+            return false;
+        }
+        *self.ranking.lock().expect("agent ranking mutex poisoned") = names;
+        true
     }
 
     /// Mark an agent unavailable until `cooldown` has elapsed.
@@ -376,7 +405,7 @@ impl AgentRegistry {
     /// Used by the terminal "no available agent" reply to explain why nothing
     /// could run.
     pub fn unavailable_agents(&self) -> Vec<(String, UnavailableReason)> {
-        self.sequence
+        self.ordered_names()
             .iter()
             .filter_map(|name| {
                 self.unavailable_reason(name)
@@ -386,9 +415,9 @@ impl AgentRegistry {
     }
 
     /// Names of the agents that are registered and not capacity-limited, in
-    /// configured sequence order, or built-in order when no sequence is set.
+    /// current in-memory preference order.
     pub fn available_names(&self) -> Vec<String> {
-        self.sequence
+        self.ordered_names()
             .iter()
             .filter(|name| self.is_available(name))
             .cloned()

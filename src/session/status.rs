@@ -613,6 +613,7 @@ mod tests {
     fn job(number: u64, is_pr: bool, agent: &str) -> Job {
         let path = if is_pr { "pulls" } else { "issues" };
         Job {
+            model_agent: None,
             id: uuid::Uuid::new_v4(),
             message: crate::forge::ForgeMessage {
                 forge: ForgeKind::Forgejo,
