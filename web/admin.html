@@ -9,7 +9,7 @@ button {{ padding: .5rem .8rem; cursor: pointer; }}
 <table><thead><tr><th>Agent</th><th>Availability</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table>
 <h2>Running threads</h2><p>Terminate stops the agent run in flight for a thread, and the thread is told so. Mentions already queued for that thread still run afterwards.</p>
 <table><thead><tr><th>Thread</th><th>Agent</th><th>Running since</th><th>Action</th></tr></thead><tbody>{thread_rows}</tbody></table>
-<h2>Agent models and effort</h2><p>Set the model and reasoning effort for an agent user's next runs. An empty model restores its configured <code>agent_model</code>; the default effort leaves the agent's own choice. Changes are saved across restarts and do not affect runs already in progress.</p>
+<h2>Agent models and effort</h2><p>Set the model and reasoning effort for an agent user's next runs. The default model choice restores its configured <code>agent_model</code>; the default effort leaves the agent's own choice. Choices include configured and recently reported models for the same agent; choose Custom model to enter another model ID. Changes are saved across restarts and do not affect runs already in progress.</p>
 <table><thead><tr><th>User</th><th>Agent</th><th>Model</th><th>Effort</th><th>Action</th></tr></thead><tbody>{user_rows}</tbody></table>
 <p id="result" role="status" aria-live="polite"></p><p><a href="/admin">Refresh availability</a></p>
 <script>
@@ -46,6 +46,23 @@ document.querySelectorAll('button[data-key]').forEach(button => {{
         }} catch (error) {{ result.textContent = error.message; button.disabled = false; }}
     }});
 }});
+document.querySelectorAll('select[data-model]').forEach(select => {{
+    let previous = select.value;
+    select.addEventListener('change', () => {{
+        if (select.selectedOptions[0].hasAttribute('data-custom-model')) {{
+            const model = window.prompt('Enter the model ID accepted by this agent:');
+            if (!model || !model.trim()) {{ select.value = previous; return; }}
+            const value = model.trim();
+            let option = Array.from(select.options).find(option => !option.hasAttribute('data-custom-model') && option.value === value);
+            if (!option) {{
+                option = new Option(value, value);
+                select.add(option, select.querySelector('[data-custom-model]'));
+            }}
+            select.value = value;
+        }}
+        previous = select.value;
+    }});
+}});
 document.querySelectorAll('button[data-user]').forEach(button => {{
     button.addEventListener('click', async () => {{
         const row = button.closest('tr');
@@ -56,7 +73,7 @@ document.querySelectorAll('button[data-user]').forEach(button => {{
                 method: 'POST', headers: {{'Content-Type': 'application/json'}},
                 body: JSON.stringify({{
                     user: button.dataset.user,
-                    model: row.querySelector('input[data-model]').value,
+                    model: row.querySelector('select[data-model]').value,
                     effort: row.querySelector('select[data-effort]').value
                 }})
             }});

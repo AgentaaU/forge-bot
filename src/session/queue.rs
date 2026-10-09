@@ -555,6 +555,37 @@ impl Dispatcher {
         Ok(threads)
     }
 
+    /// Models paired with the adapter that actually reported them. Thread
+    /// snapshots may name a queued adapter while retaining a previous model,
+    /// so they cannot supply this association.
+    pub fn reported_models(&self) -> Vec<(String, String)> {
+        let mut models: Vec<_> = self
+            .inner
+            .sessions
+            .list()
+            .into_iter()
+            .flat_map(|session| session.runs)
+            .filter_map(|run| run.model.map(|model| (run.agent, model)))
+            .collect();
+        let running = self
+            .inner
+            .running
+            .lock()
+            .expect("running agent mutex poisoned");
+        for entry in running.values() {
+            if let Some(model) = entry
+                .context
+                .reported_model
+                .lock()
+                .expect("model mutex poisoned")
+                .clone()
+            {
+                models.push((entry.agent.name().to_owned(), model));
+            }
+        }
+        models
+    }
+
     /// Read the persisted run history for one conversation.
     pub fn session(&self, key: &str) -> Option<crate::session::Session> {
         self.inner.sessions.get(key)
@@ -1797,6 +1828,34 @@ mod tests {
             },
         );
         config
+    }
+
+    #[tokio::test]
+    async fn reported_models_use_the_live_adapters_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.agent_sequence = vec!["custom".into()];
+        config.agents.overrides.insert(
+            "custom".into(),
+            crate::config::AgentConfig {
+                command: Some("cat".into()),
+                ..Default::default()
+            },
+        );
+        let dispatcher = dispatcher_for(config, dir.path());
+        let context = AgentContext::default();
+        *context.reported_model.lock().unwrap() = Some("live-custom-model".into());
+        dispatcher.inner.running.lock().unwrap().insert(
+            "conversation".into(),
+            RunningAgent {
+                agent: dispatcher.inner.agents.get("custom").unwrap(),
+                context,
+            },
+        );
+        assert_eq!(
+            dispatcher.reported_models(),
+            vec![("custom".into(), "live-custom-model".into())]
+        );
     }
 
     fn message(repo: &str) -> ForgeMessage {

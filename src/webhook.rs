@@ -306,6 +306,7 @@ const MAX_MODEL_LEN: usize = 200;
 /// left out.
 fn agent_user_rows(state: &AppState) -> String {
     let mut rows = String::new();
+    let reported_models = state.dispatcher.reported_models();
     for (id, user) in &state.config.users {
         if !user.role.is_agent() {
             continue;
@@ -324,17 +325,76 @@ fn agent_user_rows(state: &AppState) -> String {
             include_str!("../web/admin-user-row.html"),
             user = status::escape_html(id),
             agent = status::escape_html(&agent),
-            model = status::escape_html(settings.model.as_deref().unwrap_or_default()),
-            model_default = status::escape_html(
-                user.agent_model
-                    .as_deref()
-                    .unwrap_or("the agent's default model"),
+            model_options = model_options(
+                settings.model.as_deref(),
+                user.agent_model.as_deref(),
+                state
+                    .config
+                    .users
+                    .iter()
+                    .filter(|(_, candidate)| {
+                        candidate.role.is_agent()
+                            && candidate
+                                .agent
+                                .as_deref()
+                                .unwrap_or(state.agents.default_name())
+                                == agent
+                    })
+                    .flat_map(|(candidate_id, candidate)| {
+                        [
+                            candidate.agent_model.clone(),
+                            state.dispatcher.user_settings(candidate_id).model,
+                        ]
+                    })
+                    .flatten()
+                    .chain(
+                        reported_models
+                            .iter()
+                            .filter(|(reporting_agent, _)| reporting_agent == &agent)
+                            .map(|(_, model)| model.clone())
+                    ),
             ),
             effort_disabled = if supported { "" } else { " disabled" },
             effort_options = effort_options,
         ));
     }
     rows
+}
+
+/// Model choices come from this adapter's configuration and reported runs,
+/// never a hardcoded provider catalog. Merely rendering them selects no model.
+fn model_options(
+    current: Option<&str>,
+    configured: Option<&str>,
+    known: impl IntoIterator<Item = String>,
+) -> String {
+    let default_label = configured
+        .map(|model| format!("Configured default ({model})"))
+        .unwrap_or_else(|| "Agent default".to_owned());
+    let mut options = format!(
+        "<option value=\"\"{}>{}</option>",
+        if current.is_none() { " selected" } else { "" },
+        status::escape_html(&default_label),
+    );
+    let models: std::collections::BTreeSet<_> = known
+        .into_iter()
+        .chain(current.map(str::to_owned))
+        .chain(configured.map(str::to_owned))
+        .filter(|model| !model.is_empty())
+        .collect();
+    for model in models {
+        let escaped = status::escape_html(&model);
+        options.push_str(&format!(
+            "<option value=\"{escaped}\"{}>{escaped}</option>",
+            if current == Some(model.as_str()) {
+                " selected"
+            } else {
+                ""
+            },
+        ));
+    }
+    options.push_str("<option data-custom-model>Custom model…</option>");
+    options
 }
 
 /// `<option>`s for the effort select. The empty choice keeps the agent's own
@@ -980,6 +1040,26 @@ async fn push_unsubscribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_choices_preserve_defaults_and_escape_and_deduplicate_ids() {
+        let options = model_options(
+            Some("saved"),
+            Some("configured"),
+            ["reported", "reported", "<model\"&>", ""].map(str::to_owned),
+        );
+        assert!(options.contains("<option value=\"saved\" selected>saved</option>"));
+        assert!(options.contains("Configured default (configured)"));
+        assert!(options.contains("<option value=\"configured\">configured</option>"));
+        assert_eq!(options.matches("value=\"reported\"").count(), 1);
+        assert!(options.contains("&lt;model&quot;&amp;&gt;"));
+        assert!(!options.contains("<model"));
+        assert_eq!(options.matches(" selected").count(), 1);
+
+        let options = model_options(None, None, ["reported".to_owned()]);
+        assert!(options.contains("<option value=\"\" selected>Agent default</option>"));
+        assert!(!options.contains("value=\"reported\" selected"));
+    }
 
     #[test]
     fn dedupe_remembers_and_evicts() {

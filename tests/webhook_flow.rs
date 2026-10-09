@@ -2668,6 +2668,96 @@ async fn admin_terminate_rejects_threads_that_are_not_running() {
 }
 
 #[tokio::test]
+async fn admin_reported_models_follow_the_reporting_adapter_not_the_queued_adapter() {
+    use forge_bot::agent::AgentOutcome;
+    use forge_bot::forge::ForgeMessage;
+    use forge_bot::location::ForgeKind;
+    use forge_bot::mention::Mention;
+    use forge_bot::session::Job;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness_with(dir.path(), |config| {
+        config.agent_sequence = vec!["custom".into(), "claude".into()];
+        config.users.insert(
+            "reviewer".into(),
+            UserConfig {
+                role: UserRole::Reviewer,
+                host_user: "reviewer".into(),
+                agent: Some("claude".into()),
+                agent_model: None,
+                token: None,
+            },
+        );
+    });
+    let mut job = Job {
+        id: uuid::Uuid::new_v4(),
+        message: ForgeMessage {
+            forge: ForgeKind::Forgejo,
+            location: "http://forge.local:3000/shylock/forge-bot/issues/1"
+                .parse()
+                .unwrap(),
+            body: "go".into(),
+            author: "shylock".into(),
+            repository: "shylock/forge-bot".into(),
+            comment_id: Some(1),
+            number: Some(1),
+            is_pull_request: false,
+            linked_issue: None,
+            event: "issue_comment".into(),
+            title: None,
+            reply_target: Default::default(),
+        },
+        mention: Mention {
+            agent: None,
+            message: "go".into(),
+        },
+        agent: "custom".into(),
+        user_id: Some("default".into()),
+        created_at: chrono::Utc::now(),
+        status_comment: None,
+        waiting: false,
+    };
+    h.sessions.begin(&job).unwrap();
+    h.sessions
+        .finish(
+            &job.session_key(),
+            job.id,
+            "custom",
+            &AgentOutcome {
+                model: Some("custom-only-model".into()),
+                ..AgentOutcome::success("done", Duration::ZERO)
+            },
+        )
+        .unwrap();
+    job.id = uuid::Uuid::new_v4();
+    job.agent = "claude".into();
+    // Persist without submitting: the follow-up remains queued throughout
+    // rendering, reproducing the mixed adapter/model status snapshot.
+    h.sessions.save_job(&job).unwrap();
+
+    let response = h
+        .app
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = body_text(response).await;
+    let row = |user: &str| {
+        html.split("<tr>")
+            .find(|row| row.contains(&format!("data-user=\"{user}\"")))
+            .unwrap()
+    };
+    let option = "<option value=\"custom-only-model\">custom-only-model</option>";
+    assert!(row("default").contains(option), "{html}");
+    assert!(!row("reviewer").contains(option), "{html}");
+}
+
+#[tokio::test]
 async fn admin_sets_each_agent_users_model_and_effort() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness_with(dir.path(), |config| {
@@ -2730,7 +2820,21 @@ async fn admin_sets_each_agent_users_model_and_effort() {
     assert!(html.contains("Agent models and effort"), "{html}");
     assert!(html.contains("data-user=\"default\""), "{html}");
     assert!(html.contains("data-user=\"reviewer\""), "{html}");
-    assert!(html.contains("placeholder=\"review-model\""), "{html}");
+    assert!(html.contains("<select data-model"), "{html}");
+    assert!(!html.contains("input[data-model]"), "{html}");
+    assert!(html.contains("Configured default (review-model)"), "{html}");
+    assert!(
+        html.contains("<option value=\"review-model\">review-model</option>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<option value=\"\" selected>Agent default</option>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<option data-custom-model>Custom model…</option>"),
+        "{html}"
+    );
     assert!(html.contains("Not supported by this agent"), "{html}");
     assert!(!html.contains("data-user=\"alice\""), "{html}");
 
@@ -2788,7 +2892,10 @@ async fn admin_sets_each_agent_users_model_and_effort() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let html = get_admin(h.app.clone()).await;
-    assert!(html.contains("value=\"gpt-fast\""), "{html}");
+    assert!(
+        html.contains("<option value=\"gpt-fast\" selected>gpt-fast</option>"),
+        "{html}"
+    );
     assert!(
         html.contains("<option value=\"high\" selected>high</option>"),
         "{html}"
