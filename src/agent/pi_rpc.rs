@@ -170,6 +170,14 @@ impl PiRpcClient {
         }
     }
 
+    /// Query the same model catalog used by Pi's model selector.
+    pub async fn available_models(&mut self) -> Result<Vec<String>> {
+        let record = self
+            .command(json!({ "type": "get_available_models" }))
+            .await?;
+        crate::agent::catalog::pi_models(&record["data"])
+    }
+
     /// Read the live process's session state: the selected model, the exact
     /// session id, and the file backing it.
     pub async fn session_state(&mut self) -> Result<SessionState> {

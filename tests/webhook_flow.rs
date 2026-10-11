@@ -3073,3 +3073,159 @@ async fn ranking_refreshes_default_dependent_user_controls() {
     assert!(default_row.contains("claude-provider-model"));
     assert!(after.contains("<option value=\"high\""));
 }
+
+#[tokio::test]
+async fn admin_discovers_and_caches_models_per_user_and_resolved_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("home/agent")).unwrap();
+    std::fs::create_dir_all(dir.path().join("home/reviewer")).unwrap();
+    let log = dir.path().join("catalog.log");
+    let fixture = format!(
+        "{}/tests/fixtures/fake_model_catalog.py",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let h = harness_with(dir.path(), |config| {
+        config.agent_sequence = vec!["codex".into(), "pi-rpc".into()];
+        config.agents.overrides.insert(
+            "codex".into(),
+            AgentConfig {
+                command: Some(fixture.clone()),
+                env: [
+                    ("CATALOG_LOG".into(), log.display().to_string()),
+                    ("CATALOG_ID".into(), "first".into()),
+                ]
+                .into(),
+                ..Default::default()
+            },
+        );
+        config.pi_rpc.command = fixture;
+        config
+            .pi_rpc
+            .env
+            .insert("CATALOG_LOG".into(), log.display().to_string());
+        config.users.insert(
+            "reviewer".into(),
+            UserConfig {
+                role: UserRole::Reviewer,
+                host_user: "reviewer".into(),
+                agent: Some("codex".into()),
+                agent_model: None,
+                token: Some("review-token".into()),
+            },
+        );
+        config.users.insert(
+            "human".into(),
+            UserConfig {
+                role: UserRole::Human,
+                host_user: String::new(),
+                agent: None,
+                agent_model: None,
+                token: Some("human-token".into()),
+            },
+        );
+    });
+    let query = |user: &'static str| {
+        let app = h.app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/agent-models")
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"user": user}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, body)
+        }
+    };
+    for user in ["default", "default", "reviewer"] {
+        let (status, body) = query(user).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"supported": true, "models": ["first", "second"]})
+        );
+    }
+    // Separate users do not share catalog cache entries.
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+    for user in ["missing", "human"] {
+        assert_eq!(query(user).await.0, StatusCode::BAD_REQUEST);
+    }
+    assert!(h.agents.set_ranking(vec!["pi-rpc".into(), "codex".into()]));
+    let (status, body) = query("default").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"supported": true, "models": ["test/pi-model"]})
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
+    // None of these read-only requests stores a model override.
+    assert!(h.sessions.user_settings("default").is_empty());
+}
+
+#[tokio::test]
+async fn admin_model_discovery_handles_unsupported_and_failed_catalogs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("home/agent")).unwrap();
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/admin/agent-models")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"user":"default"}"#))
+            .unwrap()
+    };
+    let h = harness(dir.path());
+    let response = h.app.oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"supported": false, "models": []})
+    );
+
+    let h = harness_with(dir.path(), |config| {
+        config.users.get_mut("default").unwrap().agent = Some("codex".into());
+        config.agents.overrides.insert(
+            "codex".into(),
+            AgentConfig {
+                command: Some(format!(
+                    "{}/tests/fixtures/fake_model_catalog.py",
+                    env!("CARGO_MANIFEST_DIR")
+                )),
+                env: [("CATALOG_FAIL".into(), "1".into())].into(),
+                ..Default::default()
+            },
+        );
+    });
+    let response = h.app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(h.agents.unavailable_reason("codex").is_none());
+    let response = h
+        .app
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(html.to_vec()).unwrap();
+    assert!(html.contains("Custom model…"));
+    assert!(html.contains("value=\"\" selected>Agent default"));
+    assert!(h.sessions.user_settings("default").is_empty());
+}

@@ -397,6 +397,11 @@ impl Dispatcher {
         &self.inner.policy
     }
 
+    /// Executor shared by runs and read-only model discovery.
+    pub fn executor(&self) -> &Executor {
+        &self.inner.executor
+    }
+
     /// The resolved user identities.
     pub fn identities(&self) -> &Identities {
         &self.inner.identities

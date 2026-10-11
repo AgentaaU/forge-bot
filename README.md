@@ -402,7 +402,14 @@ The **Agent models and effort** table lists every configured agent user (human
 recipients are omitted). For each user an operator can set:
 
 * **Model**: replaces that user's `agent_model` for its next runs. An empty
-  value restores the configured model (or the agent's own default).
+  value restores the configured model (or the agent's own default). The menu
+  loads Codex's `model/list` and Pi's `get_available_models` catalogs under
+  this user's Linux account, including its configured providers. Results are
+  cached for five minutes per user and adapter; discovery never starts a turn
+  or selects a model. Codex provider/catalog `-c` and `--config` overrides
+  are preserved; arguments that cannot safely be translated (such as profiles
+  or workspace changes) make discovery unsupported. Saved/configured/reported
+  choices and **Custom model** remain usable if discovery fails or an adapter has no catalog protocol.
 * **Effort**: a reasoning effort of `low`, `medium`, `high` or `xhigh`. The
   default leaves the choice to the agent. Only adapters that accept an effort
   offer the control: `codex` (`-c model_reasoning_effort`, or `turn/start` on

@@ -24,6 +24,11 @@ use crate::session::statistics;
 use crate::session::status;
 use crate::session::{Dispatcher, ThreadState, UserAgentSettings};
 
+type ModelCatalogCache = std::collections::HashMap<
+    (String, String),
+    Arc<tokio::sync::Mutex<Option<(std::time::Instant, Option<Vec<String>>)>>>,
+>;
+
 /// Shared state for the webhook server.
 #[derive(Clone)]
 pub struct AppState {
@@ -37,6 +42,7 @@ pub struct AppState {
     /// see, so the page uploads its self-test here for the operator to read.
     diagnostics: Arc<Mutex<Option<serde_json::Value>>>,
     auto: Arc<AutoTrigger>,
+    model_catalogs: Arc<Mutex<ModelCatalogCache>>,
 }
 
 impl AppState {
@@ -55,6 +61,7 @@ impl AppState {
             dedupe: Arc::new(Mutex::new(RecentComments::new(1024))),
             diagnostics: Arc::new(Mutex::new(None)),
             auto,
+            model_catalogs: Arc::new(Mutex::new(ModelCatalogCache::new())),
         }
     }
 
@@ -76,6 +83,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/agent-ranking", post(save_agent_ranking))
         .route("/admin/terminate-thread", post(terminate_thread))
         .route("/admin/agent-settings", post(save_agent_settings))
+        .route("/admin/agent-models", post(agent_models))
         .route("/status", get(status_page))
         .route("/status/details", get(status_details))
         .route("/status.json", get(status_json))
@@ -334,6 +342,76 @@ fn worker_capacity_summary(capacity: &crate::session::queue::Capacity) -> String
         capacity.free(),
         queued,
     )
+}
+
+#[derive(serde::Deserialize)]
+struct ModelCatalogRequest {
+    user: String,
+}
+
+async fn agent_models(
+    State(state): State<AppState>,
+    Json(request): Json<ModelCatalogRequest>,
+) -> Response {
+    let Some(user) = state
+        .config
+        .users
+        .get(&request.user)
+        .filter(|user| user.role.is_agent())
+    else {
+        return (StatusCode::BAD_REQUEST, "unknown agent user\n").into_response();
+    };
+    let name = user
+        .agent
+        .clone()
+        .unwrap_or_else(|| state.agents.default_name());
+    if state.agents.get(&name).is_err() {
+        return (StatusCode::BAD_REQUEST, "unknown agent\n").into_response();
+    }
+    // Cache by user AND resolved adapter: changing ranking can change the
+    // default adapter, and different accounts have different provider access.
+    let cache = state
+        .model_catalogs
+        .lock()
+        .expect("model catalog mutex poisoned")
+        .entry((request.user.clone(), name.to_owned()))
+        .or_default()
+        .clone();
+    let mut cached = cache.lock().await;
+    let models = if let Some((_, models)) = cached
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(300))
+    {
+        models.clone()
+    } else {
+        match crate::agent::catalog::available_models(
+            &state.config,
+            &name,
+            state.dispatcher.executor(),
+            &user.host_user,
+        )
+        .await
+        {
+            Ok(mut models) => {
+                if let Some(models) = &mut models {
+                    models.sort();
+                    models.dedup();
+                }
+                *cached = Some((std::time::Instant::now(), models.clone()));
+                models
+            }
+            Err(error) => {
+                tracing::warn!(user = %request.user, agent = %name, %error, "model discovery failed");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Model discovery unavailable; saved and custom choices are still usable.\n",
+                )
+                    .into_response();
+            }
+        }
+    };
+    Json(json!({"supported": models.is_some(), "models": models.unwrap_or_default()}))
+        .into_response()
 }
 
 /// Longest model ID an operator may enter. Real identifiers are far shorter;
