@@ -614,6 +614,7 @@ mod tests {
         let path = if is_pr { "pulls" } else { "issues" };
         Job {
             model_agent: None,
+            configured_model_agent: None,
             id: uuid::Uuid::new_v4(),
             message: crate::forge::ForgeMessage {
                 forge: ForgeKind::Forgejo,

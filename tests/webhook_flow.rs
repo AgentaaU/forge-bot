@@ -41,6 +41,7 @@ const PAYLOAD: &str = r#"{
 }"#;
 
 struct Harness {
+    dispatcher: Arc<Dispatcher>,
     app: axum::Router,
     sessions: Arc<SessionStore>,
     agents: Arc<AgentRegistry>,
@@ -120,10 +121,15 @@ fn harness_with(dir: &std::path::Path, configure: impl FnOnce(&mut Config)) -> H
     )
     .unwrap();
 
-    let state =
-        forge_bot::webhook::AppState::new(config.clone(), adapters, agents.clone(), dispatcher);
+    let state = forge_bot::webhook::AppState::new(
+        config.clone(),
+        adapters,
+        agents.clone(),
+        dispatcher.clone(),
+    );
 
     Harness {
+        dispatcher,
         app: forge_bot::webhook::router(state),
         sessions,
         agents,
@@ -451,6 +457,12 @@ async fn auto_trigger_reuses_the_threads_previous_agent() {
             .agent,
         "other"
     );
+
+    // An admin choice for ordinary mentions must not replace the thread's
+    // remembered adapter when an automatic follow-up is submitted.
+    harness
+        .dispatcher
+        .set_user_agent("default", Some("custom".into()));
 
     // The automatic conflict trigger has no mention but must keep using
     // `other` for the same thread rather than falling back to `custom`.
@@ -2691,6 +2703,7 @@ async fn admin_reported_models_follow_the_reporting_adapter_not_the_queued_adapt
     });
     let mut job = Job {
         model_agent: None,
+        configured_model_agent: None,
         id: uuid::Uuid::new_v4(),
         message: ForgeMessage {
             forge: ForgeKind::Forgejo,
@@ -2908,16 +2921,67 @@ async fn admin_sets_each_agent_users_model_and_effort() {
         "{saved}"
     );
 
+    // Adapter choices are validated against the selected adapter's effort support.
+    for (body, expected) in [
+        (
+            json!({"user":"reviewer", "agent":"missing"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"user":"reviewer", "agent":"custom", "effort":"high"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"user":"reviewer", "agent":"claude", "effort":"high"}),
+            StatusCode::NO_CONTENT,
+        ),
+    ] {
+        assert_eq!(
+            post(h.app.clone(), Body::from(body.to_string()), true)
+                .await
+                .status(),
+            expected
+        );
+    }
+    assert_eq!(
+        h.dispatcher.user_agent("reviewer").as_deref(),
+        Some("claude")
+    );
+    assert!(
+        get_admin(h.app.clone())
+            .await
+            .contains("value=\"claude\" selected data-supports-effort=\"true\"")
+    );
+    assert!(
+        std::fs::read_to_string(dir.path().join("agent-settings.json"))
+            .unwrap()
+            .contains("claude")
+    );
+    let restarted = harness_with(dir.path(), |_| {});
+    assert_eq!(restarted.dispatcher.user_agent("reviewer"), None);
+    assert_eq!(
+        post(
+            h.app.clone(),
+            Body::from(json!({"user":"reviewer", "agent":""}).to_string()),
+            true
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(h.dispatcher.user_agent("reviewer"), None);
+
     // A save that cannot be persisted is reported and changes nothing.
     let tmp = dir.path().join("agent-settings.json.tmp");
     std::fs::create_dir(&tmp).unwrap();
     let response = post(
         h.app.clone(),
-        Body::from(json!({"user": "default", "model": "gpt-lost"}).to_string()),
+        Body::from(json!({"user": "default", "agent": "custom", "model": "gpt-lost"}).to_string()),
         true,
     )
     .await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(h.dispatcher.user_agent("default"), None);
     assert!(!get_admin(h.app.clone()).await.contains("gpt-lost"));
     std::fs::remove_dir(&tmp).unwrap();
 
@@ -3033,7 +3097,11 @@ async fn ranking_refreshes_default_dependent_user_controls() {
         .await
     };
     let before = admin(h.app.clone()).await;
-    assert!(before.contains("<td>default</td><td>custom</td>"));
+    assert!(
+        before.contains(
+            "selected data-supports-effort=\"false\">Configured default (custom)</option>"
+        )
+    );
     assert!(before.contains("<select data-effort disabled>"));
     let default_row = before
         .split("<td>default</td>")
@@ -3060,7 +3128,11 @@ async fn ranking_refreshes_default_dependent_user_controls() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let after = admin(h.app.clone()).await;
-    assert!(after.contains("<td>default</td><td>claude</td>"));
+    assert!(
+        after.contains(
+            "selected data-supports-effort=\"true\">Configured default (claude)</option>"
+        )
+    );
     assert!(!after.contains("<select data-effort disabled>"));
     assert!(after.contains("window.location.reload()"));
     let default_row = after
@@ -3124,16 +3196,20 @@ async fn admin_discovers_and_caches_models_per_user_and_resolved_agent() {
             },
         );
     });
-    let query = |user: &'static str| {
+    let query = |user: &'static str, agent: Option<&'static str>| {
         let app = h.app.clone();
         async move {
+            let mut body = json!({"user": user});
+            if let Some(agent) = agent {
+                body["agent"] = json!(agent);
+            }
             let response = app
                 .oneshot(
                     Request::builder()
                         .method("POST")
                         .uri("/admin/agent-models")
                         .header("content-type", "application/json")
-                        .body(Body::from(json!({"user": user}).to_string()))
+                        .body(Body::from(body.to_string()))
                         .unwrap(),
                 )
                 .await
@@ -3146,7 +3222,7 @@ async fn admin_discovers_and_caches_models_per_user_and_resolved_agent() {
         }
     };
     for user in ["default", "default", "reviewer"] {
-        let (status, body) = query(user).await;
+        let (status, body) = query(user, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap(),
@@ -3156,16 +3232,40 @@ async fn admin_discovers_and_caches_models_per_user_and_resolved_agent() {
     // Separate users do not share catalog cache entries.
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
     for user in ["missing", "human"] {
-        assert_eq!(query(user).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(query(user, None).await.0, StatusCode::BAD_REQUEST);
     }
     assert!(h.agents.set_ranking(vec!["pi-rpc".into(), "codex".into()]));
-    let (status, body) = query("default").await;
+    let (status, body) = query("default", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         serde_json::from_slice::<Value>(&body).unwrap(),
         json!({"supported": true, "models": ["test/pi-model"]})
     );
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
+    // Discovery follows runtime choices and can preview an unsaved adapter.
+    h.dispatcher
+        .set_user_agent("reviewer", Some("pi-rpc".into()));
+    for (agent, models) in [
+        (None, json!(["test/pi-model"])),
+        (Some(""), json!(["first", "second"])),
+        (Some("codex"), json!(["first", "second"])),
+    ] {
+        let (status, body) = query("reviewer", agent).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"supported": true, "models": models})
+        );
+    }
+    assert_eq!(
+        query("reviewer", Some("missing")).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        h.dispatcher.user_agent("reviewer").as_deref(),
+        Some("pi-rpc")
+    );
+    assert!(h.sessions.user_settings("reviewer").is_empty());
     // None of these read-only requests stores a model override.
     assert!(h.sessions.user_settings("default").is_empty());
 }

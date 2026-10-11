@@ -347,6 +347,9 @@ fn worker_capacity_summary(capacity: &crate::session::queue::Capacity) -> String
 #[derive(serde::Deserialize)]
 struct ModelCatalogRequest {
     user: String,
+    /// Preview an adapter without changing the user's saved/runtime settings.
+    /// Omitted uses the runtime choice; empty uses configuration.
+    agent: Option<String>,
 }
 
 async fn agent_models(
@@ -361,10 +364,13 @@ async fn agent_models(
     else {
         return (StatusCode::BAD_REQUEST, "unknown agent user\n").into_response();
     };
-    let name = user
-        .agent
-        .clone()
-        .unwrap_or_else(|| state.agents.default_name());
+    let name = if let Some(agent) = &request.agent {
+        (!agent.is_empty()).then(|| agent.clone())
+    } else {
+        state.dispatcher.user_agent(&request.user)
+    }
+    .or_else(|| user.agent.clone())
+    .unwrap_or_else(|| state.agents.default_name());
     if state.agents.get(&name).is_err() {
         return (StatusCode::BAD_REQUEST, "unknown agent\n").into_response();
     }
@@ -428,11 +434,17 @@ fn agent_user_rows(state: &AppState) -> String {
         if !user.role.is_agent() {
             continue;
         }
-        let agent = user
-            .agent
-            .clone()
+        let agent = state
+            .dispatcher
+            .user_agent(id)
+            .or_else(|| user.agent.clone())
             .unwrap_or_else(|| state.agents.default_name().to_owned());
         let settings = state.dispatcher.user_settings(id);
+        let settings = if settings.agent.as_ref() == Some(&agent) {
+            settings
+        } else {
+            UserAgentSettings::default()
+        };
         let supported = state
             .agents
             .get(&agent)
@@ -441,29 +453,50 @@ fn agent_user_rows(state: &AppState) -> String {
         rows.push_str(&format!(
             include_str!("../web/admin-user-row.html"),
             user = status::escape_html(id),
-            agent = status::escape_html(&agent),
+            agent_options = {
+                let current = state.dispatcher.user_agent(id);
+                let default_agent = state.agents.default_name();
+                let configured = user.agent.as_deref().unwrap_or(&default_agent);
+                let mut options = format!(
+                    "<option value=\"\"{} data-supports-effort=\"{}\">Configured default ({})</option>",
+                    if current.is_none() { " selected" } else { "" },
+                    state.agents.get(configured).is_ok_and(|agent| agent.supports_effort()),
+                    status::escape_html(configured)
+                );
+                for name in state.agents.names() {
+                    options.push_str(&format!(
+                        "<option value=\"{}\"{} data-supports-effort=\"{}\">{}</option>",
+                        status::escape_html(&name),
+                        if current.as_deref() == Some(&name) {
+                            " selected"
+                        } else {
+                            ""
+                        },
+                        state
+                            .agents
+                            .get(&name)
+                            .is_ok_and(|agent| agent.supports_effort()),
+                        status::escape_html(&name)
+                    ));
+                }
+                options
+            },
             model_options = model_options(
                 settings.model.as_deref(),
-                user.agent_model.as_deref(),
-                state
-                    .config
-                    .users
-                    .iter()
-                    .filter(|(_, candidate)| {
-                        candidate.role.is_agent()
-                            && candidate
-                                .agent
-                                .as_deref()
-                                .unwrap_or(&state.agents.default_name())
-                                == agent
-                    })
+                user.agent_model.as_deref().filter(|_| user.agent.as_deref().unwrap_or(&state.agents.default_name()) == agent),
+                state.config.users.iter().filter(|(_, candidate)| candidate.role.is_agent())
                     .flat_map(|(candidate_id, candidate)| {
+                        let default_agent = state.agents.default_name();
+                        let configured = candidate.agent.as_deref().unwrap_or(&default_agent);
+                        let effective = state.dispatcher.user_agent(candidate_id).unwrap_or_else(|| configured.to_owned());
                         [
-                            candidate.agent_model.clone(),
-                            state.dispatcher.user_settings(candidate_id).model,
+                            (configured == agent).then(|| candidate.agent_model.clone()).flatten(),
+                            (effective == agent).then(|| {
+                                let settings = state.dispatcher.user_settings(candidate_id);
+                                (settings.agent.as_deref() == Some(effective.as_str())).then_some(settings.model).flatten()
+                            }).flatten(),
                         ]
-                    })
-                    .flatten()
+                    }).flatten()
                     .chain(
                         reported_models
                             .iter()
@@ -589,6 +622,8 @@ async fn terminate_thread(
 #[derive(serde::Deserialize)]
 struct AgentSettingsRequest {
     user: String,
+    /// Omitted preserves the runtime choice; empty restores configuration.
+    agent: Option<String>,
     /// Empty restores the configured `agent_model`.
     #[serde(default)]
     model: String,
@@ -611,6 +646,19 @@ async fn save_agent_settings(
     else {
         return (StatusCode::NOT_FOUND, "unknown agent user\n").into_response();
     };
+    let selected_agent = request.agent.as_deref().filter(|name| !name.is_empty());
+    if let Some(agent) = selected_agent
+        && state.agents.get(agent).is_err()
+    {
+        return (StatusCode::BAD_REQUEST, "unknown agent\n").into_response();
+    }
+    let effective_agent = if request.agent.is_some() {
+        selected_agent.map(str::to_owned)
+    } else {
+        state.dispatcher.user_agent(&request.user)
+    }
+    .or_else(|| user.agent.clone())
+    .unwrap_or_else(|| state.agents.default_name());
     let model = request.model.trim();
     if model.len() > MAX_MODEL_LEN || model.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return (StatusCode::BAD_REQUEST, "invalid model\n").into_response();
@@ -624,13 +672,10 @@ async fn save_agent_settings(
             )
                 .into_response();
         }
-        let agent = user
-            .agent
-            .clone()
-            .unwrap_or_else(|| state.agents.default_name().to_owned());
+        let agent = &effective_agent;
         if !state
             .agents
-            .get(&agent)
+            .get(agent)
             .is_ok_and(|agent| agent.supports_effort())
         {
             return (
@@ -641,6 +686,7 @@ async fn save_agent_settings(
         }
     }
     let settings = UserAgentSettings {
+        agent: Some(effective_agent),
         model: (!model.is_empty()).then(|| model.to_owned()),
         effort: (!effort.is_empty()).then(|| effort.to_owned()),
     };
@@ -651,6 +697,11 @@ async fn save_agent_settings(
             "failed to save agent settings\n",
         )
             .into_response();
+    }
+    if request.agent.is_some() {
+        state
+            .dispatcher
+            .set_user_agent(&request.user, selected_agent.map(str::to_owned));
     }
     tracing::info!(user = %request.user, "agent settings changed by admin");
     StatusCode::NO_CONTENT.into_response()

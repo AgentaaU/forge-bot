@@ -10,7 +10,7 @@ button {{ padding: .5rem .8rem; cursor: pointer; }}
 <table id="agent-ranking"><thead><tr><th>Agent</th><th>Availability</th><th>Action</th><th>Priority</th></tr></thead><tbody>{rows}</tbody></table>
 <h2>Running threads</h2><p>Terminate stops the agent run in flight for a thread, and the thread is told so. Mentions already queued for that thread still run afterwards.</p>
 <table><thead><tr><th>Thread</th><th>Agent</th><th>Running since</th><th>Action</th></tr></thead><tbody>{thread_rows}</tbody></table>
-<h2>Agent models and effort</h2><p>Set the model and reasoning effort for an agent user's next runs. The default model choice restores its configured <code>agent_model</code>; the default effort leaves the agent's own choice. Choices load from the agent’s own model catalog for this user (where supported), alongside configured and recently reported models for the same agent; choose Custom model to enter another model ID. Changes are saved across restarts and do not affect runs already in progress.</p>
+<h2>Agent models and effort</h2><p>Set the agent, model and reasoning effort for an agent user's next runs. The default model choice restores its configured <code>agent_model</code>; the default effort leaves the agent's own choice. Choices load from the agent’s own model catalog for this user (where supported), alongside configured and recently reported models for the same agent; choose Custom model to enter another model ID. Agent changes reset on restart; model and effort changes are saved across restarts and do not affect runs already in progress.</p>
 <table><thead><tr><th>User</th><th>Agent</th><th>Model</th><th>Effort</th><th>Action</th></tr></thead><tbody>{user_rows}</tbody></table>
 <p id="result" role="status" aria-live="polite"></p><p><a href="/admin">Refresh availability</a></p>
 <script>
@@ -72,24 +72,41 @@ document.querySelectorAll('button[data-key]').forEach(button => {{
 document.querySelectorAll('select[data-model]').forEach(select => {{
     const row = select.closest('tr');
     const catalogStatus = row.querySelector('[data-model-status]');
-    catalogStatus.textContent = ' Loading models…';
-    fetch('/admin/agent-models', {{
-        method: 'POST', headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{user: row.querySelector('button[data-user]').dataset.user}})
-    }}).then(async response => {{
-        if (!response.ok) throw new Error(' Models unavailable; saved and custom choices remain usable.');
-        const catalog = await response.json();
-        // Keep the default and any selection made while discovery was running.
-        const selected = select.value;
-        for (const model of catalog.models) {{
-            if (!Array.from(select.options).some(option => !option.hasAttribute('data-custom-model') && option.value === model)) {{
-                select.add(new Option(model, model), select.querySelector('[data-custom-model]'));
+    let discovery = 0;
+    const loadModels = async () => {{
+        const current = ++discovery;
+        catalogStatus.textContent = ' Loading models…';
+        try {{
+            const response = await fetch('/admin/agent-models', {{
+                method: 'POST', headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{
+                    user: row.querySelector('button[data-user]').dataset.user,
+                    agent: row.querySelector('select[data-user-agent]').value
+                }})
+            }});
+            if (!response.ok) throw new Error(' Models unavailable; saved and custom choices remain usable.');
+            const catalog = await response.json();
+            // A response for an earlier adapter must not populate the new menu.
+            if (current !== discovery) return;
+            const selected = select.value;
+            for (const model of catalog.models) {{
+                if (!Array.from(select.options).some(option => !option.hasAttribute('data-custom-model') && option.value === model)) {{
+                    select.add(new Option(model, model), select.querySelector('[data-custom-model]'));
+                }}
             }}
+            select.value = selected;
+            catalogStatus.textContent = catalog.supported ? '' : ' This agent does not expose a model catalog.';
+        }} catch (error) {{
+            if (current === discovery) catalogStatus.textContent = error.message;
         }}
-        select.value = selected;
-        catalogStatus.textContent = catalog.supported ? '' : ' This agent does not expose a model catalog.';
-    }}).catch(error => {{ catalogStatus.textContent = error.message; }});
+    }};
+    loadModels();
     let previous = select.value;
+    row.querySelector('select[data-user-agent]').addEventListener('change', () => {{
+        select.innerHTML = '<option value="">Agent default</option><option data-custom-model>Custom model…</option>';
+        previous = '';
+        loadModels();
+    }});
     select.addEventListener('change', () => {{
         if (select.selectedOptions[0].hasAttribute('data-custom-model')) {{
             const model = window.prompt('Enter the model ID accepted by this agent:');
@@ -105,6 +122,14 @@ document.querySelectorAll('select[data-model]').forEach(select => {{
         previous = select.value;
     }});
 }});
+document.querySelectorAll('select[data-user-agent]').forEach(select => {{
+    const row = select.closest('tr');
+    const effort = row.querySelector('select[data-effort]');
+    select.addEventListener('change', () => {{
+        effort.innerHTML = '<option value="">Agent default</option>' + ['low', 'medium', 'high', 'xhigh'].map(value => '<option value="' + value + '">' + value + '</option>').join('');
+        effort.disabled = select.selectedOptions[0].dataset.supportsEffort !== 'true';
+    }});
+}});
 document.querySelectorAll('button[data-user]').forEach(button => {{
     button.addEventListener('click', async () => {{
         const row = button.closest('tr');
@@ -115,12 +140,13 @@ document.querySelectorAll('button[data-user]').forEach(button => {{
                 method: 'POST', headers: {{'Content-Type': 'application/json'}},
                 body: JSON.stringify({{
                     user: button.dataset.user,
+                    agent: row.querySelector('select[data-user-agent]').value,
                     model: row.querySelector('select[data-model]').value,
                     effort: row.querySelector('select[data-effort]').value
                 }})
             }});
             if (!response.ok) throw new Error((await response.text()).trim() || 'Save failed (' + response.status + ')');
-            result.textContent = 'Saved settings for ' + button.dataset.user + '. They apply to its next run.';
+            window.location.reload();
         }} catch (error) {{ result.textContent = error.message; }}
         finally {{ button.disabled = false; }}
     }});

@@ -60,6 +60,8 @@ struct Inner {
     /// Bounded set of delivery keys already notified, so a comment seen by both
     /// ingesters (or redelivered) notifies a human only once.
     notified: Mutex<RecentComments>,
+    /// Runtime-only adapter choices; restarting restores configuration.
+    user_agents: Mutex<HashMap<String, String>>,
     tx: mpsc::Sender<Job>,
     /// Conversation key -> agent currently running for it, so a follow-up can
     /// be delivered into the live run instead of queueing a second one.
@@ -228,6 +230,7 @@ impl Dispatcher {
             notifier: Notifier::new(),
             push: crate::web_push::PushService::new(&config)?,
             notified: Mutex::new(RecentComments::new(1024)),
+            user_agents: Mutex::new(HashMap::new()),
             tx,
             running: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
@@ -325,11 +328,18 @@ impl Dispatcher {
         mention: Mention,
         agent_name: &str,
     ) -> Result<Uuid> {
+        let user = self.inner.recipient_for(&message);
+        let override_agent = self.user_agent(&user.id);
+        let agent_name =
+            if !is_auto_trigger(&message) && mention.agent.as_deref().is_none_or(str::is_empty) {
+                override_agent.as_deref().unwrap_or(agent_name)
+            } else {
+                agent_name
+            };
         // Resolve eagerly so an unknown agent fails before we persist a job.
         // A typo in `--agent=` is a caller error, not something to swallow, so
         // report it in the thread with the registered names.
         let resolved = self.inner.agents.get(agent_name);
-        let user = self.inner.recipient_for(&message);
         let user_id = Some(user.id.clone());
         if let Err(BotError::UnknownAgent(name)) = &resolved {
             let body = unknown_agent_message(name, &self.inner.agents.names());
@@ -342,10 +352,16 @@ impl Dispatcher {
         // claiming the agent is running.
         let key = SessionStore::key(&message, user_id.as_deref());
         let waiting = self.inner.thread_is_busy(&key);
+        let configured_agent = user
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.inner.agents.default_name());
         let mut job = Job {
+            configured_model_agent: Some(configured_agent),
             model_agent: Some(
-                user.agent
+                override_agent
                     .clone()
+                    .or_else(|| user.agent.clone())
                     .unwrap_or_else(|| self.inner.agents.default_name()),
             ),
             id: Uuid::new_v4(),
@@ -501,6 +517,7 @@ impl Dispatcher {
             .agent
             .clone()
             .filter(|name| !name.is_empty())
+            .or_else(|| self.user_agent(&recipient.id))
             .or_else(|| recipient.agent.clone())
             .unwrap_or_else(|| self.inner.agents.default_name().to_owned());
         Ok(Some((mention, agent)))
@@ -637,9 +654,41 @@ impl Dispatcher {
         self.inner.sessions.user_settings(user_id)
     }
 
+    /// Runtime adapter override for a configured user.
+    pub fn user_agent(&self, user_id: &str) -> Option<String> {
+        self.inner
+            .user_agents
+            .lock()
+            .expect("user agents mutex poisoned")
+            .get(user_id)
+            .cloned()
+    }
+
+    /// Set or clear a runtime adapter override. The caller validates the user.
+    pub fn set_user_agent(&self, user_id: &str, agent: Option<String>) {
+        let mut agents = self
+            .inner
+            .user_agents
+            .lock()
+            .expect("user agents mutex poisoned");
+        if let Some(agent) = agent {
+            agents.insert(user_id.to_owned(), agent);
+        } else {
+            agents.remove(user_id);
+        }
+    }
+
     /// Replace an agent user's overrides. They apply from the next run; runs
     /// already in flight keep the settings they started with.
-    pub fn set_user_settings(&self, user_id: &str, settings: UserAgentSettings) -> Result<()> {
+    pub fn set_user_settings(&self, user_id: &str, mut settings: UserAgentSettings) -> Result<()> {
+        if !settings.is_empty() && settings.agent.is_none() {
+            let user = self.inner.user_for(Some(user_id))?;
+            settings.agent = Some(
+                self.user_agent(user_id)
+                    .or_else(|| user.agent.clone())
+                    .unwrap_or_else(|| self.inner.agents.default_name()),
+            );
+        }
         self.inner.sessions.set_user_settings(user_id, settings)
     }
 
@@ -1060,6 +1109,7 @@ impl Inner {
             .clone()
             .or_else(|| user.agent.clone())
             .unwrap_or_else(|| self.agents.configured_default_name().to_owned());
+        let configured_model_agent = job.configured_model_agent.as_ref().unwrap_or(&model_agent);
         let workspace = match self
             .workspaces
             .prepare(
@@ -1182,9 +1232,21 @@ impl Inner {
             .map(|id| self.sessions.user_settings(id))
             .unwrap_or_default();
 
+        let overrides = if overrides.agent.as_ref() == Some(&model_agent) {
+            overrides
+        } else {
+            UserAgentSettings::default()
+        };
+
         for (index, name) in candidates.iter().enumerate() {
             context.model = (name == &model_agent)
-                .then(|| overrides.model.clone().or_else(|| user.agent_model.clone()))
+                .then(|| {
+                    overrides.model.clone().or_else(|| {
+                        (name == configured_model_agent)
+                            .then(|| user.agent_model.clone())
+                            .flatten()
+                    })
+                })
                 .flatten();
             context.effort = (name == &model_agent)
                 .then(|| overrides.effort.clone())
@@ -1977,10 +2039,18 @@ mod tests {
         assert_eq!(mention.message, "do it");
         assert_eq!(agent, "custom");
 
+        dispatcher.set_user_agent("shylock-bot", Some("claude".into()));
+        assert_eq!(dispatcher.route(&to_default).unwrap().unwrap().1, "claude");
+        assert_eq!(dispatcher.user_agent("shylock-reviewer"), None);
+
         // An explicit `--agent` still takes precedence.
         to_default.body = "@shylock-bot --agent=codex do it".into();
         let (_, agent) = dispatcher.route(&to_default).unwrap().unwrap();
         assert_eq!(agent, "codex");
+
+        dispatcher.set_user_agent("shylock-bot", None);
+        to_default.body = "@shylock-bot do it".into();
+        assert_eq!(dispatcher.route(&to_default).unwrap().unwrap().1, "custom");
 
         // A reviewer with no adapter uses the registry default.
         let mut to_reviewer = message("o/r");
@@ -2076,6 +2146,7 @@ mod tests {
         let user = dispatcher.inner.recipient_for(&auto);
         let job = Job {
             model_agent: None,
+            configured_model_agent: None,
             id: Uuid::new_v4(),
             message: auto.clone(),
             mention: Mention {
@@ -2099,6 +2170,7 @@ mod tests {
         let user = dispatcher.inner.recipient_for(&removed);
         let job = Job {
             model_agent: None,
+            configured_model_agent: None,
             id: Uuid::new_v4(),
             message: removed.clone(),
             mention: Mention {
@@ -2423,6 +2495,7 @@ mod tests {
     fn permission_failure_is_user_facing() {
         let job = Job {
             model_agent: None,
+            configured_model_agent: None,
             id: Uuid::new_v4(),
             message: message("o/r"),
             mention: Mention {
@@ -2753,6 +2826,7 @@ mod tests {
     fn merged_notice_names_the_trigger() {
         let auto_job = |event: &str| Job {
             model_agent: None,
+            configured_model_agent: None,
             id: Uuid::new_v4(),
             message: ForgeMessage {
                 forge: crate::location::ForgeKind::Forgejo,
@@ -2827,6 +2901,7 @@ mod tests {
 
         let job = Job {
             model_agent: None,
+            configured_model_agent: None,
             id: Uuid::new_v4(),
             message: message("o/r"),
             mention: Mention {
@@ -3344,7 +3419,7 @@ mod tests {
                         },
                     );
                 }
-                // Write old-format jobs and settings, then reopen the store so
+                // Write old-format jobs and adapter-owned settings, then reopen the store so
                 // Dispatcher::new exercises actual on-disk recovery.
                 let store = SessionStore::open(dir.path()).unwrap();
                 if admin_override {
@@ -3352,6 +3427,7 @@ mod tests {
                         .set_user_settings(
                             "default",
                             UserAgentSettings {
+                                agent: Some("primary".into()),
                                 model: Some("admin-primary-model".into()),
                                 effort: Some("high".into()),
                             },
@@ -3368,6 +3444,7 @@ mod tests {
                         },
                         agent: agent.into(),
                         model_agent: None,
+                        configured_model_agent: None,
                         user_id: Some("default".into()),
                         created_at: Utc::now(),
                         status_comment: None,
@@ -3496,6 +3573,7 @@ mod tests {
                         .set_user_settings(
                             "default",
                             UserAgentSettings {
+                                agent: None,
                                 model: Some("admin-primary-model".into()),
                                 effort: Some("high".into()),
                             },
@@ -3599,18 +3677,27 @@ mod tests {
         user.agent_model = Some("configured-model".into());
         let config = Arc::new(config);
 
-        for supports_effort in [true, false] {
+        for (supports_effort, configured_agent) in [(true, Some("recorder")), (false, None)] {
+            let mut config = (*config).clone();
+            config.users.get_mut("default").unwrap().agent = configured_agent.map(str::to_owned);
+            let config = Arc::new(config);
             let dir = tempfile::tempdir().unwrap();
             let recorder = Arc::new(Recorder {
                 supports_effort,
                 seen: Mutex::new(Vec::new()),
             });
+            let alternate = Arc::new(Recorder {
+                supports_effort,
+                seen: Mutex::new(Vec::new()),
+            });
             let mut registry = AgentRegistry::from_config(&config);
             registry.insert_for_test("recorder", recorder.clone());
+            registry.insert_for_test("alternate", alternate.clone());
+            let registry = Arc::new(registry);
             let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
             let dispatcher = Dispatcher::new(
                 config.clone(),
-                Arc::new(registry),
+                registry.clone(),
                 sessions.clone(),
                 Arc::new(NoopForgeApi),
                 Policy::new(&config.policy),
@@ -3638,6 +3725,7 @@ mod tests {
                 .set_user_settings(
                     "default",
                     crate::session::UserAgentSettings {
+                        agent: None,
                         model: Some("override-model".into()),
                         effort: Some("high".into()),
                     },
@@ -3646,14 +3734,144 @@ mod tests {
             submit(dispatcher.clone()).await;
             wait_for_drain(&sessions).await;
 
+            dispatcher
+                .set_user_settings("default", UserAgentSettings::default())
+                .unwrap();
+            dispatcher.set_user_agent("default", Some("alternate".into()));
+            submit(dispatcher.clone()).await;
+            wait_for_drain(&sessions).await;
+            assert_eq!(
+                *alternate.seen.lock().unwrap(),
+                vec![(None, None)],
+                "configured provider model must not leak into the selected adapter"
+            );
+            dispatcher
+                .set_user_settings(
+                    "default",
+                    UserAgentSettings {
+                        agent: None,
+                        model: Some("alternate-model".into()),
+                        effort: Some("low".into()),
+                    },
+                )
+                .unwrap();
+            submit(dispatcher.clone()).await;
+            wait_for_drain(&sessions).await;
+            assert_eq!(
+                alternate.seen.lock().unwrap()[1],
+                (Some("alternate-model".into()), Some("low".into()))
+            );
+            dispatcher
+                .submit(
+                    message("o/r"),
+                    Mention {
+                        agent: Some("recorder".into()),
+                        message: "explicit".into(),
+                    },
+                    "recorder",
+                )
+                .await
+                .unwrap();
+            wait_for_drain(&sessions).await;
+
             let seen = recorder.seen.lock().unwrap().clone();
             assert_eq!(
                 seen,
                 vec![
                     (Some("configured-model".into()), None),
                     (Some("override-model".into()), Some("high".into())),
+                    (None, None),
                 ],
                 "supports_effort = {supports_effort}"
+            );
+
+            // Persist a pending job accepted for the configured adapter before
+            // the admin switches adapters and saves new provider settings.
+            dispatcher.set_user_agent("default", None);
+            dispatcher
+                .set_user_settings("default", UserAgentSettings::default())
+                .unwrap();
+            let pending = Job {
+                id: Uuid::new_v4(),
+                message: message("o/r"),
+                mention: Mention {
+                    agent: None,
+                    message: "pending".into(),
+                },
+                agent: "recorder".into(),
+                model_agent: Some("recorder".into()),
+                configured_model_agent: Some("recorder".into()),
+                user_id: Some("default".into()),
+                created_at: Utc::now(),
+                status_comment: None,
+                waiting: true,
+            };
+            sessions.save_job(&pending).unwrap();
+            dispatcher.set_user_agent("default", Some("alternate".into()));
+            dispatcher
+                .set_user_settings(
+                    "default",
+                    UserAgentSettings {
+                        agent: None,
+                        model: Some("alternate-model".into()),
+                        effort: Some("low".into()),
+                    },
+                )
+                .unwrap();
+            let reopened = Arc::new(SessionStore::open(dir.path()).unwrap());
+            assert_eq!(
+                reopened.user_settings("default").agent.as_deref(),
+                Some("alternate")
+            );
+            let mut recovered_config = (*config).clone();
+            recovered_config.session.recover = true;
+            let recovered_config = Arc::new(recovered_config);
+            let restarted = Dispatcher::new(
+                recovered_config.clone(),
+                registry,
+                reopened.clone(),
+                Arc::new(NoopForgeApi),
+                Policy::new(&recovered_config.policy),
+            )
+            .unwrap();
+            wait_for_drain(&reopened).await;
+            assert_eq!(
+                recorder.seen.lock().unwrap().last().unwrap(),
+                &(Some("configured-model".into()), None)
+            );
+            // Restart forgets the runtime adapter but retains its owned settings.
+            assert_eq!(restarted.user_agent("default"), None);
+            submit(restarted.clone()).await;
+            wait_for_drain(&reopened).await;
+            assert_eq!(
+                recorder.seen.lock().unwrap().last().unwrap(),
+                &(Some("configured-model".into()), None)
+            );
+            restarted.set_user_agent("default", Some("alternate".into()));
+            submit(restarted.clone()).await;
+            wait_for_drain(&reopened).await;
+            assert_eq!(
+                alternate.seen.lock().unwrap().last().unwrap(),
+                &(Some("alternate-model".into()), Some("low".into()))
+            );
+            // Old records have no trustworthy adapter ownership. Never guess
+            // their provider from the adapter selected after a restart.
+            reopened
+                .set_user_settings(
+                    "default",
+                    UserAgentSettings {
+                        agent: None,
+                        model: Some("unowned-model".into()),
+                        effort: Some("high".into()),
+                    },
+                )
+                .unwrap();
+            restarted.set_user_agent("default", None);
+            submit(restarted).await;
+            wait_for_drain(&reopened).await;
+            assert_eq!(
+                recorder.seen.lock().unwrap().last().unwrap(),
+                &(Some("configured-model".into()), None)
             );
         }
     }
@@ -5035,6 +5253,7 @@ echo "end:$token" >> "$AGENT_LOG"
         for (number, token) in [(1, "TOKEN_A"), (2, "TOKEN_B")] {
             let job = Job {
                 model_agent: None,
+                configured_model_agent: None,
                 id: Uuid::new_v4(),
                 message: message_at("o/r", number),
                 mention: Mention {
@@ -5598,6 +5817,7 @@ echo "end:$token" >> "$AGENT_LOG"
         for (index, token) in ["TOKEN_A", "TOKEN_B"].into_iter().enumerate() {
             let mut job = Job {
                 model_agent: None,
+                configured_model_agent: None,
                 id: Uuid::new_v4(),
                 message: message_at("o/r", 7),
                 mention: Mention {

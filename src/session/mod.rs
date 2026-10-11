@@ -36,6 +36,9 @@ pub struct Job {
     /// Older persisted jobs use their configured adapter or startup default.
     #[serde(default)]
     pub model_agent: Option<String>,
+    /// Adapter owning the configured model, before a runtime agent override.
+    #[serde(default)]
+    pub configured_model_agent: Option<String>,
     /// User id this job belongs to. Persisted so recovery runs under the
     /// same account instead of re-deriving it from the message.
     #[serde(default)]

@@ -84,6 +84,10 @@ const USER_SETTINGS_FILE: &str = "agent-settings.json";
 /// the agent's own default (effort).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserAgentSettings {
+    /// Adapter owning these overrides. Older records without ownership are
+    /// ignored by runs until an operator saves settings with an owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Model ID that replaces the user's `agent_model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -511,6 +515,7 @@ mod tests {
     fn job() -> Job {
         Job {
             model_agent: None,
+            configured_model_agent: None,
             id: Uuid::new_v4(),
             message: ForgeMessage {
                 forge: ForgeKind::Forgejo,
@@ -771,6 +776,7 @@ mod user_settings_tests {
 
     fn settings(model: &str, effort: &str) -> UserAgentSettings {
         UserAgentSettings {
+            agent: None,
             model: Some(model.into()),
             effort: Some(effort.into()),
         }

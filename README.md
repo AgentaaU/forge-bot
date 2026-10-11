@@ -401,6 +401,10 @@ that has already produced its outcome, which can no longer be terminated.
 The **Agent models and effort** table lists every configured agent user (human
 recipients are omitted). For each user an operator can set:
 
+* **Agent**: selects an adapter for mentions without an explicit `--agent=`.
+  An empty value restores the configured adapter. This choice is in memory
+  only and resets on restart; running jobs keep their original adapter.
+  Automatic follow-ups continue with the conversation’s remembered adapter.
 * **Model**: replaces that user's `agent_model` for its next runs. An empty
   value restores the configured model (or the agent's own default). The menu
   loads Codex's `model/list` and Pi's `get_available_models` catalogs under
@@ -418,11 +422,17 @@ recipients are omitted). For each user an operator can set:
   effort the user's agent does not support returns 400.
 
 Each save is `POST /admin/agent-settings` with a JSON body such as
-`{"user":"forge-reviewer","model":"gpt-fast","effort":"high"}`; an empty `model`
-or `effort` clears that override. Unknown or human users return 404, and an
-invalid model or effort returns 400. Overrides are written to
-`agent-settings.json` in the session directory, so they survive restarts, and
-they apply only to the user's configured agent, not to `--agent=` fallbacks.
+`{"user":"forge-reviewer","agent":"codex","model":"gpt-fast","effort":"high"}`; an empty `model`
+or `effort` clears that override. An omitted `agent` preserves the current
+runtime choice; an empty `agent` restores configuration. Unknown adapters
+return 400. Unknown or human users return 404, and an invalid model or effort
+returns 400. Model and effort overrides are written to `agent-settings.json`
+in the session directory together with their owning adapter, so they survive
+restarts. Settings owned by another adapter are ignored, including after the
+runtime agent choice resets on restart. Older settings without an owner are
+ignored until saved again from the admin page. They apply only to the user's selected agent, not to
+other explicit adapters or automatic fallbacks. The configured `agent_model`
+stays bound to the configured adapter when the runtime agent changes.
 Changing them does not affect a run already in progress. As with the other
 controls, protect the page with reverse proxy authentication.
 
