@@ -634,7 +634,9 @@ Inline model and effort override configured and admin choices for this
 invocation, including fallback adapters, and do not change later requests.
 Options end at the first instruction word or unknown, empty, or invalid option;
 that text remains part of the instruction. Options on subsequent lines are
-instruction text. A follow-up with inline settings queues a new turn rather
+instruction text. Model and effort are passed through the agent's CLI or RPC
+interface, without adding settings instructions to the task prompt.
+A follow-up with inline settings queues a new turn rather
 than steering a turn with different launch settings. An adapter without effort
 support fails an explicit effort request instead of silently ignoring it.
 

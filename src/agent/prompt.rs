@@ -28,13 +28,6 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
         "Your working directory: {}\n\n",
         working_directory.display()
     ));
-    if context.explicit_model
-        && let Some(model) = &context.model
-    {
-        prompt.push_str(&format!(
-            "Model requirement: `{model}` was explicitly requested in the caller's AT options for this invocation. Use exactly this model.\n\n"
-        ));
-    }
     prompt.push_str("Requested work:\n");
     prompt.push_str(request.message.trim());
     prompt.push('\n');
@@ -153,6 +146,20 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn model_and_effort_settings_do_not_change_the_task_prompt() {
+        let (request, mut context) = sample();
+        let prompt = build_prompt(&request, &context);
+
+        context.model = Some("provider/requested-model".into());
+        context.effort = Some("high".into());
+        assert_eq!(build_prompt(&request, &context), prompt);
+
+        context.explicit_model = true;
+        context.explicit_effort = true;
+        assert_eq!(build_prompt(&request, &context), prompt);
     }
 
     #[test]
