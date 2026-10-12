@@ -66,6 +66,8 @@ pub struct ThreadStatus {
     pub agent: String,
     /// Model reported by the active or most recent run, if known.
     pub model: Option<String>,
+    /// Effective reasoning effort of the active or most recent run, if known.
+    pub effort: Option<String>,
     /// Prompt-cache usage reported by the active or most recent run.
     pub cache: Option<TokenUsage>,
     /// Follow-up mentions waiting behind the current run.
@@ -122,6 +124,7 @@ pub fn snapshot(sessions: Vec<Session>, pending: Vec<Job>) -> Vec<ThreadStatus> 
             state: ThreadState::Queued,
             agent: first.agent.clone(),
             model: None,
+            effort: None,
             cache: None,
             queued: waiting.len() + 1,
             runs: 0,
@@ -180,6 +183,7 @@ fn from_session(session: Session, waiting: Vec<Job>) -> ThreadStatus {
         state,
         agent,
         model: running.or(last).and_then(|run| run.model.clone()),
+        effort: running.or(last).and_then(|run| run.effort.clone()),
         cache: running.or(last).and_then(|run| run.cache),
         queued,
         runs: session.runs.len(),
@@ -465,6 +469,11 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
             .as_deref()
             .map(escape_html)
             .unwrap_or_else(|| "—".to_owned()),
+        effort = thread
+            .effort
+            .as_deref()
+            .map(escape_html)
+            .unwrap_or_else(|| "—".to_owned()),
         cache = cache_rate(thread.cache),
         queued = thread.queued,
         runs = thread.runs,
@@ -655,6 +664,7 @@ mod tests {
             success: Some(success),
             summary: Some("done".into()),
             model: Some("openai/test-model".into()),
+            effort: Some("high".into()),
             cache: Some(TokenUsage {
                 prompt_tokens: 10_000,
                 cached_tokens: 9_000,
@@ -672,6 +682,7 @@ mod tests {
             success: None,
             summary: None,
             model: None,
+            effort: None,
             cache: None,
         }
     }
@@ -685,6 +696,8 @@ mod tests {
         assert_eq!(thread.state, ThreadState::Idle);
         assert_eq!(thread.agent, "codex");
         assert_eq!(thread.model.as_deref(), Some("openai/test-model"));
+        assert_eq!(thread.effort.as_deref(), Some("high"));
+        assert_eq!(serde_json::to_value(thread).unwrap()["effort"], "high");
         assert_eq!(
             thread.cache,
             Some(TokenUsage {
@@ -697,6 +710,21 @@ mod tests {
         assert_eq!(thread.runs, 1);
         assert_eq!(thread.last_success, Some(true));
         assert_eq!(thread.queued, 0);
+    }
+
+    #[test]
+    fn active_run_does_not_reuse_previous_effort() {
+        let key = "forgejo:owner/repo:issue:1";
+        let threads = snapshot(vec![session(key, vec![finished(true), running()])], vec![]);
+        assert_eq!(threads[0].effort, None);
+        let html = render_html(&threads, None);
+        assert!(html.contains("<th>Effort</th>"));
+        assert!(html.contains("<td>—</td><td>—</td>"));
+        let mut active = running();
+        active.effort = Some("low".into());
+        let threads = snapshot(vec![session(key, vec![finished(true), active])], vec![]);
+        assert_eq!(threads[0].effort.as_deref(), Some("low"));
+        assert!(render_html(&threads, None).contains("<td>low</td>"));
     }
 
     #[test]
@@ -915,6 +943,7 @@ mod tests {
             state: ThreadState::Idle,
             agent: "<img src=x>".into(),
             model: Some("<script>model</script>".into()),
+            effort: Some("<script>effort</script>".into()),
             cache: None,
             queued: 0,
             runs: 0,
@@ -931,6 +960,7 @@ mod tests {
         assert!(!html.contains("<script>model"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("&lt;script&gt;model&lt;/script&gt;"));
+        assert!(html.contains("&lt;script&gt;effort&lt;/script&gt;"));
         assert!(html.contains("&quot; onmouseover=&quot;"));
         assert!(html.contains("❌"));
     }

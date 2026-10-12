@@ -259,6 +259,7 @@ mod tests {
             success: Some(true),
             summary: None,
             model: model.map(str::to_owned),
+            effort: None,
             cache: usage.map(|(prompt_tokens, cached_tokens)| TokenUsage {
                 prompt_tokens,
                 cached_tokens,

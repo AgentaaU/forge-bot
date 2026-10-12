@@ -133,6 +133,8 @@ impl PiRpcWriter {
 /// Backend session state reported by the live process.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SessionState {
+    /// Reasoning effort returned by get_state.
+    pub effort: Option<String>,
     /// Model selected by the agent, `provider/id` when the protocol names both.
     pub model: Option<String>,
     /// Exact session id the process is currently on.
@@ -194,6 +196,10 @@ impl PiRpcClient {
             _ => None,
         };
         Ok(SessionState {
+            effort: data["thinkingLevel"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned),
             model,
             id: data["sessionId"].as_str().map(str::to_owned),
             file: data["sessionFile"].as_str().map(str::to_owned),
@@ -1165,6 +1171,10 @@ impl Agent for PiPoolAgent {
             .session_state()
             .await
             .unwrap_or_default();
+        *context
+            .reported_effort
+            .lock()
+            .expect("effort mutex poisoned") = state.effort.clone();
         let model = state.model.clone();
         *context.reported_model.lock().expect("model mutex poisoned") = model.clone();
         // Remember the exact session the conversation is on so a later process
@@ -1190,6 +1200,7 @@ impl Agent for PiPoolAgent {
                 guard.completed = true;
                 let mut outcome = AgentOutcome::success(text, started.elapsed());
                 outcome.model = model;
+                outcome.effort = state.effort.clone();
                 outcome.usage = (usage.prompt_tokens > 0).then_some(usage);
                 Ok(outcome)
             }
@@ -1197,6 +1208,7 @@ impl Agent for PiPoolAgent {
                 guard.invalidate();
                 let mut outcome = AgentOutcome::failure(error.to_string(), started.elapsed());
                 outcome.model = model;
+                outcome.effort = state.effort.clone();
                 Ok(outcome)
             }
         }
@@ -2440,6 +2452,11 @@ mod tests {
         let outcome = run.await.unwrap().unwrap();
         assert!(outcome.success);
         assert_eq!(outcome.model.as_deref(), Some("test/fake-pi"));
+        assert_eq!(outcome.effort.as_deref(), Some("medium"));
+        assert_eq!(
+            context.reported_effort.lock().unwrap().as_deref(),
+            Some("medium")
+        );
         // The follow-up went to the same process; no second agent was spawned.
         assert_eq!(agent.live_agents(), 1);
         let logged = std::fs::read_to_string(&steer_log).unwrap();

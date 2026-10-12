@@ -172,6 +172,11 @@ impl CodexAppServerAgent {
                 .await
         };
         if let Ok(outcome) = &mut result {
+            outcome.effort = context
+                .reported_effort
+                .lock()
+                .expect("effort mutex poisoned")
+                .clone();
             outcome.model = context
                 .reported_model
                 .lock()
@@ -209,6 +214,10 @@ impl CodexAppServerAgent {
             .open_thread(process, live, key, context, deadline)
             .await?;
         let effort = turn_effort(process, context, deadline).await;
+        *context
+            .reported_effort
+            .lock()
+            .expect("effort mutex poisoned") = effort.clone();
 
         // Subscribe before `turn/start` so no part of the turn is missed.
         let mut events = process.subscribe();
@@ -863,13 +872,16 @@ mod tests {
 
         let mut ctx = context(dir.path());
         ctx.effort = Some("high".into());
-        assert!(agent.run(&request(), &ctx).await.unwrap().success);
+        let outcome = agent.run(&request(), &ctx).await.unwrap();
+        assert!(outcome.success);
+        assert_eq!(outcome.effort.as_deref(), Some("high"));
         // Without an effort the turn sends the configured default explicitly.
         ctx.effort = None;
         assert!(agent.run(&request(), &ctx).await.unwrap().success);
 
         let turns = turn_params(&log);
         assert_eq!(turns.len(), 2, "{turns:?}");
+        assert_eq!(ctx.reported_effort.lock().unwrap().as_deref(), Some("low"));
         assert_eq!(turns[0]["effort"], "high");
         assert_eq!(turns[1]["effort"], "low", "{turns:?}");
     }

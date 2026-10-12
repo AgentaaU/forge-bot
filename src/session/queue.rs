@@ -577,6 +577,12 @@ impl Dispatcher {
                     .lock()
                     .expect("model mutex poisoned")
                     .clone();
+                thread.effort = entry
+                    .context
+                    .reported_effort
+                    .lock()
+                    .expect("effort mutex poisoned")
+                    .clone();
             }
         }
         Ok(threads)
@@ -1205,6 +1211,7 @@ impl Inner {
             credentials,
             live_output: self.sessions.live_output(job.id),
             reported_model: Default::default(),
+            reported_effort: Default::default(),
             executor: self.executor.clone(),
             host_user,
             user_id: user_id.clone(),
@@ -1270,6 +1277,10 @@ impl Inner {
             used_agent = name.clone();
             running_agent = name.clone();
             *context.reported_model.lock().expect("model mutex poisoned") = None;
+            *context
+                .reported_effort
+                .lock()
+                .expect("effort mutex poisoned") = None;
 
             // The requested agent always leads the candidate list, so index 0
             // is exactly `job.agent` and needs no "instead" notice. Later
@@ -1349,10 +1360,15 @@ impl Inner {
                     .lock()
                     .expect("model mutex poisoned")
                     .clone();
+                outcome.effort = context
+                    .reported_effort
+                    .lock()
+                    .expect("effort mutex poisoned")
+                    .clone();
                 outcome
             };
 
-            let outcome = match agent.run(&request, &context).await {
+            let mut outcome = match agent.run(&request, &context).await {
                 Ok(outcome) => outcome,
                 Err(error) if error.is_agent_unavailable() => {
                     // The adapter cannot start at all (missing binary, wrong
@@ -1371,6 +1387,14 @@ impl Inner {
                 }
                 Err(error) => agent_failure(&error),
             };
+
+            outcome.effort = outcome.effort.or_else(|| {
+                context
+                    .reported_effort
+                    .lock()
+                    .expect("effort mutex poisoned")
+                    .clone()
+            });
 
             // A successful run clears any earlier capacity/start-failure
             // cooldown, so the requested agent is not reported as unavailable
@@ -1959,6 +1983,43 @@ mod tests {
         assert_eq!(
             dispatcher.reported_models(),
             vec![("custom".into(), "live-custom-model".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn threads_show_live_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = dispatcher_for(test_config(dir.path()), dir.path());
+        let job = Job {
+            id: Uuid::new_v4(),
+            message: message("o/r"),
+            mention: Mention {
+                agent: None,
+                model: None,
+                effort: None,
+                message: "go".into(),
+            },
+            agent: "codex".into(),
+            model_agent: None,
+            configured_model_agent: None,
+            user_id: None,
+            created_at: Utc::now(),
+            status_comment: None,
+            waiting: false,
+        };
+        dispatcher.inner.sessions.begin(&job).unwrap();
+        let context = AgentContext::default();
+        *context.reported_effort.lock().unwrap() = Some("high".into());
+        dispatcher.inner.running.lock().unwrap().insert(
+            job.session_key(),
+            RunningAgent {
+                agent: dispatcher.inner.agents.get("codex").unwrap(),
+                context,
+            },
+        );
+        assert_eq!(
+            dispatcher.threads().unwrap()[0].effort.as_deref(),
+            Some("high")
         );
     }
 

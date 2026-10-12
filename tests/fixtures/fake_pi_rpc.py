@@ -143,6 +143,7 @@ for line in sys.stdin:
     elif kind == "get_state":
         print(json.dumps({"type": "response", "id": request_id, "success": True,
                           "data": {"model": {"provider": "test", "id": "fake-pi"},
+                                   "thinkingLevel": "medium",
                                    "sessionId": session_id,
                                    "sessionFile": session_file}}), flush=True)
     elif kind == "new_session":

@@ -454,6 +454,12 @@ recent command output or Pi RPC assistant text as it arrives. Live output is
 kept in memory (up to 1 MiB per run) and disappears when the run finishes;
 the final result summary remains in the run history.
 
+The Effort column shows the effective reasoning effort known for the current or
+most recent run, also exposed as `effort` in `/status.json`. Codex app-server
+reports the effort used for its turn, Pi RPC reports its thinking level, and CLI
+adapters report explicit effort options. Unknown effort and older run records
+show `—`; the bot does not guess an agent default.
+
 The Model column shows the model known for the current or most recent run.
 Codex app-server leaves the model unknown in live status and completed history,
 even when a thread start/resume reply includes it or the invocation explicitly

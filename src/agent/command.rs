@@ -110,6 +110,37 @@ impl EffortStyle {
         spans
     }
 
+    /// Read the last effective effort option without changing the command.
+    fn value_in(self, args: &[String]) -> Option<String> {
+        let span = self.option_spans(args).pop()?;
+        let option = &args[span];
+        let value = match self {
+            Self::Flag(flag) => {
+                if option.len() == 2 {
+                    option[1].as_str()
+                } else {
+                    option[0].strip_prefix(flag)?.strip_prefix('=')?
+                }
+            }
+            Self::Config(key) => {
+                let value = if option.len() == 2 {
+                    option[1].as_str()
+                } else {
+                    option[0]
+                        .strip_prefix("--config=")
+                        .or_else(|| option[0].strip_prefix("-c"))?
+                        .trim_start_matches('=')
+                };
+                value
+                    .strip_prefix(key)?
+                    .strip_prefix('=')?
+                    .trim_matches('"')
+                    .trim_matches('\'')
+            }
+        };
+        (!value.trim().is_empty()).then(|| value.to_owned())
+    }
+
     /// The argument pair (or the single config override) for `level`.
     fn arguments(self, level: &str) -> Vec<String> {
         match self {
@@ -701,6 +732,11 @@ impl Agent for CommandAgent {
         apply_model(&mut args, context.model.as_deref(), model_at);
         apply_effort(&mut args, context.effort.as_deref(), self.effort, model_at);
 
+        *context
+            .reported_effort
+            .lock()
+            .expect("effort mutex poisoned") = self.effort.and_then(|style| style.value_in(&args));
+
         let configured_model = match self.name.as_str() {
             "agy" => crate::agent::agy::configured_model(&args, self.env.get("HOME")),
             "kimi" => crate::agent::kimi::configured_model(
@@ -884,6 +920,11 @@ impl Agent for CommandAgent {
                     self.record_session(&plan, &stdout);
                     let mut outcome = AgentOutcome::success(summary, started.elapsed());
                     outcome.model = observed_model;
+                    outcome.effort = context
+                        .reported_effort
+                        .lock()
+                        .expect("effort mutex poisoned")
+                        .clone();
                     outcome.usage = usage;
                     Ok(outcome)
                 } else {
@@ -910,6 +951,11 @@ impl Agent for CommandAgent {
                     } else {
                         observed_model
                     };
+                    outcome.effort = context
+                        .reported_effort
+                        .lock()
+                        .expect("effort mutex poisoned")
+                        .clone();
                     outcome.usage = usage;
                     *context.reported_model.lock().expect("model mutex poisoned") =
                         outcome.model.clone();
@@ -1098,6 +1144,37 @@ mod tests {
                 "--flag".to_string(),
                 "value".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn reports_effective_effort_options() {
+        let style = EffortStyle::Flag("--effort");
+        assert_eq!(style.value_in(&[]), None);
+        assert_eq!(
+            style
+                .value_in(&["--effort=low".into(), "--effort".into(), "high".into()])
+                .as_deref(),
+            Some("high")
+        );
+        let style = EffortStyle::Config("model_reasoning_effort");
+        for args in [
+            vec!["-c", "model_reasoning_effort=\"low\""],
+            vec!["--config", "model_reasoning_effort=\"low\""],
+            vec!["--config=model_reasoning_effort=\"low\""],
+            vec!["-cmodel_reasoning_effort=\"low\""],
+            vec!["-c=model_reasoning_effort=\"low\""],
+        ] {
+            assert_eq!(
+                style
+                    .value_in(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .as_deref(),
+                Some("low")
+            );
+        }
+        assert_eq!(
+            style.value_in(&["-c".into(), "model_reasoning_effort_x=\"low\"".into()]),
+            None
         );
     }
 
@@ -1601,8 +1678,18 @@ if out:
                 ..context_for(dir.path())
             };
 
-            assert!(agent.run(&request, &context).await.unwrap().success);
-            assert!(agent.run(&request, &context).await.unwrap().success);
+            for _ in 0..2 {
+                let outcome = agent.run(&request, &context).await.unwrap();
+                assert!(outcome.success);
+                assert_eq!(
+                    outcome.effort.as_deref(),
+                    Some(if operator_effort.is_some() {
+                        "low"
+                    } else {
+                        "high"
+                    })
+                );
+            }
 
             let received: Vec<String> = std::fs::read_to_string(&prompts)
                 .unwrap()

@@ -87,6 +87,8 @@ pub struct AgentContext {
     pub live_output: Option<LiveOutput>,
     /// Shared with the status page while this run is active.
     pub reported_model: Arc<Mutex<Option<String>>>,
+    /// Effective reasoning effort observed by the adapter, when known.
+    pub reported_effort: Arc<Mutex<Option<String>>>,
     /// Launches this run's child process (cgroup executor).
     pub executor: Arc<crate::executor::Executor>,
     /// Linux account the agent runs as. Always set in production; only a
@@ -241,6 +243,9 @@ pub struct AgentOutcome {
     /// Model reported by the agent, when its protocol exposes one.
     #[serde(default)]
     pub model: Option<String>,
+    /// Effective reasoning effort observed by the adapter, when known.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Provider prompt-cache accounting, when the adapter can read it.
     #[serde(default)]
     pub usage: Option<TokenUsage>,
@@ -252,6 +257,7 @@ impl AgentOutcome {
             summary: summary.into(),
             duration,
             model: None,
+            effort: None,
             usage: None,
         }
     }
@@ -262,6 +268,7 @@ impl AgentOutcome {
             summary: summary.into(),
             duration,
             model: None,
+            effort: None,
             usage: None,
         }
     }
@@ -357,6 +364,7 @@ mod tests {
             credentials: vec![("FORGEJO_TOKEN".into(), "secret".into())],
             live_output: None,
             reported_model: Default::default(),
+            reported_effort: Default::default(),
             executor: Default::default(),
             host_user: None,
             user_id: None,

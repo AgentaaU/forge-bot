@@ -28,6 +28,9 @@ pub struct RunRecord {
     pub summary: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Effective reasoning effort, absent in older records.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Provider prompt-cache accounting, when the adapter reported it.
     #[serde(default)]
     pub cache: Option<TokenUsage>,
@@ -227,6 +230,7 @@ impl SessionStore {
             success: None,
             summary: None,
             model: None,
+            effort: None,
             cache: None,
         });
 
@@ -279,6 +283,7 @@ impl SessionStore {
             run.success = Some(outcome.success);
             run.summary = Some(outcome.summary.clone());
             run.model = outcome.model.clone();
+            run.effort = outcome.effort.clone();
             run.cache = outcome.usage;
         }
         session.agent = agent.to_owned();
@@ -582,6 +587,7 @@ mod tests {
 
         let mut outcome = AgentOutcome::success("done", Duration::from_millis(5));
         outcome.model = Some("test/example".into());
+        outcome.effort = Some("high".into());
         outcome.usage = Some(TokenUsage {
             prompt_tokens: 1_000,
             cached_tokens: 750,
@@ -593,10 +599,18 @@ mod tests {
         assert_eq!(stored.runs[0].agent, "pi");
         assert_eq!(stored.runs[0].summary.as_deref(), Some("done"));
         assert_eq!(stored.runs[0].model.as_deref(), Some("test/example"));
+        assert_eq!(stored.runs[0].effort, outcome.effort);
         assert_eq!(stored.runs[0].cache, outcome.usage);
         let reopened = SessionStore::open(dir.path()).unwrap();
         assert_eq!(reopened.get(&key).unwrap().runs[0].model, outcome.model);
+        assert_eq!(reopened.get(&key).unwrap().runs[0].effort, outcome.effort);
         assert_eq!(reopened.get(&key).unwrap().runs[0].cache, outcome.usage);
+        let mut legacy = serde_json::to_value(&stored.runs[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("effort");
+        assert_eq!(
+            serde_json::from_value::<RunRecord>(legacy).unwrap().effort,
+            None
+        );
     }
 
     #[test]
