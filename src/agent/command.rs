@@ -362,6 +362,44 @@ fn apply_effort(
     }
 }
 
+/// Remove configured choices when the caller explicitly overrides this run.
+/// Remove complete options so their values never become positional arguments.
+/// Adjust `at` for removed arguments so it still points to the same boundary.
+pub(crate) fn remove_run_options(
+    args: &mut Vec<String>,
+    model: bool,
+    effort: Option<EffortStyle>,
+    mut at: Option<usize>,
+) -> Option<usize> {
+    let mut remove = |args: &mut Vec<String>, span: std::ops::Range<usize>| {
+        at = at.map(|index| index - span.len().min(index.saturating_sub(span.start)));
+        args.drain(span);
+    };
+    if let Some(style) = effort {
+        for span in style.option_spans(args).into_iter().rev() {
+            remove(args, span);
+        }
+    }
+    if model {
+        let mut index = 0;
+        while index < args.len() {
+            let width = if args[index] == "--model" || args[index] == "-m" {
+                if index + 1 < args.len() { 2 } else { 1 }
+            } else if args[index].starts_with("--model=") {
+                1
+            } else {
+                0
+            };
+            if width > 0 {
+                remove(args, index..index + width);
+            } else {
+                index += 1;
+            }
+        }
+    }
+    at
+}
+
 /// Insert the addressed user's `--model <id>` unless the operator already
 /// configured one. `at` pins the insertion before a prompt-consuming flag
 /// (agy `--print`); `None` appends it just before the prompt.
@@ -652,15 +690,16 @@ impl Agent for CommandAgent {
         }
 
         // Apply the addressed user's model before reading the effective model
-        // for reporting. An explicit `--model` already in the configured args
-        // wins, so operator intent is never overridden.
-        apply_model(&mut args, context.model.as_deref(), self.model_at);
-        apply_effort(
+        // for reporting. Configured choices win unless the caller overrides
+        // them inline. Keep the insertion boundary aligned after removal.
+        let model_at = remove_run_options(
             &mut args,
-            context.effort.as_deref(),
-            self.effort,
+            context.explicit_model,
+            context.explicit_effort.then_some(self.effort).flatten(),
             self.model_at,
         );
+        apply_model(&mut args, context.model.as_deref(), model_at);
+        apply_effort(&mut args, context.effort.as_deref(), self.effort, model_at);
 
         let configured_model = match self.name.as_str() {
             "agy" => crate::agent::agy::configured_model(&args, self.env.get("HOME")),
@@ -940,6 +979,50 @@ async fn spawn_retrying_busy(
 mod tests {
     use super::*;
     use crate::forge::ReplyTarget;
+
+    #[test]
+    fn inline_options_replace_all_operator_spellings() {
+        let mut args = [
+            "exec",
+            "--model=old",
+            "-m",
+            "older",
+            "--model",
+            "oldest",
+            "--config=model_reasoning_effort=low",
+            "-c",
+            "model_reasoning_effort=medium",
+            "--print",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let print_at = args.len() - 1;
+        let model_at = remove_run_options(
+            &mut args,
+            true,
+            Some(EffortStyle::Config("model_reasoning_effort")),
+            Some(print_at),
+        );
+        assert_eq!(model_at, Some(1));
+        apply_model(&mut args, Some("gpt-6.1-sol"), model_at);
+        apply_effort(
+            &mut args,
+            Some("high"),
+            Some(EffortStyle::Config("model_reasoning_effort")),
+            model_at,
+        );
+        assert_eq!(
+            args,
+            [
+                "exec",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "--model",
+                "gpt-6.1-sol",
+                "--print"
+            ]
+        );
+    }
 
     #[test]
     fn summarize_prefers_stdout() {
@@ -1257,6 +1340,8 @@ mod tests {
 
     fn context_for(dir: &std::path::Path) -> AgentContext {
         AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.to_path_buf(),
             repository: "o/r".into(),
             issue_number: Some(1),

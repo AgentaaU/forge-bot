@@ -96,9 +96,13 @@ pub struct AgentContext {
     /// and replies.
     pub user_id: Option<String>,
     /// Model ID to pass to the agent, from the addressed user's `agent_model`
-    /// or its `/admin` override.
+    /// or its `/admin` override, unless the caller selects one inline.
     pub model: Option<String>,
-    /// Reasoning effort requested for this run through `/admin`. `None` leaves
+    /// The caller explicitly selected the model in this invocation.
+    pub explicit_model: bool,
+    /// The caller explicitly selected effort in this invocation.
+    pub explicit_effort: bool,
+    /// Reasoning effort requested inline or through `/admin`. `None` leaves
     /// the agent's own default. Only adapters reporting
     /// [`Agent::supports_effort`] receive it.
     pub effort: Option<String>,
@@ -335,6 +339,8 @@ mod tests {
             message: "do it".into(),
         };
         let ctx = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: PathBuf::from("/tmp/ws"),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),

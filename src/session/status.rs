@@ -632,6 +632,8 @@ mod tests {
                 reply_target: Default::default(),
             },
             mention: Mention {
+                model: None,
+                effort: None,
                 agent: None,
                 message: "go".into(),
             },

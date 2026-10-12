@@ -599,7 +599,7 @@ durable record.
 
 ```text
 @agent fix the failing test          # default agent
-@agent --agent=codex refactor this module   # pick an agent explicitly
+@agent --agent=codex --model=gpt-6.1-sol --effort=high refactor this module   # pick an agent explicitly
 @agent --agent=agy fix the build            # Antigravity CLI
 @agent --agent=pi-rpc review the diff       # any configured adapter
 ```
@@ -624,6 +624,17 @@ and `claude` is Claude Code. An explicit `@agent --agent=<name>` runs first even
 is absent from the sequence. Agents not listed are not tried as fallbacks.
 Keep the space before `--agent` so Forgejo renders `@agent` as a clickable
 mention. Colon selector forms are no longer accepted.
+
+Leading `--agent=`, `--model=`, and `--effort=` options may appear in any
+order. The last repeated option wins. Model IDs are passed through exactly;
+effort must be one of `low`, `medium`, `high`, or `xhigh`.
+Inline model and effort override configured and admin choices for this
+invocation, including fallback adapters, and do not change later requests.
+Options end at the first instruction word or unknown, empty, or invalid option;
+that text remains part of the instruction. Options on subsequent lines are
+instruction text. A follow-up with inline settings queues a new turn rather
+than steering a turn with different launch settings. An adapter without effort
+support fails an explicit effort request instead of silently ignoring it.
 
 The mention is matched case-insensitively and only at a word boundary, so
 `foo@agent.com` does not trigger it. Self-mentions are ignored to avoid loops.

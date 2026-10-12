@@ -589,6 +589,8 @@ mod tests {
 
     fn context(dir: &std::path::Path) -> AgentContext {
         AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.to_path_buf(),
             forge: Some(crate::location::ForgeKind::Forgejo),
             repository: "o/r".into(),

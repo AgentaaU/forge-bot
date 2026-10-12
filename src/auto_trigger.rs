@@ -397,6 +397,8 @@ impl AutoTrigger {
             return Ok(0);
         }
         let mention = Mention {
+            model: None,
+            effort: None,
             agent: None,
             message: instruction,
         };

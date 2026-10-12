@@ -2722,6 +2722,8 @@ async fn admin_reported_models_follow_the_reporting_adapter_not_the_queued_adapt
             reply_target: Default::default(),
         },
         mention: Mention {
+            model: None,
+            effort: None,
             agent: None,
             message: "go".into(),
         },

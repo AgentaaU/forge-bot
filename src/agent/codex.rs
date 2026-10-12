@@ -283,6 +283,8 @@ with open(out, "w") as f:
             message: "go".into(),
         };
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             repository: "o/r".into(),
             issue_number: Some(1),
@@ -354,6 +356,8 @@ with open(out, "w") as f:
             message: "go".into(),
         };
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             repository: "o/r".into(),
             issue_number: Some(1),

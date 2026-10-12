@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 pub struct Mention {
     /// Optional agent selected inline, e.g. `@agent --agent=codex`.
     pub agent: Option<String>,
+    /// Explicit model for this invocation.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Explicit reasoning effort for this invocation.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// The instruction left after removing the trigger.
     pub message: String,
 }
@@ -69,34 +75,44 @@ pub fn extract_mention(body: &str, trigger: &str) -> Option<Mention> {
         }) {
             continue;
         }
-        let selector = if after_spaces.len() < after.len() {
-            after_spaces.strip_prefix("--agent=")
-        } else {
-            None
-        };
-        let (agent, rest) = match selector {
-            Some(after_argument) => {
-                let end = after_argument
-                    .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-                    .unwrap_or(after_argument.len());
-                let name = &after_argument[..end];
-                let rest = &after_argument[end..];
-                let name = name.trim();
-                (
-                    if name.is_empty() {
-                        None
-                    } else {
-                        Some(name.to_owned())
-                    },
-                    rest,
-                )
+        let mut agent = None;
+        let mut model = None;
+        let mut effort = None;
+        let mut rest = after;
+        // Only consume a leading run of recognized, nonempty options. Once
+        // prose (or an unknown/invalid option) starts, preserve it verbatim.
+        while rest.starts_with([' ', '\t']) {
+            let argument = rest.trim_start_matches([' ', '\t']);
+            let end = argument.find(char::is_whitespace).unwrap_or(argument.len());
+            let token = &argument[..end];
+            let Some((key, value)) = token.split_once('=') else {
+                break;
+            };
+            if value.is_empty() {
+                break;
             }
-            None => (None, after),
-        };
+            match key {
+                "--agent"
+                    if value
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_') =>
+                {
+                    agent = Some(value.to_owned())
+                }
+                "--model" => model = Some(value.to_owned()),
+                "--effort" if crate::agent::is_effort_level(value) => {
+                    effort = Some(value.to_owned())
+                }
+                _ => break,
+            }
+            rest = &argument[end..];
+        }
 
         let message = rest.trim_start_matches(|c: char| c == ':' || c == ',' || c.is_whitespace());
         return Some(Mention {
             agent,
+            model,
+            effort,
             message: message.trim().to_owned(),
         });
     }
@@ -173,6 +189,50 @@ fn code_ranges(body: &str) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_inline_launch_options() {
+        for body in [
+            "@agent --agent=codex --model=gpt-6.1-sol --effort=high fix it",
+            "@agent\t--effort=high --model=gpt-6.1-sol --agent=codex fix it",
+        ] {
+            let m = extract_mention(body, "@agent").unwrap();
+            assert_eq!(m.agent.as_deref(), Some("codex"));
+            assert_eq!(m.model.as_deref(), Some("gpt-6.1-sol"));
+            assert_eq!(m.effort.as_deref(), Some("high"));
+            assert_eq!(m.message, "fix it");
+        }
+        let m = extract_mention(
+            "@agent --model=old --model=provider/model.v2 --effort=low",
+            "@agent",
+        )
+        .unwrap();
+        assert_eq!(m.model.as_deref(), Some("provider/model.v2"));
+        assert_eq!(m.message_or_default(), Mention::DEFAULT_MESSAGE);
+    }
+
+    #[test]
+    fn launch_options_stop_at_instruction_or_invalid_option() {
+        for instruction in [
+            "fix --model=x",
+            "--model= fix",
+            "--effort=invalid fix",
+            "--unknown=x --model=y",
+            "\n--model=x fix",
+        ] {
+            let m = extract_mention(&format!("@agent {instruction}"), "@agent").unwrap();
+            assert_eq!(m.model, None);
+            assert_eq!(m.effort, None);
+            assert_eq!(m.message, instruction.trim());
+        }
+    }
+
+    #[test]
+    fn old_serialized_mentions_keep_agent_defaults() {
+        let m: Mention = serde_json::from_str(r#"{"agent":null,"message":"go"}"#).unwrap();
+        assert_eq!(m.model, None);
+        assert_eq!(m.effort, None);
+    }
 
     #[test]
     fn extracts_simple_mention() {

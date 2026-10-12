@@ -967,6 +967,10 @@ impl Inner {
     /// queue the job. An adapter with no live process (or a one-shot CLI)
     /// returns `None`, keeping the existing "queue the next turn" behaviour.
     async fn try_merge_follow_up(&self, job: &Job) -> bool {
+        // Steering an existing turn cannot change its launch settings.
+        if job.mention.model.is_some() || job.mention.effort.is_some() {
+            return false;
+        }
         let key = job.session_key();
         let running = {
             let agents = self.running.lock().expect("running agent mutex poisoned");
@@ -978,6 +982,9 @@ impl Inner {
             return false;
         };
 
+        if context.explicit_model || context.explicit_effort {
+            return false;
+        }
         let request = AgentRequest {
             location: job.message.location.clone(),
             message: job.mention.message_or_default().to_owned(),
@@ -1184,6 +1191,8 @@ impl Inner {
                 None
             };
         let mut context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace,
             forge: Some(job.message.forge),
             repository: job.message.repository.clone(),
@@ -1239,18 +1248,25 @@ impl Inner {
         };
 
         for (index, name) in candidates.iter().enumerate() {
-            context.model = (name == &model_agent)
-                .then(|| {
-                    overrides.model.clone().or_else(|| {
-                        (name == configured_model_agent)
-                            .then(|| user.agent_model.clone())
-                            .flatten()
+            context.explicit_model = job.mention.model.is_some();
+            context.explicit_effort = job.mention.effort.is_some();
+            // Inline requirements belong to this invocation, including fallback.
+            context.model = job.mention.model.clone().or_else(|| {
+                (name == &model_agent)
+                    .then(|| {
+                        overrides.model.clone().or_else(|| {
+                            (name == configured_model_agent)
+                                .then(|| user.agent_model.clone())
+                                .flatten()
+                        })
                     })
-                })
-                .flatten();
-            context.effort = (name == &model_agent)
-                .then(|| overrides.effort.clone())
-                .flatten();
+                    .flatten()
+            });
+            context.effort = job.mention.effort.clone().or_else(|| {
+                (name == &model_agent)
+                    .then(|| overrides.effort.clone())
+                    .flatten()
+            });
             used_agent = name.clone();
             running_agent = name.clone();
             *context.reported_model.lock().expect("model mutex poisoned") = None;
@@ -1299,6 +1315,13 @@ impl Inner {
                     break;
                 }
             };
+            if context.explicit_effort && !agent.supports_effort() {
+                last_outcome = Some(AgentOutcome::failure(
+                    format!("agent `{name}` does not support the explicitly requested effort"),
+                    Default::default(),
+                ));
+                break;
+            }
             if context.effort.is_some() && !agent.supports_effort() {
                 tracing::warn!(agent = %name, "agent does not support the configured effort; using its default");
             }
@@ -2150,6 +2173,8 @@ mod tests {
             id: Uuid::new_v4(),
             message: auto.clone(),
             mention: Mention {
+                model: None,
+                effort: None,
                 agent: None,
                 message: "resolve".into(),
             },
@@ -2174,6 +2199,8 @@ mod tests {
             id: Uuid::new_v4(),
             message: removed.clone(),
             mention: Mention {
+                model: None,
+                effort: None,
                 agent: None,
                 message: "resolve".into(),
             },
@@ -2220,6 +2247,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("custom".into()),
                     message: "go".into(),
                 },
@@ -2264,6 +2293,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("custom".into()),
                     message: "go".into(),
                 },
@@ -2357,6 +2388,8 @@ mod tests {
             .submit(
                 message,
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("custom".into()),
                     message: "go".into(),
                 },
@@ -2404,6 +2437,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("custom".into()),
                     message: "go".into(),
                 },
@@ -2451,6 +2486,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("pi-rcp".into()),
                     message: "go".into(),
                 },
@@ -2499,6 +2536,8 @@ mod tests {
             id: Uuid::new_v4(),
             message: message("o/r"),
             mention: Mention {
+                model: None,
+                effort: None,
                 agent: None,
                 message: "x".into(),
             },
@@ -2535,6 +2574,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: None,
                     message: "go".into(),
                 },
@@ -2695,6 +2736,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("steering".into()),
                     message: "first".into(),
                 },
@@ -2710,11 +2753,32 @@ mod tests {
         }
         assert_eq!(steering.runs(), 1);
 
+        let mut settings_job = Job {
+            model_agent: None,
+            configured_model_agent: None,
+            id: Uuid::new_v4(),
+            message: message("o/r"),
+            mention: crate::mention::extract_mention("@agent --model=inline-model go", "@agent")
+                .unwrap(),
+            agent: "steering".into(),
+            user_id: Some("default".into()),
+            created_at: Utc::now(),
+            status_comment: None,
+            waiting: false,
+        };
+        assert!(!dispatcher.inner.try_merge_follow_up(&settings_job).await);
+        settings_job.mention.model = None;
+        settings_job.mention.effort = Some("high".into());
+        assert!(!dispatcher.inner.try_merge_follow_up(&settings_job).await);
+        assert!(steering.steers().is_empty());
+
         // Second mention in the same thread is merged into that run.
         dispatcher
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("steering".into()),
                     message: "second".into(),
                 },
@@ -2776,6 +2840,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("steering".into()),
                     message: "first".into(),
                 },
@@ -2801,6 +2867,8 @@ mod tests {
             .submit_auto(
                 auto,
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("steering".into()),
                     message: "resolve".into(),
                 },
@@ -2843,6 +2911,8 @@ mod tests {
                 reply_target: Default::default(),
             },
             mention: Mention {
+                model: None,
+                effort: None,
                 agent: None,
                 message: "x".into(),
             },
@@ -2905,6 +2975,8 @@ mod tests {
             id: Uuid::new_v4(),
             message: message("o/r"),
             mention: Mention {
+                model: None,
+                effort: None,
                 agent: Some("plain".into()),
                 message: "second".into(),
             },
@@ -3035,6 +3107,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "go".into(),
                 },
@@ -3129,6 +3203,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("cooldown-agent".into()),
                     message: "go".into(),
                 },
@@ -3168,6 +3244,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("overloaded-agent".into()),
                     message: "go".into(),
                 },
@@ -3220,6 +3298,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("missing-agent".into()),
                     message: "go".into(),
                 },
@@ -3260,6 +3340,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("broken-agent".into()),
                     message: "go".into(),
                 },
@@ -3336,6 +3418,8 @@ mod tests {
                 .submit(
                     message("o/r"),
                     Mention {
+                        model: None,
+                        effort: None,
                         agent: Some("primary".into()),
                         message: "go".into(),
                     },
@@ -3362,6 +3446,8 @@ mod tests {
                 .submit(
                     message("o/r"),
                     Mention {
+                        model: None,
+                        effort: None,
                         agent: Some("secondary".into()),
                         message: "go".into(),
                     },
@@ -3439,6 +3525,8 @@ mod tests {
                         id: Uuid::new_v4(),
                         message: message_at("o/r", number),
                         mention: Mention {
+                            model: None,
+                            effort: None,
                             agent: Some(agent.into()),
                             message: "recovered".into(),
                         },
@@ -3584,6 +3672,8 @@ mod tests {
                     .submit(
                         message_at("o/r", 1),
                         Mention {
+                            model: None,
+                            effort: None,
                             agent: Some("blocking".into()),
                             message: "block".into(),
                         },
@@ -3596,6 +3686,8 @@ mod tests {
                     .submit(
                         message_at("o/r", 2),
                         Mention {
+                            model: None,
+                            effort: None,
                             agent: None,
                             message: "automatic".into(),
                         },
@@ -3609,6 +3701,8 @@ mod tests {
                     .submit(
                         message_at("o/r", 3),
                         Mention {
+                            model: None,
+                            effort: None,
                             agent: Some("secondary".into()),
                             message: "explicit".into(),
                         },
@@ -3708,6 +3802,8 @@ mod tests {
                     .submit(
                         message("o/r"),
                         Mention {
+                            model: None,
+                            effort: None,
                             agent: None,
                             message: "go".into(),
                         },
@@ -3765,6 +3861,8 @@ mod tests {
                 .submit(
                     message("o/r"),
                     Mention {
+                        model: None,
+                        effort: None,
                         agent: Some("recorder".into()),
                         message: "explicit".into(),
                     },
@@ -3773,6 +3871,33 @@ mod tests {
                 .await
                 .unwrap();
             wait_for_drain(&sessions).await;
+
+            if supports_effort {
+                dispatcher
+                    .submit(
+                        message("o/r"),
+                        crate::mention::extract_mention(
+                            "@agent --agent=alternate --model=inline-model --effort=xhigh go",
+                            "@agent",
+                        )
+                        .unwrap(),
+                        "alternate",
+                    )
+                    .await
+                    .unwrap();
+                wait_for_drain(&sessions).await;
+                assert_eq!(
+                    alternate.seen.lock().unwrap()[2],
+                    (Some("inline-model".into()), Some("xhigh".into()))
+                );
+                // A later request restores the existing admin settings.
+                submit(dispatcher.clone()).await;
+                wait_for_drain(&sessions).await;
+                assert_eq!(
+                    alternate.seen.lock().unwrap()[3],
+                    (Some("alternate-model".into()), Some("low".into()))
+                );
+            }
 
             let seen = recorder.seen.lock().unwrap().clone();
             assert_eq!(
@@ -3795,6 +3920,8 @@ mod tests {
                 id: Uuid::new_v4(),
                 message: message("o/r"),
                 mention: Mention {
+                    model: None,
+                    effort: None,
                     agent: None,
                     message: "pending".into(),
                 },
@@ -3940,6 +4067,8 @@ mod tests {
                 .submit(
                     message("o/r"),
                     Mention {
+                        model: None,
+                        effort: None,
                         agent: Some("codex".into()),
                         message: "go".into(),
                     },
@@ -4000,6 +4129,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("broken-agent".into()),
                     message: "go".into(),
                 },
@@ -4046,6 +4177,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "go".into(),
                 },
@@ -4117,6 +4250,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "go".into(),
                 },
@@ -4172,6 +4307,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("good-agent".into()),
                     message: "go".into(),
                 },
@@ -4223,6 +4360,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "go".into(),
                 },
@@ -4283,6 +4422,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "go".into(),
                 },
@@ -4336,6 +4477,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "go".into(),
                 },
@@ -4399,6 +4542,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "go".into(),
                 },
@@ -4454,6 +4599,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("missing-agent".into()),
                     message: "go".into(),
                 },
@@ -4500,6 +4647,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "go".into(),
                 },
@@ -4564,6 +4713,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "go".into(),
                 },
@@ -4634,6 +4785,8 @@ mod tests {
             .submit(
                 review,
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "go".into(),
                 },
@@ -4688,6 +4841,8 @@ mod tests {
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("custom".into()),
                     message: "go".into(),
                 },
@@ -4848,6 +5003,8 @@ echo "end:$token" >> "$AGENT_LOG"
             .submit(
                 message_at(repo, number),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("gate".into()),
                     message: token.into(),
                 },
@@ -4880,6 +5037,8 @@ echo "end:$token" >> "$AGENT_LOG"
             .submit(
                 message("o/r"),
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("capacity-agent".into()),
                     message: "TOKEN_A".into(),
                 },
@@ -5184,6 +5343,8 @@ echo "end:$token" >> "$AGENT_LOG"
         .unwrap();
 
         let mention = |text: &str| Mention {
+            model: None,
+            effort: None,
             agent: Some("blocking".into()),
             message: text.into(),
         };
@@ -5257,6 +5418,8 @@ echo "end:$token" >> "$AGENT_LOG"
                 id: Uuid::new_v4(),
                 message: message_at("o/r", number),
                 mention: Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("gate".into()),
                     message: token.into(),
                 },
@@ -5664,6 +5827,8 @@ echo "end:$token" >> "$AGENT_LOG"
                 .submit_auto(
                     message_at(repo, 9),
                     Mention {
+                        model: None,
+                        effort: None,
                         agent: None,
                         message: "denied".into(),
                     },
@@ -5684,6 +5849,8 @@ echo "end:$token" >> "$AGENT_LOG"
             .submit_auto(
                 message,
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: None,
                     message: "TOKEN_A".into(),
                 },
@@ -5742,6 +5909,8 @@ echo "end:$token" >> "$AGENT_LOG"
             .submit_auto(
                 message,
                 Mention {
+                    model: None,
+                    effort: None,
                     agent: None,
                     message: "TOKEN_B".into(),
                 },
@@ -5821,6 +5990,8 @@ echo "end:$token" >> "$AGENT_LOG"
                 id: Uuid::new_v4(),
                 message: message_at("o/r", 7),
                 mention: Mention {
+                    model: None,
+                    effort: None,
                     agent: Some("gate".into()),
                     message: token.into(),
                 },

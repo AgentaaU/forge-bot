@@ -28,6 +28,13 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
         "Your working directory: {}\n\n",
         working_directory.display()
     ));
+    if context.explicit_model
+        && let Some(model) = &context.model
+    {
+        prompt.push_str(&format!(
+            "Model requirement: `{model}` was explicitly requested in the caller's AT options for this invocation. Use exactly this model.\n\n"
+        ));
+    }
     prompt.push_str("Requested work:\n");
     prompt.push_str(request.message.trim());
     prompt.push('\n');

@@ -103,6 +103,7 @@ impl KimiWireAgent {
     fn exec_spec(&self, request: &AgentRequest, context: &AgentContext) -> ExecSpec {
         let mut args = vec!["--wire".to_owned()];
         args.extend(self.config.args.iter().cloned());
+        crate::agent::command::remove_run_options(&mut args, context.explicit_model, None, None);
         // A per-user model is only added when the operator has not chosen one.
         if let Some(model) = context
             .model
@@ -423,6 +424,8 @@ mod tests {
 
     fn context(dir: &std::path::Path) -> AgentContext {
         AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.to_path_buf(),
             repository: "o/r".into(),
             issue_number: Some(1),
@@ -549,6 +552,14 @@ mod tests {
         let spec = agent.exec_spec(&request(), &ctx);
         assert!(!spec.args.contains(&"kimi-fast".to_owned()));
         assert!(spec.args.contains(&"operator".to_owned()));
+        ctx.explicit_model = true;
+        let spec = agent.exec_spec(&request(), &ctx);
+        assert!(!spec.args.contains(&"operator".to_owned()));
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|pair| pair == ["--model", "kimi-fast"])
+        );
     }
 
     #[tokio::test]

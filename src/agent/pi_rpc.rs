@@ -57,6 +57,8 @@ pub struct LaunchSettings<'a> {
     pub model: Option<&'a str>,
     /// `--thinking` for the process, from the user's effort.
     pub effort: Option<&'a str>,
+    pub explicit_model: bool,
+    pub explicit_effort: bool,
 }
 
 /// Arguments for a `pi --mode rpc` process.
@@ -246,9 +248,18 @@ impl PiRpcClient {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         env.extend(credentials.iter().cloned());
+        let mut launch_config = config.clone();
+        crate::agent::command::remove_run_options(
+            &mut launch_config.args,
+            settings.explicit_model,
+            settings
+                .explicit_effort
+                .then_some(crate::agent::command::EffortStyle::Flag("--thinking")),
+            None,
+        );
         let spec = ExecSpec {
             program: config.command.clone(),
-            args: rpc_arguments(config, session_id, settings.model, settings.effort),
+            args: rpc_arguments(&launch_config, session_id, settings.model, settings.effort),
             env,
             cwd: (!workspace.as_os_str().is_empty()).then(|| workspace.to_path_buf()),
             host_user: host_user.map(str::to_owned),
@@ -716,6 +727,8 @@ struct PoolEntry {
     model: Option<String>,
     /// Reasoning effort this process was started with, for the same reason.
     effort: Option<String>,
+    explicit_model: bool,
+    explicit_effort: bool,
     client: Option<PiRpcClient>,
     /// Writer for the live process. Kept on the entry while `client` is
     /// checked out by a run in flight, so a follow-up can be injected without
@@ -819,6 +832,8 @@ impl PoolInner {
                         && entry.host_user.as_deref() == host_user
                         && entry.model.as_deref() == settings.model
                         && entry.effort.as_deref() == settings.effort
+                        && entry.explicit_model == settings.explicit_model
+                        && entry.explicit_effort == settings.explicit_effort
                         && !entry.busy
                         && entry.client.is_some()
                 };
@@ -917,6 +932,8 @@ impl PoolInner {
                         host_user: host_user.map(str::to_owned),
                         model: settings.model.map(str::to_owned),
                         effort: settings.effort.map(str::to_owned),
+                        explicit_model: settings.explicit_model,
+                        explicit_effort: settings.explicit_effort,
                         client: None,
                         writer,
                         busy: true,
@@ -1105,6 +1122,8 @@ impl Agent for PiPoolAgent {
                 context.executor.as_ref(),
                 context.host_user.as_deref(),
                 LaunchSettings {
+                    explicit_model: context.explicit_model,
+                    explicit_effort: context.explicit_effort,
                     model: context.model.as_deref(),
                     effort: context.effort.as_deref(),
                 },
@@ -1353,6 +1372,8 @@ mod tests {
             host_user: None,
             model: None,
             effort: None,
+            explicit_model: false,
+            explicit_effort: false,
             client: None,
             writer: None,
             busy: false,
@@ -1366,6 +1387,8 @@ mod tests {
             host_user: None,
             model: None,
             effort: None,
+            explicit_model: false,
+            explicit_effort: false,
             client: None,
             writer: None,
             busy: true,
@@ -1389,6 +1412,8 @@ mod tests {
             host_user: None,
             model: None,
             effort: None,
+            explicit_model: false,
+            explicit_effort: false,
             client: None,
             writer: None,
             busy: true,
@@ -1436,6 +1461,8 @@ mod tests {
             message: "go".into(),
         };
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
@@ -1636,6 +1663,8 @@ mod tests {
             message: "go".into(),
         };
         let context = |number: u64| AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
@@ -1694,6 +1723,8 @@ mod tests {
             message: "go".into(),
         };
         let context = |number: u64| AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
@@ -1753,6 +1784,8 @@ mod tests {
             message: "go".into(),
         };
         let context = |number: u64| AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
@@ -1804,6 +1837,8 @@ mod tests {
             message: "go".into(),
         };
         let context = |number: u64| AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
@@ -1858,6 +1893,8 @@ mod tests {
             message: "go".into(),
         };
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
@@ -1995,6 +2032,8 @@ mod tests {
             message: "go".into(),
         };
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             repository: "o/r".into(),
             issue_number: Some(1),
@@ -2094,6 +2133,8 @@ mod tests {
             message: "go".into(),
         };
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
@@ -2123,6 +2164,8 @@ mod tests {
             message: "go".into(),
         };
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
@@ -2178,6 +2221,8 @@ mod tests {
         };
         let output = LiveOutput::default();
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
@@ -2336,6 +2381,8 @@ mod tests {
         };
         let output = LiveOutput::default();
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),

@@ -130,6 +130,8 @@ echo '{"type":"result","result":"ok"}'
             message: "research".into(),
         };
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_owned(),
             repository: "o/r".into(),
             issue_number: Some(2),
@@ -219,6 +221,8 @@ echo '{"type":"result","result":"ok"}'
             message: "go".into(),
         };
         let context = AgentContext {
+            explicit_model: false,
+            explicit_effort: false,
             workspace: dir.path().to_path_buf(),
             repository: "o/r".into(),
             issue_number: Some(1),

@@ -180,4 +180,61 @@ mod tests {
             })
         );
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inline_model_override_keeps_print_next_to_the_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-agy.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+model=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) shift; model="$1" ;;
+    --model=*) model="${1#--model=}" ;;
+    --print)
+      shift
+      [ "$model" = inline-model ] || exit 2
+      [ $# -eq 1 ] || exit 3
+      case "$1" in *PING*) printf '{"response":"agy reply"}'; exit 0 ;; *) exit 4 ;; esac
+      ;;
+  esac
+  shift
+done
+exit 5
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let request = AgentRequest {
+            location: url::Url::parse("https://forge.example.com/o/r/issues/1").unwrap(),
+            message: "PING".into(),
+        };
+        for args in [
+            vec!["--model".into(), "operator-model".into()],
+            vec!["--model=operator-model".into()],
+        ] {
+            let agent = build(&AgentConfig {
+                command: Some(script.display().to_string()),
+                args: Some(args.clone()),
+                ..Default::default()
+            });
+            let context = AgentContext {
+                model: Some("inline-model".into()),
+                explicit_model: true,
+                ..Default::default()
+            };
+            let outcome = agent.run(&request, &context).await.unwrap();
+            assert!(
+                outcome.success,
+                "configured args: {args:?}; outcome: {outcome:?}"
+            );
+            assert_eq!(outcome.summary, "agy reply");
+            assert_eq!(outcome.model.as_deref(), Some("inline-model"));
+        }
+    }
 }
