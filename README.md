@@ -385,8 +385,15 @@ restart. `POST /admin/agent-ranking` accepts `{"agents":["codex","pi-rpc"]}`
 with every current automatic-selection candidate exactly once; invalid lists
 return 400 without changing the ranking.
 
-Protect `/admin`, `/admin/agent-ranking` and `/admin/reset-cooldown` with reverse proxy authentication,
-as with the other non-webhook routes, or keep the server on a trusted network.
+Set top-level `auth = true` to require an operator credential on all `/admin`
+routes. Authentication is disabled when `auth` is false or omitted; in that mode
+admin routes accept requests without credentials. With authentication enabled,
+set top-level `admin_token` or `FORGE_BOT_ADMIN_TOKEN` to a dedicated secret;
+missing or empty credentials deny admin access (401). Browsers prompt for username
+`operator` and the token as the password. API clients can send
+`Authorization: Bearer <token>`.
+Serve the admin page through HTTPS so credentials are encrypted in transit.
+Do not share this token with agent users or reuse a forge/webhook token.
 
 The **Running threads** table lists every thread with an agent run in flight.
 **Terminate thread** stops that run: the agent process and its cgroup are

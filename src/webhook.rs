@@ -75,15 +75,21 @@ impl AppState {
 
 /// Build the axum router.
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(root))
-        .route("/healthz", get(healthz))
+    let admin = Router::new()
         .route("/admin", get(admin_page))
         .route("/admin/reset-cooldown", post(reset_cooldown))
         .route("/admin/agent-ranking", post(save_agent_ranking))
         .route("/admin/terminate-thread", post(terminate_thread))
         .route("/admin/agent-settings", post(save_agent_settings))
         .route("/admin/agent-models", post(agent_models))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_admin,
+        ));
+    Router::new()
+        .merge(admin)
+        .route("/", get(root))
+        .route("/healthz", get(healthz))
         .route("/status", get(status_page))
         .route("/status/details", get(status_details))
         .route("/status.json", get(status_json))
@@ -110,6 +116,57 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks/{forge}", post(receive))
         .route("/webhook/{forge}", post(receive))
         .with_state(state)
+}
+
+/// Authenticate every admin route. Basic authentication lets the browser retain
+/// the credential for subsequent JSON requests; API clients can use Bearer.
+async fn authenticate_admin(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !state.config.auth {
+        return next.run(request).await;
+    }
+    use base64::Engine;
+    let credential = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let (scheme, value) = value.split_once(' ')?;
+            if scheme.eq_ignore_ascii_case("Bearer") {
+                Some(value.as_bytes().to_vec())
+            } else if scheme.eq_ignore_ascii_case("Basic") {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .ok()?;
+                decoded.strip_prefix(b"operator:").map(<[u8]>::to_vec)
+            } else {
+                None
+            }
+        });
+    let authenticated = state
+        .config
+        .admin_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .zip(credential.as_deref())
+        .is_some_and(|(expected, supplied)| {
+            crate::forge::constant_time_eq(expected.as_bytes(), supplied)
+        });
+    if authenticated {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(
+                header::WWW_AUTHENTICATE,
+                "Basic realm=\"forge-bot admin\", charset=\"UTF-8\"",
+            )],
+        )
+            .into_response()
+    }
 }
 
 /// Index of the browser pages. Clients that prefer HTML (see

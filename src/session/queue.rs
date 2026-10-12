@@ -27,7 +27,7 @@ use crate::executor::Executor;
 use crate::forge::ForgeMessage;
 use crate::forge_api::{ForgeApi, HttpForgeApi};
 use crate::identity::Identities;
-use crate::mention::{Mention, extract_mention};
+use crate::mention::{Mention, extract_mention_at};
 use crate::notify::{Notifier, RecentComments, delivery_key};
 use crate::policy::Policy;
 use crate::session::status::{self, ThreadStatus};
@@ -238,28 +238,31 @@ impl Dispatcher {
             waiting_jobs: AtomicUsize::new(0),
         });
 
-        // Recover jobs that were queued when the process stopped.
+        // Start the consumer before feeding persisted jobs. Recovery can exceed
+        // the bounded channel capacity, so await space instead of dropping jobs.
+        let (done_tx, done_rx) = mpsc::unbounded_channel();
+        tokio::spawn(scheduler_loop(inner.clone(), rx, done_tx, done_rx));
         if config.session.recover {
             match inner.sessions.pending_jobs() {
                 Ok(jobs) if !jobs.is_empty() => {
                     tracing::info!(count = jobs.len(), "recovering pending jobs");
-                    for job in jobs {
-                        let handoff = WaitingJob::begin(&inner.waiting_jobs);
-                        match inner.tx.try_send(job) {
-                            Ok(()) => handoff.delivered(),
-                            Err(error) => {
+                    // Count the entire backlog immediately, including jobs waiting
+                    // for channel capacity in the recovery producer.
+                    inner.waiting_jobs.fetch_add(jobs.len(), Ordering::SeqCst);
+                    let recovery = inner.clone();
+                    tokio::spawn(async move {
+                        for job in jobs {
+                            if let Err(error) = recovery.tx.send(job).await {
                                 tracing::warn!(%error, "could not requeue recovered job");
+                                break;
                             }
                         }
-                    }
+                    });
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "failed to load pending jobs"),
             }
         }
-
-        let (done_tx, done_rx) = mpsc::unbounded_channel();
-        tokio::spawn(scheduler_loop(inner.clone(), rx, done_tx, done_rx));
 
         // Thread status is rebuilt from the persisted sessions, so an
         // always-on process would otherwise accumulate one record per thread
@@ -498,19 +501,19 @@ impl Dispatcher {
     /// A comment that addresses more than one configured user is rejected
     /// rather than routed arbitrarily.
     pub fn route(&self, message: &ForgeMessage) -> Result<Option<(Mention, String)>> {
-        let matches = self.inner.identities.matching_users(&message.body);
-        let recipient = match matches.as_slice() {
+        let matches = self.inner.identities.matching_user_mentions(&message.body);
+        let (recipient, range) = match matches.as_slice() {
             [] => return Ok(None),
-            [only] => *only,
+            [(user, range)] => (*user, range.clone()),
             many => {
-                let logins: Vec<&str> = many.iter().map(|user| user.login.as_str()).collect();
+                let logins: Vec<&str> = many.iter().map(|(user, _)| user.login.as_str()).collect();
                 return Err(BotError::Unauthorized(format!(
                     "comment addresses multiple agent users: {}",
                     logins.join(", ")
                 )));
             }
         };
-        let Some(mention) = extract_mention(&message.body, &recipient.trigger()) else {
+        let Some(mention) = extract_mention_at(&message.body, range) else {
             return Ok(None);
         };
         let agent = mention
@@ -5533,12 +5536,13 @@ echo "end:$token" >> "$AGENT_LOG"
     #[tokio::test]
     async fn recovered_jobs_count_as_queued_until_they_start() {
         let dir = tempfile::tempdir().unwrap();
-        let (config, log, release) = gated_config(dir.path(), 1);
+        let (mut config, log, release) = gated_config(dir.path(), 1);
+        config.session.queue_capacity = 1;
         let config = Arc::new(config);
         let registry = isolated_registry(&config, &["gate"]);
         let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
 
-        for (number, token) in [(1, "TOKEN_A"), (2, "TOKEN_B")] {
+        for (number, token) in [(1, "TOKEN_A"), (2, "TOKEN_B"), (3, "TOKEN_C")] {
             let job = Job {
                 model_agent: None,
                 configured_model_agent: None,
@@ -5574,7 +5578,7 @@ echo "end:$token" >> "$AGENT_LOG"
             Capacity {
                 workers: 1,
                 busy: 1,
-                queued: 1,
+                queued: 2,
             }
         );
 
@@ -5585,12 +5589,18 @@ echo "end:$token" >> "$AGENT_LOG"
             Capacity {
                 workers: 1,
                 busy: 1,
-                queued: 0,
+                queued: 1,
             }
         );
 
         release_token(&release, "TOKEN_B");
+        wait_for_log(&log, "start:TOKEN_C").await;
+        release_token(&release, "TOKEN_C");
         wait_for_drain(&sessions).await;
+        let contents = std::fs::read_to_string(&log).unwrap();
+        for token in ["TOKEN_A", "TOKEN_B", "TOKEN_C"] {
+            assert_eq!(contents.matches(&format!("start:{token}")).count(), 1);
+        }
         wait_for_capacity(&dispatcher, |c| c.busy == 0).await;
         assert_eq!(dispatcher.capacity().queued, 0);
     }

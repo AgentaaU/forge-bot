@@ -1,3 +1,9 @@
+# Admin authentication is disabled by default. Set true to enable it.
+auth = false
+# With auth=true, admin access requires a token. Prefer the environment.
+# admin_token = "dedicated-operator-secret"
+# Environment: FORGE_BOT_ADMIN_TOKEN
+
 # Example configuration for forge-bot.
 #
 # forge-bot runs as a root-controlled system service (see

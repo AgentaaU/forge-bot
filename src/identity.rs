@@ -67,7 +67,7 @@ impl UserRuntime {
     /// The trailing boundary prevents `@bot` from capturing `@bot-reviewer`,
     /// and the leading boundary keeps email-like `user@bot` text from matching.
     pub fn is_mentioned(&self, body: &str) -> bool {
-        mention_login(&crate::mention::strip_code(body), &self.login)
+        crate::mention::find_user_mention(body, &self.login).is_some()
     }
 }
 
@@ -157,9 +157,23 @@ impl Identities {
     /// configuration order. Humans are excluded: addressing a human must not
     /// start an agent run.
     pub fn matching_users(&self, body: &str) -> Vec<&Arc<UserRuntime>> {
+        self.matching_user_mentions(body)
+            .into_iter()
+            .map(|(user, _)| user)
+            .collect()
+    }
+
+    /// Resolve users and their original mention offsets together.
+    pub fn matching_user_mentions(
+        &self,
+        body: &str,
+    ) -> Vec<(&Arc<UserRuntime>, std::ops::Range<usize>)> {
         self.users
             .iter()
-            .filter(|user| user.is_agent() && user.is_mentioned(body))
+            .filter(|user| user.is_agent())
+            .filter_map(|user| {
+                crate::mention::find_user_mention(body, &user.login).map(|range| (user, range))
+            })
             .collect()
     }
 
@@ -242,34 +256,9 @@ impl Identities {
 }
 
 /// Whether `body` contains `@<login>` as a complete handle.
+#[cfg(test)]
 fn mention_login(body: &str, login: &str) -> bool {
-    if login.is_empty() {
-        return false;
-    }
-    let needle = login.as_bytes();
-    let bytes = body.as_bytes();
-    let mut search = 0usize;
-    while let Some(rel) = body[search..].find('@') {
-        let at = search + rel;
-        let before_ok = at == 0 || {
-            let prev = body[..at].chars().next_back().unwrap();
-            !(prev.is_alphanumeric() || matches!(prev, '_' | '-' | '.'))
-        };
-        if before_ok {
-            let after = &bytes[at + 1..];
-            if after.len() >= needle.len() && after[..needle.len()].eq_ignore_ascii_case(needle) {
-                let tail = &after[needle.len()..];
-                let tail_ok = tail.first().is_none_or(|&byte| {
-                    !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-                });
-                if tail_ok {
-                    return true;
-                }
-            }
-        }
-        search = at + 1;
-    }
-    false
+    crate::mention::find_user_mention(body, login).is_some()
 }
 
 #[cfg(test)]

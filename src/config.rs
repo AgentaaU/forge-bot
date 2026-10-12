@@ -17,6 +17,10 @@ use crate::error::{BotError, Result};
 pub struct Config {
     /// Address the webhook server binds to.
     pub bind: String,
+    /// Enable operator authentication on /admin routes. Defaults to false.
+    pub auth: bool,
+    /// Operator credential for /admin when auth is enabled. Missing or empty denies access.
+    pub admin_token: Option<String>,
     /// Trigger string users mention, e.g. `@agent`.
     pub mention: String,
     /// Agents to try in order. The first registered agent handles mentions
@@ -55,6 +59,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0:8080".to_owned(),
+            auth: false,
+            admin_token: None,
             mention: "@agent".to_owned(),
             agent_sequence: Vec::new(),
             forges: Forges::default(),
@@ -161,6 +167,9 @@ impl Config {
     }
 
     fn apply_env(&mut self) {
+        if let Ok(v) = std::env::var("FORGE_BOT_ADMIN_TOKEN") {
+            self.admin_token = Some(v);
+        }
         if let Ok(v) = std::env::var("FORGE_BOT_BIND") {
             self.bind = v;
         }
@@ -1444,10 +1453,23 @@ markers = ["overloaded"]
     }
 
     #[test]
+    fn admin_authentication_is_explicitly_enabled_in_config() {
+        assert!(!Config::default().auth);
+        assert!(
+            !toml::from_str::<Config>("admin_token = 'token'")
+                .unwrap()
+                .auth
+        );
+        assert!(!toml::from_str::<Config>("auth = false").unwrap().auth);
+        assert!(toml::from_str::<Config>("auth = true").unwrap().auth);
+    }
+
+    #[test]
     fn apply_env_overrides_all_fields() {
         let _guard = env_guard();
         let keys = [
             "FORGE_BOT_BIND",
+            "FORGE_BOT_ADMIN_TOKEN",
             "FORGE_BOT_MENTION",
             "FORGE_BOT_MAX_CONCURRENCY",
             "FORGE_BOT_WORKSPACE_ROOT",
@@ -1460,6 +1482,7 @@ markers = ["overloaded"]
         let saved = save_env(&keys);
         unsafe {
             std::env::set_var("FORGE_BOT_BIND", "1.2.3.4:1234");
+            std::env::set_var("FORGE_BOT_ADMIN_TOKEN", "env-admin-token");
             std::env::set_var("FORGE_BOT_MENTION", "@env");
             std::env::set_var("FORGE_BOT_MAX_CONCURRENCY", "7");
             std::env::set_var("FORGE_BOT_WORKSPACE_ROOT", "/tmp/env-ws");
@@ -1475,6 +1498,7 @@ markers = ["overloaded"]
         config.apply_env();
 
         assert_eq!(config.bind, "1.2.3.4:1234");
+        assert_eq!(config.admin_token.as_deref(), Some("env-admin-token"));
         assert_eq!(config.mention, "@env");
         assert_eq!(config.session.workers, 7);
         assert_eq!(config.workspace.root, PathBuf::from("/tmp/env-ws"));

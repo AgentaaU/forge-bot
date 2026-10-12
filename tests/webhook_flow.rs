@@ -56,6 +56,8 @@ fn harness(dir: &std::path::Path) -> Harness {
 fn harness_with(dir: &std::path::Path, configure: impl FnOnce(&mut Config)) -> Harness {
     let mut config = Config::default();
     config.bind = "127.0.0.1:0".into();
+    config.auth = true;
+    config.admin_token = Some("test-operator-token".into());
     config.policy.allow_all = true;
     config.workspace.enabled = false;
     config.reply.ack = false;
@@ -2563,6 +2565,7 @@ async fn admin_resets_only_the_selected_agent_cooldown() {
         .oneshot(
             Request::builder()
                 .uri("/admin")
+                .header("authorization", "Bearer test-operator-token")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2594,6 +2597,7 @@ async fn admin_resets_only_the_selected_agent_cooldown() {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/reset-cooldown")
+                    .header("authorization", "Bearer test-operator-token")
                     .header("content-type", "application/json")
                     .body(Body::from(json!({"agent": agent}).to_string()))
                     .unwrap(),
@@ -2614,6 +2618,7 @@ async fn admin_resets_only_the_selected_agent_cooldown() {
                 Request::builder()
                     .method(method)
                     .uri("/admin/reset-cooldown")
+                    .header("authorization", "Bearer test-operator-token")
                     .body(Body::from("agent=codex"))
                     .unwrap(),
             )
@@ -2634,6 +2639,7 @@ async fn admin_terminate_rejects_threads_that_are_not_running() {
         .oneshot(
             Request::builder()
                 .uri("/admin")
+                .header("authorization", "Bearer test-operator-token")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2654,6 +2660,7 @@ async fn admin_terminate_rejects_threads_that_are_not_running() {
             Request::builder()
                 .method("POST")
                 .uri("/admin/terminate-thread")
+                .header("authorization", "Bearer test-operator-token")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({"key": "forgejo:o/r:issue:1"}).to_string(),
@@ -2671,6 +2678,7 @@ async fn admin_terminate_rejects_threads_that_are_not_running() {
             Request::builder()
                 .method("POST")
                 .uri("/admin/terminate-thread")
+                .header("authorization", "Bearer test-operator-token")
                 .body(Body::from("key=forgejo:o/r:issue:1"))
                 .unwrap(),
         )
@@ -2756,6 +2764,7 @@ async fn admin_reported_models_follow_the_reporting_adapter_not_the_queued_adapt
         .oneshot(
             Request::builder()
                 .uri("/admin")
+                .header("authorization", "Bearer test-operator-token")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2814,6 +2823,7 @@ async fn admin_sets_each_agent_users_model_and_effort() {
             .oneshot(
                 Request::builder()
                     .uri("/admin")
+                    .header("authorization", "Bearer test-operator-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2825,7 +2835,8 @@ async fn admin_sets_each_agent_users_model_and_effort() {
     let post = |app: axum::Router, body: Body, json: bool| async move {
         let mut request = Request::builder()
             .method("POST")
-            .uri("/admin/agent-settings");
+            .uri("/admin/agent-settings")
+            .header("authorization", "Bearer test-operator-token");
         if json {
             request = request.header("content-type", "application/json");
         }
@@ -3018,6 +3029,7 @@ async fn admin_ranking_updates_selection_and_rejects_invalid_lists() {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/agent-ranking")
+                    .header("authorization", "Bearer test-operator-token")
                     .header("content-type", "application/json")
                     .body(Body::from(json!({"agents": agents}).to_string()))
                     .unwrap(),
@@ -3038,6 +3050,7 @@ async fn admin_ranking_updates_selection_and_rejects_invalid_lists() {
         .oneshot(
             Request::builder()
                 .uri("/admin")
+                .header("authorization", "Bearer test-operator-token")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3055,6 +3068,7 @@ async fn admin_ranking_updates_selection_and_rejects_invalid_lists() {
             Request::builder()
                 .method("POST")
                 .uri("/admin/agent-ranking")
+                .header("authorization", "Bearer test-operator-token")
                 .body(Body::from("agents=custom"))
                 .unwrap(),
         )
@@ -3090,6 +3104,7 @@ async fn ranking_refreshes_default_dependent_user_controls() {
             app.oneshot(
                 Request::builder()
                     .uri("/admin")
+                    .header("authorization", "Bearer test-operator-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3120,6 +3135,7 @@ async fn ranking_refreshes_default_dependent_user_controls() {
             Request::builder()
                 .method("POST")
                 .uri("/admin/agent-ranking")
+                .header("authorization", "Bearer test-operator-token")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({"agents": ["claude", "custom"]}).to_string(),
@@ -3210,6 +3226,7 @@ async fn admin_discovers_and_caches_models_per_user_and_resolved_agent() {
                     Request::builder()
                         .method("POST")
                         .uri("/admin/agent-models")
+                        .header("authorization", "Bearer test-operator-token")
                         .header("content-type", "application/json")
                         .body(Body::from(body.to_string()))
                         .unwrap(),
@@ -3280,6 +3297,7 @@ async fn admin_model_discovery_handles_unsupported_and_failed_catalogs() {
         Request::builder()
             .method("POST")
             .uri("/admin/agent-models")
+            .header("authorization", "Bearer test-operator-token")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"user":"default"}"#))
             .unwrap()
@@ -3317,6 +3335,7 @@ async fn admin_model_discovery_handles_unsupported_and_failed_catalogs() {
         .oneshot(
             Request::builder()
                 .uri("/admin")
+                .header("authorization", "Bearer test-operator-token")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3330,4 +3349,186 @@ async fn admin_model_discovery_handles_unsupported_and_failed_catalogs() {
     assert!(html.contains("Custom model…"));
     assert!(html.contains("value=\"\" selected>Agent default"));
     assert!(h.sessions.user_settings("default").is_empty());
+}
+
+#[tokio::test]
+async fn admin_rejects_anonymous_invalid_and_disabled_credentials_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(dir.path());
+    h.agents
+        .mark_unavailable("custom", Duration::from_secs(3600));
+    let before = state_fingerprint(dir.path());
+    let ranking = h.agents.ordered_names();
+    for credential in [
+        None,
+        Some("Bearer wrong"),
+        Some("Basic b3BlcmF0b3I6d3Jvbmc="),
+    ] {
+        for (path, body) in [
+            ("/admin/reset-cooldown", json!({"agent":"custom"})),
+            ("/admin/agent-ranking", json!({"agents":["codex","custom"]})),
+            ("/admin/terminate-thread", json!({"key":"thread"})),
+            (
+                "/admin/agent-settings",
+                json!({"user":"default","model":"attacker"}),
+            ),
+            ("/admin/agent-models", json!({"user":"default"})),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json");
+            if let Some(credential) = credential {
+                request = request.header("authorization", credential);
+            }
+            let response = h
+                .app
+                .clone()
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+    }
+    assert_eq!(state_fingerprint(dir.path()), before);
+    assert_eq!(h.agents.ordered_names(), ranking);
+    assert!(!h.agents.is_available("custom"));
+    let response = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().contains_key("www-authenticate"));
+
+    use base64::Engine;
+    let basic = base64::engine::general_purpose::STANDARD.encode("operator:test-operator-token");
+    let response = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/reset-cooldown")
+                .header("authorization", format!("Basic {basic}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"agent":"custom"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(h.agents.is_available("custom"));
+
+    for token in [None, Some(String::new())] {
+        let disabled_dir = tempfile::tempdir().unwrap();
+        let disabled = harness_with(disabled_dir.path(), |config| config.admin_token = token);
+        let response = disabled
+            .app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .header("authorization", "Bearer test-operator-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn routing_extracts_options_from_the_eligible_mention_and_preserves_task_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(dir.path());
+    for prefix in [
+        "`@shylock-bot --model=quoted-model example`",
+        "```text\n@shylock-bot --model=quoted-model example\n```",
+        "    @shylock-bot --model=quoted-model example\n",
+        "@shylock-bot-other unrelated",
+        "@shylock-bot.other unrelated",
+        "user@shylock-bot unrelated",
+    ] {
+        let mut payload: Value = serde_json::from_str(PAYLOAD).unwrap();
+        payload["comment"]["body"] = json!(format!(
+            "{prefix}\n\n@shylock-bot --agent=custom --model=requested-model --effort=high fix `@shylock-bot --model=example`\n```\ncode\n```"
+        ));
+        use forge_bot::forge::ForgeAdapter;
+        let adapter =
+            forge_bot::forge::forgejo::ForgejoAdapter::new(&forge_bot::config::ForgejoConfig {
+                bot_username: Some("shylock-bot".into()),
+                ..Default::default()
+            });
+        let message = adapter
+            .parse(
+                &{
+                    let mut headers = axum::http::HeaderMap::new();
+                    headers.insert("x-forgejo-event", "issue_comment".parse().unwrap());
+                    headers
+                },
+                &serde_json::to_vec(&payload).unwrap(),
+            )
+            .unwrap()
+            .remove(0);
+        let (mention, agent) = h.dispatcher.route(&message).unwrap().unwrap();
+        assert_eq!(agent, "custom");
+        assert_eq!(
+            mention.model.as_deref(),
+            Some("requested-model"),
+            "{prefix}"
+        );
+        assert_eq!(mention.effort.as_deref(), Some("high"));
+        assert_eq!(
+            mention.message,
+            "fix `@shylock-bot --model=example`\n```\ncode\n```"
+        );
+    }
+}
+
+#[tokio::test]
+async fn admin_auth_false_allows_access_and_mutation_without_credentials() {
+    for token in [None, Some(String::new()), Some("operator-token".into())] {
+        let dir = tempfile::tempdir().unwrap();
+        let h = harness_with(dir.path(), |config| {
+            config.auth = false;
+            config.admin_token = token;
+        });
+        h.agents
+            .mark_unavailable("custom", Duration::from_secs(3600));
+        for credential in [None, Some("Bearer wrong")] {
+            let mut request = Request::builder().uri("/admin");
+            if let Some(credential) = credential {
+                request = request.header("authorization", credential);
+            }
+            let response = h
+                .app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!response.headers().contains_key("www-authenticate"));
+        }
+        let response = h
+            .app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/reset-cooldown")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"agent":"custom"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(h.agents.is_available("custom"));
+    }
 }

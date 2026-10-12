@@ -66,57 +66,100 @@ pub fn extract_mention(body: &str, trigger: &str) -> Option<Mention> {
         let Some(len) = matching_prefix_len(&body[idx..], &lower_trigger) else {
             continue;
         };
-        let after = &body[idx + len..];
-
-        // Reject the old colon selector rather than treating it as a default-agent request.
-        let after_spaces = after.trim_start_matches([' ', '\t']);
-        if after_spaces.strip_prefix(':').is_some_and(|rest| {
-            rest.starts_with(|c: char| c.is_alphanumeric() || c == '-' || c == '_')
-        }) {
-            continue;
+        if let Some(mention) = extract_mention_at(body, idx..idx + len) {
+            return Some(mention);
         }
-        let mut agent = None;
-        let mut model = None;
-        let mut effort = None;
-        let mut rest = after;
-        // Only consume a leading run of recognized, nonempty options. Once
-        // prose (or an unknown/invalid option) starts, preserve it verbatim.
-        while rest.starts_with([' ', '\t']) {
-            let argument = rest.trim_start_matches([' ', '\t']);
-            let end = argument.find(char::is_whitespace).unwrap_or(argument.len());
-            let token = &argument[..end];
-            let Some((key, value)) = token.split_once('=') else {
-                break;
-            };
-            if value.is_empty() {
-                break;
-            }
-            match key {
-                "--agent"
-                    if value
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_') =>
-                {
-                    agent = Some(value.to_owned())
-                }
-                "--model" => model = Some(value.to_owned()),
-                "--effort" if crate::agent::is_effort_level(value) => {
-                    effort = Some(value.to_owned())
-                }
-                _ => break,
-            }
-            rest = &argument[end..];
-        }
+    }
+    None
+}
 
-        let message = rest.trim_start_matches(|c: char| c == ':' || c == ',' || c.is_whitespace());
-        return Some(Mention {
-            agent,
-            model,
-            effort,
-            message: message.trim().to_owned(),
-        });
+/// Parse launch arguments after an already resolved mention in the original body.
+pub fn extract_mention_at(body: &str, range: Range<usize>) -> Option<Mention> {
+    let after = &body[range.end..];
+
+    // Reject the old colon selector rather than treating it as a default-agent request.
+    let after_spaces = after.trim_start_matches([' ', '\t']);
+    if after_spaces
+        .strip_prefix(':')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_alphanumeric() || c == '-' || c == '_'))
+    {
+        return None;
+    }
+    let mut agent = None;
+    let mut model = None;
+    let mut effort = None;
+    let mut rest = after;
+    // Only consume a leading run of recognized, nonempty options. Once
+    // prose (or an unknown/invalid option) starts, preserve it verbatim.
+    while rest.starts_with([' ', '\t']) {
+        let argument = rest.trim_start_matches([' ', '\t']);
+        let end = argument.find(char::is_whitespace).unwrap_or(argument.len());
+        let token = &argument[..end];
+        let Some((key, value)) = token.split_once('=') else {
+            break;
+        };
+        if value.is_empty() {
+            break;
+        }
+        match key {
+            "--agent"
+                if value
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_') =>
+            {
+                agent = Some(value.to_owned())
+            }
+            "--model" => model = Some(value.to_owned()),
+            "--effort" if crate::agent::is_effort_level(value) => effort = Some(value.to_owned()),
+            _ => break,
+        }
+        rest = &argument[end..];
     }
 
+    let message = rest.trim_start_matches(|c: char| c == ':' || c == ',' || c.is_whitespace());
+    Some(Mention {
+        agent,
+        model,
+        effort,
+        message: message.trim().to_owned(),
+    })
+}
+
+/// Find a complete, non-code user handle in the original text. Keeping byte
+/// offsets lets option extraction preserve code examples in the actual task.
+pub fn find_user_mention(body: &str, login: &str) -> Option<Range<usize>> {
+    if login.is_empty() {
+        return None;
+    }
+    let ranges = code_ranges(body);
+    let needle = login.as_bytes();
+    for (at, _) in body.match_indices('@') {
+        if body[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        {
+            continue;
+        }
+        let end = at + 1 + needle.len();
+        let Some(candidate) = body.as_bytes().get(at + 1..end) else {
+            continue;
+        };
+        if !candidate.eq_ignore_ascii_case(needle) || !body.is_char_boundary(end) {
+            continue;
+        }
+        if body
+            .as_bytes()
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            || ranges
+                .iter()
+                .any(|range| at < range.end && end > range.start)
+        {
+            continue;
+        }
+        return Some(at..end);
+    }
     None
 }
 
