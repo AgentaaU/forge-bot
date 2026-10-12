@@ -103,6 +103,19 @@ pub fn is_capacity_limited(text: &str, extra: &[String]) -> bool {
         })
 }
 
+/// Explicit model/server overload is transient, rather than account exhaustion.
+pub fn is_model_overloaded(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "selected model is at capacity",
+        "model is currently overloaded",
+        "overloaded_error",
+        "server_overloaded",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 /// Read an explicit retry window from a failed agent's response.
 ///
 /// Provider messages without a usable duration or reset time leave the choice

@@ -616,7 +616,9 @@ successful run clears the mark. This is why a thread can still be answered by
 `codex` immediately after an earlier capacity notice. When a failed response
 includes an explicit retry interval or reset time, that sets the cooldown;
 times without a timezone use the bot host's local timezone. Otherwise,
-`[capacity] cooldown_secs` is used.
+`[capacity] cooldown_secs` is used for quota/rate limits (default five hours).
+Explicit model/server overload uses `overload_cooldown_secs` (default 60 seconds),
+so temporary model contention does not disable the adapter for five hours.
 
 The example config sets `agent_sequence = ["codex", "agy", "pi-rpc", "claude"]`
 at the top level. Use registered adapter names; `agy` is Antigravity

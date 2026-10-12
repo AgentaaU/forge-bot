@@ -1383,6 +1383,12 @@ impl Inner {
                 && is_capacity_limited(&outcome.summary, &self.config.capacity.markers);
 
             if capacity_limited {
+                let fallback_cooldown =
+                    if crate::agent::capacity::is_model_overloaded(&outcome.summary) {
+                        Duration::from_secs(self.config.capacity.overload_cooldown_secs.max(1))
+                    } else {
+                        fallback_cooldown
+                    };
                 let cooldown =
                     crate::agent::capacity::retry_after(&outcome.summary, chrono::Utc::now())
                         .unwrap_or(fallback_cooldown);
@@ -1392,7 +1398,7 @@ impl Inner {
                     UnavailableReason::CapacityLimit,
                 );
                 unavailable_hits += 1;
-                tracing::warn!(job = %job.id, agent = %name, "agent hit a capacity limit");
+                tracing::warn!(job = %job.id, agent = %name, summary = %outcome.summary, "agent hit a capacity limit");
                 last_outcome = Some(outcome);
                 previous_reason = Some(UnavailableReason::CapacityLimit);
                 continue;
@@ -3085,6 +3091,66 @@ mod tests {
             },
         );
         config
+    }
+
+    #[tokio::test]
+    async fn model_overload_uses_short_cooldown_and_preserves_explicit_retry() {
+        for (error, expected) in [
+            (
+                "Selected model is at capacity. Please try a different model.",
+                60,
+            ),
+            ("You have hit your usage limit", 18000),
+            ("Selected model is at capacity. Retry after 2 minutes", 120),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = capacity_config(dir.path());
+            config
+                .agents
+                .overrides
+                .get_mut("capacity-agent")
+                .unwrap()
+                .args = Some(vec!["-c".into(), format!("echo '{error}' >&2; exit 1")]);
+            let config = Arc::new(config);
+            let registry = isolated_registry(&config, &["capacity-agent", "good-agent"]);
+            let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+            let dispatcher = Dispatcher::new(
+                config.clone(),
+                registry.clone(),
+                sessions.clone(),
+                Arc::new(RecordingApi::default()),
+                Policy::new(&config.policy),
+            )
+            .unwrap();
+            dispatcher
+                .submit(
+                    message("o/r"),
+                    Mention {
+                        model: None,
+                        effort: None,
+                        agent: Some("capacity-agent".into()),
+                        message: "go".into(),
+                    },
+                    "capacity-agent",
+                )
+                .await
+                .unwrap();
+            wait_for_drain(&sessions).await;
+            let remaining = registry.cooldown_remaining("capacity-agent").unwrap();
+            assert!(
+                remaining <= Duration::from_secs(expected),
+                "{error}: {remaining:?}"
+            );
+            assert!(
+                remaining > Duration::from_secs(expected - 10),
+                "{error}: {remaining:?}"
+            );
+            let session = sessions
+                .get(&SessionStore::key(&message("o/r"), Some("default")))
+                .unwrap();
+            assert_eq!(session.runs[0].agent, "good-agent");
+            assert_eq!(session.runs[0].success, Some(true));
+        }
     }
 
     #[tokio::test]

@@ -795,11 +795,13 @@ pub const DEFAULT_CAPACITY_COOLDOWN_SECS: u64 = 5 * 60 * 60;
 pub struct CapacityConfig {
     /// Retry a job on another available agent when the chosen one is at
     /// capacity. When false the job simply fails and the agent is still
-    /// skipped for `cooldown_secs`.
+    /// skipped for the applicable cooldown.
     pub fallback: bool,
     /// Fallback when a capacity response has no usable retry interval, and
     /// the window used when an agent cannot be started. Defaults to five hours.
     pub cooldown_secs: u64,
+    /// Short retry window for explicit model/server overload without a retry hint.
+    pub overload_cooldown_secs: u64,
     /// Extra, case-insensitive substrings that count as a capacity message, in
     /// addition to the built-in markers.
     pub markers: Vec<String>,
@@ -810,6 +812,7 @@ impl Default for CapacityConfig {
         Self {
             fallback: true,
             cooldown_secs: DEFAULT_CAPACITY_COOLDOWN_SECS,
+            overload_cooldown_secs: 60,
             markers: Vec::new(),
         }
     }
@@ -1227,6 +1230,7 @@ timeout_secs = 60
     #[test]
     fn capacity_cooldown_defaults_to_five_hours() {
         assert_eq!(CapacityConfig::default().cooldown_secs, 5 * 60 * 60);
+        assert_eq!(CapacityConfig::default().overload_cooldown_secs, 60);
         assert_eq!(
             DEFAULT_CAPACITY_COOLDOWN_SECS,
             5 * 60 * 60,

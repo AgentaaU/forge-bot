@@ -146,7 +146,8 @@ transport = "web_push"
 # leaving the thread unanswered. An agent whose output looks like a quota,
 # rate-limit or capacity/overload error is additionally marked unavailable for
 # the retry interval reported by the agent, or `cooldown_secs` if the response
-# has no usable interval. The requested (or default) agent is still tried first
+# has no usable interval (`overload_cooldown_secs` for explicit model/server
+# overload). The requested (or default) agent is still tried first
 # while it is cooling down, so a recovered quota is picked up; a successful run
 # clears the mark. A start failure uses the configured cooldown; an ordinary
 # non-capacity run failure does not disable the agent. When no agent is left,
@@ -155,6 +156,8 @@ transport = "web_push"
 fallback = true
 # Fallback window for messages without a usable retry interval (five hours).
 cooldown_secs = 18000
+# Explicit model/server overload without a retry hint is retried after one minute.
+overload_cooldown_secs = 60
 # Extra, case-insensitive phrases that count as a capacity message, in
 # addition to the built-in markers ("usage limit", "rate limit", "too many
 # requests", "quota exceeded", "overloaded", "at capacity", "503 Service
