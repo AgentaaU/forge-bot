@@ -987,7 +987,7 @@ impl Inner {
                 .get(&key)
                 .map(|running| (running.agent.clone(), running.context.clone()))
         };
-        let Some((agent, context)) = running else {
+        let Some((agent, mut context)) = running else {
             return false;
         };
 
@@ -998,6 +998,8 @@ impl Inner {
             location: job.message.location.clone(),
             message: job.mention.message_or_default().to_owned(),
         };
+        context.automatic_event = is_auto_trigger(&job.message);
+        context.requester = job.message.author.clone();
         match agent.follow_up(&request, &context).await {
             Ok(Some(receipt)) => {
                 tracing::info!(
@@ -1206,6 +1208,7 @@ impl Inner {
             forge: Some(job.message.forge),
             repository: job.message.repository.clone(),
             requester: job.message.author.clone(),
+            automatic_event: is_auto_trigger(&job.message),
             issue_number: job.message.number,
             is_pull_request: job.message.is_pull_request,
             linked_issue: job.message.linked_issue.clone(),
@@ -2725,6 +2728,7 @@ mod tests {
         runs: std::sync::atomic::AtomicUsize,
         release: tokio::sync::Notify,
         steers: std::sync::Mutex<Vec<String>>,
+        recipients: std::sync::Mutex<Vec<(bool, String)>>,
     }
 
     impl SteeringAgent {
@@ -2733,6 +2737,7 @@ mod tests {
                 runs: std::sync::atomic::AtomicUsize::new(0),
                 release: tokio::sync::Notify::new(),
                 steers: std::sync::Mutex::new(Vec::new()),
+                recipients: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -2754,8 +2759,12 @@ mod tests {
         async fn run(
             &self,
             _request: &AgentRequest,
-            _context: &AgentContext,
+            context: &AgentContext,
         ) -> Result<AgentOutcome> {
+            self.recipients
+                .lock()
+                .unwrap()
+                .push((context.automatic_event, context.requester.clone()));
             self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.release.notified().await;
             Ok(AgentOutcome::success("done", Duration::ZERO))
@@ -2764,8 +2773,12 @@ mod tests {
         async fn follow_up(
             &self,
             request: &AgentRequest,
-            _context: &AgentContext,
+            context: &AgentContext,
         ) -> Result<Option<crate::agent::SteerReceipt>> {
+            self.recipients
+                .lock()
+                .unwrap()
+                .push((context.automatic_event, context.requester.clone()));
             self.steers.lock().unwrap().push(request.message.clone());
             self.release.notify_one();
             Ok(Some(crate::agent::SteerReceipt::merged()))
@@ -2842,10 +2855,12 @@ mod tests {
         assert!(!dispatcher.inner.try_merge_follow_up(&settings_job).await);
         assert!(steering.steers().is_empty());
 
+        let mut follow_up = message("o/r");
+        follow_up.author = "other-bot".into();
         // Second mention in the same thread is merged into that run.
         dispatcher
             .submit(
-                message("o/r"),
+                follow_up,
                 Mention {
                     model: None,
                     effort: None,
@@ -2865,10 +2880,14 @@ mod tests {
             "the follow-up must not start a second run"
         );
         assert_eq!(steering.steers(), vec!["second".to_owned()]);
+        assert_eq!(
+            *steering.recipients.lock().unwrap(),
+            vec![(false, "alice".into()), (false, "other-bot".into())]
+        );
         let comments = api.comments();
         assert!(
             comments.iter().any(|(_, body)| body
-                == "forge-bot: 📎 Merged into the current run. Follow-up from @alice."),
+                == "forge-bot: 📎 Merged into the current run. Follow-up from @other-bot."),
             "the thread should show the merge notice and its author: {comments:?}"
         );
     }
@@ -2876,7 +2895,15 @@ mod tests {
     /// An automatic trigger merged into a live run names its origin, so the
     /// thread can tell it apart from a human follow-up.
     #[tokio::test]
-    async fn merged_auto_trigger_names_its_origin() {
+    async fn automatic_jobs_preserve_origin_for_fresh_and_merged_runs() {
+        for event in ["merge_conflict", "action_run_failure"] {
+            for fresh_auto in [false, true] {
+                check_auto_recipients(event, fresh_auto).await;
+            }
+        }
+    }
+
+    async fn check_auto_recipients(event: &str, fresh_auto: bool) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.reply.ack = true;
@@ -2905,20 +2932,29 @@ mod tests {
         )
         .unwrap();
 
-        // A human mention starts a run, which blocks until steered.
-        dispatcher
-            .submit(
-                message("o/r"),
-                Mention {
-                    model: None,
-                    effort: None,
-                    agent: Some("steering".into()),
-                    message: "first".into(),
-                },
-                "steering",
-            )
-            .await
-            .unwrap();
+        let mut first = message("o/r");
+        first.is_pull_request = true;
+        first.location = Url::parse("http://forge.local/o/r/pulls/1#issuecomment-1").unwrap();
+        if fresh_auto {
+            first.author = AUTO_TRIGGER_AUTHOR.into();
+            first.event = event.into();
+            first.comment_id = None;
+            first.location.set_fragment(None);
+        }
+        let mention = Mention {
+            model: None,
+            effort: None,
+            agent: Some("steering".into()),
+            message: "first".into(),
+        };
+        if fresh_auto {
+            dispatcher
+                .submit_auto(first, mention, "steering", "trusted")
+                .await
+                .unwrap();
+        } else {
+            dispatcher.submit(first, mention, "steering").await.unwrap();
+        }
         for _ in 0..500 {
             if steering.runs() == 1 {
                 break;
@@ -2927,12 +2963,15 @@ mod tests {
         }
         assert_eq!(steering.runs(), 1);
 
-        // An automatic merge-conflict trigger arrives while the run is live and
+        // An automatic CI/conflict trigger arrives while the run is live and
         // is merged into it instead of starting a second run.
         let mut auto = message_at("o/r", 1);
         auto.author = crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into();
-        auto.event = "merge_conflict".into();
+        auto.event = event.into();
+        auto.is_pull_request = true;
+        auto.location = Url::parse("http://forge.local/o/r/pulls/1").unwrap();
         auto.comment_id = None;
+        auto.location.set_fragment(None);
         dispatcher
             .submit_auto(
                 auto,
@@ -2950,10 +2989,31 @@ mod tests {
 
         wait_for_drain(&sessions).await;
 
+        assert_eq!(
+            *steering.recipients.lock().unwrap(),
+            vec![
+                (
+                    fresh_auto,
+                    if fresh_auto {
+                        AUTO_TRIGGER_AUTHOR.into()
+                    } else {
+                        "alice".into()
+                    }
+                ),
+                (true, AUTO_TRIGGER_AUTHOR.into())
+            ]
+        );
         let comments = api.comments();
         assert!(
             comments.iter().any(|(_, body)| body
-                == "forge-bot: 📎 Merged into the current run. Triggered by a merge conflict."),
+                == &format!(
+                    "forge-bot: 📎 Merged into the current run. Triggered by {}.",
+                    if event == "merge_conflict" {
+                        "a merge conflict"
+                    } else {
+                        "a failed CI run"
+                    }
+                )),
             "the merged acknowledgement must name the automatic trigger: {comments:?}"
         );
     }

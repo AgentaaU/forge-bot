@@ -1238,7 +1238,7 @@ impl Agent for PiPoolAgent {
 
         writer.send(json!({
             "type": "steer",
-            "message": build_follow_up_prompt(request),
+            "message": build_follow_up_prompt(request, context),
         }))?;
         tracing::info!(key, "injected a steer into a live pi agent");
         Ok(Some(SteerReceipt::merged()))

@@ -6,7 +6,11 @@ use super::{AgentContext, AgentRequest};
 
 pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> String {
     let mut prompt = String::new();
-    prompt.push_str("You are an autonomous coding agent invoked from a forge comment.\n\n");
+    prompt.push_str(if context.automatic_event {
+        "You are an autonomous coding agent invoked by an automatic forge event.\n\n"
+    } else {
+        "You are an autonomous coding agent invoked from a forge comment.\n\n"
+    });
 
     if let Some(forge) = context.forge {
         prompt.push_str(&format!("Forge: {forge}\n"));
@@ -32,7 +36,15 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
     prompt.push_str(request.message.trim());
     prompt.push('\n');
 
-    if context.is_issue() && !context.requester.is_empty() {
+    if !context.automatic_event && !context.requester.is_empty() {
+        prompt.push_str(&format!(
+            "\nReply to the caller (@{}) when reporting results or asking for task changes. \
+             Mention only the caller in that reply, even when the caller is an agent.\n",
+            context.requester
+        ));
+    }
+
+    if context.is_issue() && !context.automatic_event && !context.requester.is_empty() {
         prompt.push_str(&format!(
             "\nIf you create a pull request, request a review from the caller (@{}) on that pull request.\n",
             context.requester
@@ -40,16 +52,23 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
     }
 
     if context.is_reviewer {
-        let submitter_mention = context
-            .pull_request_author
-            .as_ref()
-            .map(|submitter| format!("'@{submitter}'"))
-            .unwrap_or_else(|| {
-                "the PR submitter's login (read it from the forge PR author)".into()
-            });
+        let caller_mention = if context.automatic_event {
+            context
+                .pull_request_author
+                .as_ref()
+                .map(|author| format!("'@{author}'"))
+                .unwrap_or_else(|| {
+                    "the PR submitter's login (read it from the forge PR author)".into()
+                })
+        } else if context.requester.is_empty() {
+            "the invoking comment author's login (read it from the forge comment at Location)"
+                .into()
+        } else {
+            format!("'@{}'", context.requester)
+        };
         prompt.push_str(&format!(
             "\nYou are acting as a reviewer. On a pull request, inspect the current diff and run relevant checks. \
-             If changes are needed, post an actionable comment mentioning only {submitter_mention}, asking them to fix the findings and mention you again after updating. \
+             If changes are needed, post an actionable comment mentioning only {caller_mention}, asking them to fix the findings and mention you again after updating. \
              When the review is OK, rebase the branch onto the current base and squash it to one commit, \
              verify the final diff and checks, then approve the final head and enable auto-merge using fast-forward only. \
              Do not approve or enable auto-merge while findings or checks remain unresolved.\n",
@@ -94,14 +113,31 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
 /// Deliberately short: the agent already has the workspace and its earlier
 /// context, so a follow-up only needs the new instruction and where it came
 /// from.
-pub(super) fn build_follow_up_prompt(request: &AgentRequest) -> String {
-    format!(
-        "A follow-up comment arrived in this thread while you were working. Treat it \
-         as a continuation of the same task and act on it before you finish.\n\n\
-         Follow-up at {}:\n{}",
+pub(super) fn build_follow_up_prompt(request: &AgentRequest, context: &AgentContext) -> String {
+    let origin = if context.automatic_event {
+        "event"
+    } else {
+        "comment"
+    };
+    let mut prompt = format!(
+        "A follow-up {origin} arrived in this thread while you were working. Treat it \
+         as a continuation of the same task and act on it before you finish.\n\n"
+    );
+    if !context.automatic_event {
+        if context.requester.is_empty() {
+            prompt.push_str("Reply to the author of this follow-up comment when reporting its results or asking for task changes. \
+                Read their login from the forge comment at the follow-up location and mention only them, even if they are an agent.\n\n");
+        } else {
+            prompt.push_str(&format!("Reply to the caller (@{}) of this follow-up comment when reporting its results or asking for task changes. \
+                Mention only them, even if they are an agent.\n\n", context.requester));
+        }
+    }
+    prompt.push_str(&format!(
+        "Follow-up at {}:\n{}",
         request.location,
         request.message.trim()
-    )
+    ));
+    prompt
 }
 
 #[cfg(test)]
@@ -171,7 +207,7 @@ mod tests {
         assert!(prompt.contains("mentioning only @review-bot"));
         context.is_reviewer = true;
         let prompt = build_prompt(&request, &context);
-        assert!(prompt.contains("PR submitter's login"));
+        assert!(prompt.contains("mentioning only '@alice'"));
         assert!(prompt.contains("squash it to one commit"));
         assert!(prompt.contains("approve the final head"));
         assert!(prompt.contains("fast-forward only"));
@@ -191,14 +227,69 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_prompt_names_resolved_pr_author_instead_of_requester() {
+    fn reviewer_prompt_addresses_caller_instead_of_pr_author_or_human() {
         let (request, mut context) = sample();
+        context.is_reviewer = true;
+        context.requester = "caller-bot".into();
+        context.human = Some("alice".into());
+        context.pull_request_author = Some("submitter-bot".into());
+        let prompt = build_prompt(&request, &context);
+        assert!(prompt.contains("mentioning only '@caller-bot'"));
+        assert!(prompt.contains("Reply to the caller (@caller-bot)"));
+        assert!(prompt.contains("mentioning only @alice and say exactly what you need"));
+        assert!(!prompt.contains("read it from the forge PR author"));
+        assert!(!prompt.contains("mentioning only '@submitter-bot'"));
+    }
+
+    #[test]
+    fn reviewer_without_requester_resolves_invoking_comment_author() {
+        let (request, mut context) = sample();
+        context.requester.clear();
         context.is_reviewer = true;
         context.pull_request_author = Some("submitter-bot".into());
         let prompt = build_prompt(&request, &context);
-        assert!(prompt.contains("mentioning only '@submitter-bot'"));
-        assert!(!prompt.contains("read it from the forge PR author"));
-        assert!(!prompt.contains("mentioning only @alice"));
+        assert!(prompt.contains("invoking comment author's login"));
+        assert!(!prompt.contains("@submitter-bot"));
+        assert!(!prompt.contains("Reply to the caller (@)"));
+    }
+
+    #[test]
+    fn automatic_prompts_omit_caller_guidance_and_keep_handoffs() {
+        for event in ["action_run_failure", "merge_conflict"] {
+            let (mut request, mut context) = sample();
+            request.location.set_fragment(None);
+            request.message = event.into();
+            context.reply_target = ReplyTarget::Conversation;
+            context.automatic_event = true;
+            context.requester = crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into();
+            context.reviewer = Some("review-bot".into());
+            context.human = Some("human".into());
+            let prompt = build_prompt(&request, &context);
+            assert!(!prompt.contains("@forgejo-event"));
+            assert!(!prompt.contains("Reply to the caller"));
+            assert!(prompt.contains("mentioning only @review-bot"));
+            assert!(prompt.contains("mentioning only @human"));
+            let follow_up = build_follow_up_prompt(&request, &context);
+            assert!(follow_up.contains("follow-up event arrived"));
+            assert!(!follow_up.contains("author"));
+            assert!(!follow_up.contains("caller"));
+            assert!(!follow_up.contains("login"));
+            context.is_reviewer = true;
+            context.pull_request_author = Some("submitter-bot".into());
+            let prompt = build_prompt(&request, &context);
+            assert!(prompt.contains("mentioning only '@submitter-bot'"));
+            assert!(!prompt.contains("@forgejo-event"));
+        }
+    }
+
+    #[test]
+    fn real_follow_up_names_its_own_caller() {
+        let (request, mut context) = sample();
+        context.requester = "other-bot".into();
+        let prompt = build_follow_up_prompt(&request, &context);
+        assert!(prompt.contains("Reply to the caller (@other-bot)"));
+        assert!(!prompt.contains("Read their login"));
+        assert!(!prompt.contains("@alice"));
     }
 
     #[test]
@@ -209,10 +300,11 @@ mod tests {
                 .unwrap(),
             message: "  also run the linter ".into(),
         };
-        let prompt = build_follow_up_prompt(&request);
+        let prompt = build_follow_up_prompt(&request, &AgentContext::default());
         assert!(prompt.contains("follow-up comment arrived"));
         assert!(prompt.contains("https://forge.example/o/r/issues/4#issuecomment-11"));
         assert!(prompt.contains("also run the linter"));
+        assert!(prompt.contains("Reply to the author of this follow-up comment"));
         // It must not repeat the full initial prompt.
         assert!(!prompt.contains("You are an autonomous coding agent"));
     }
@@ -230,6 +322,7 @@ mod tests {
                 "Title: A title\n",
                 "Your working directory: /srv/worker\n\n",
                 "Requested work:\nfix this\n",
+                "\nReply to the caller (@alice) when reporting results or asking for task changes. Mention only the caller in that reply, even when the caller is an agent.\n",
                 "\nThis mention is an inline pull-request review comment. Post any reply in the same review thread (review id 7, file `src/lib.rs`, line 42) instead of opening a new top-level comment.\n",
                 "\nUse the tools available to you (forge CLI/API, git, shell, filesystem) to gather context, make changes, run tests, and commit/push when appropriate. Reply on the forge when you are done. Forge credentials are available in the environment.\n",
             )
@@ -254,6 +347,7 @@ mod tests {
         assert!(prompt.contains("fix this"));
         assert!(!prompt.contains("request a review from the caller"));
         assert!(prompt.contains("Reply on the forge"));
+        assert!(prompt.contains("Reply to the caller (@alice)"));
         assert!(!prompt.contains("inline pull-request review comment"));
     }
 
@@ -272,8 +366,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(
-            build_prompt(&request, &context).contains("request a review from the caller (@alice)")
-        );
+        let prompt = build_prompt(&request, &context);
+        assert!(prompt.contains("request a review from the caller (@alice)"));
+        assert!(prompt.contains("Reply to the caller (@alice)"));
     }
 }

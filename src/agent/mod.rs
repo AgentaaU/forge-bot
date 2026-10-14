@@ -61,6 +61,8 @@ pub struct AgentContext {
     pub repository: String,
     /// Login of the forge user who requested this run.
     pub requester: String,
+    /// This invocation comes from an automatic forge event, without a caller comment.
+    pub automatic_event: bool,
     /// One configured reviewer selected for PR handoffs.
     pub reviewer: Option<String>,
     /// Whether this run belongs to an account with the reviewer role.
@@ -352,6 +354,7 @@ mod tests {
             forge: Some(ForgeKind::Forgejo),
             repository: "o/r".into(),
             requester: "alice".into(),
+            automatic_event: false,
             reviewer: None,
             is_reviewer: false,
             human: None,

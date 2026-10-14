@@ -297,7 +297,7 @@ impl KimiWireAgent {
             .process
             .request(
                 "steer",
-                json!({ "user_input": build_follow_up_prompt(request) }),
+                json!({ "user_input": build_follow_up_prompt(request, context) }),
                 deadline,
             )
             .await

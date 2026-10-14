@@ -457,7 +457,7 @@ impl CodexAppServerAgent {
                 json!({
                     "threadId": thread_id,
                     "expectedTurnId": turn_id,
-                    "input": [{ "type": "text", "text": build_follow_up_prompt(request) }],
+                    "input": [{ "type": "text", "text": build_follow_up_prompt(request, context) }],
                 }),
                 deadline,
             )
