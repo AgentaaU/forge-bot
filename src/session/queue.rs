@@ -138,6 +138,8 @@ struct ActiveRun {
 
 /// The agent currently running a conversation, with the context it was given.
 struct RunningAgent {
+    /// Registry name, which can differ from the adapter implementation name.
+    name: String,
     agent: Arc<dyn Agent>,
     context: AgentContext,
 }
@@ -153,13 +155,21 @@ impl<'a> RunningGuard<'a> {
     fn enter(
         running: &'a Mutex<HashMap<String, RunningAgent>>,
         key: String,
+        name: String,
         agent: Arc<dyn Agent>,
         context: AgentContext,
     ) -> Self {
         running
             .lock()
             .expect("running agent mutex poisoned")
-            .insert(key.clone(), RunningAgent { agent, context });
+            .insert(
+                key.clone(),
+                RunningAgent {
+                    name,
+                    agent,
+                    context,
+                },
+            );
         Self { running, key }
     }
 }
@@ -1012,6 +1022,39 @@ impl Inner {
             >= workers
     }
 
+    /// Resolve adapter-owned admin/configuration defaults for this job.
+    fn run_settings(&self, job: &Job, user: &crate::identity::UserRuntime) -> UserAgentSettings {
+        let agent = job
+            .model_agent
+            .clone()
+            .or_else(|| user.agent.clone())
+            .unwrap_or_else(|| self.agents.configured_default_name().to_owned());
+        let configured = job.configured_model_agent.as_ref().unwrap_or(&agent);
+        let overrides = job
+            .user_id
+            .as_deref()
+            .map(|id| {
+                self.sessions
+                    .repository_settings(&job.message.repository, id)
+                    .unwrap_or_else(|| self.sessions.user_settings(id))
+            })
+            .unwrap_or_default();
+        let overrides = if overrides.agent.as_ref() == Some(&agent) {
+            overrides
+        } else {
+            UserAgentSettings::default()
+        };
+        UserAgentSettings {
+            model: overrides.model.or_else(|| {
+                (configured == &agent)
+                    .then(|| user.agent_model.clone())
+                    .flatten()
+            }),
+            effort: overrides.effort,
+            agent: Some(agent),
+        }
+    }
+
     /// Try to deliver `job` into the run already in flight for its
     /// conversation.
     ///
@@ -1026,17 +1069,36 @@ impl Inner {
         let key = job.session_key();
         let running = {
             let agents = self.running.lock().expect("running agent mutex poisoned");
-            agents
-                .get(&key)
-                .map(|running| (running.agent.clone(), running.context.clone()))
+            agents.get(&key).map(|running| {
+                (
+                    running.name.clone(),
+                    running.agent.clone(),
+                    running.context.clone(),
+                )
+            })
         };
-        let Some((agent, mut context)) = running else {
+        let Some((name, agent, mut context)) = running else {
             return false;
         };
 
         if context.explicit_model || context.explicit_effort {
             return false;
         }
+        let Ok(user) = self.user_for(job.user_id.as_deref()) else {
+            return false;
+        };
+        let settings = self.run_settings(job, &user);
+        let (model, effort) = if settings.agent.as_deref() == Some(job.agent.as_str()) {
+            (settings.model, settings.effort)
+        } else {
+            (None, None)
+        };
+        // A live process cannot adopt another adapter or launch settings.
+        // Queue this mention so the next run uses the saved admin choices.
+        if name != job.agent || context.model != model || context.effort != effort {
+            return false;
+        }
+
         let request = AgentRequest {
             location: job.message.location.clone(),
             message: job.mention.message_or_default().to_owned(),
@@ -1170,7 +1232,6 @@ impl Inner {
             .clone()
             .or_else(|| user.agent.clone())
             .unwrap_or_else(|| self.agents.configured_default_name().to_owned());
-        let configured_model_agent = job.configured_model_agent.as_ref().unwrap_or(&model_agent);
         let workspace = match self
             .workspaces
             .prepare(
@@ -1290,22 +1351,7 @@ impl Inner {
         // unclassified reason.
         let mut previous_reason: Option<UnavailableReason> = None;
 
-        // `/admin` overrides win over the configured model and apply only to
-        // the addressed user's own agent, like `agent_model`.
-        let overrides = user_id
-            .as_deref()
-            .map(|id| {
-                self.sessions
-                    .repository_settings(&job.message.repository, id)
-                    .unwrap_or_else(|| self.sessions.user_settings(id))
-            })
-            .unwrap_or_default();
-
-        let overrides = if overrides.agent.as_ref() == Some(&model_agent) {
-            overrides
-        } else {
-            UserAgentSettings::default()
-        };
+        let settings = self.run_settings(&job, &user);
 
         for (index, name) in candidates.iter().enumerate() {
             context.explicit_model = job.mention.model.is_some();
@@ -1313,18 +1359,12 @@ impl Inner {
             // Inline requirements belong to this invocation, including fallback.
             context.model = job.mention.model.clone().or_else(|| {
                 (name == &model_agent)
-                    .then(|| {
-                        overrides.model.clone().or_else(|| {
-                            (name == configured_model_agent)
-                                .then(|| user.agent_model.clone())
-                                .flatten()
-                        })
-                    })
+                    .then(|| settings.model.clone())
                     .flatten()
             });
             context.effort = job.mention.effort.clone().or_else(|| {
                 (name == &model_agent)
-                    .then(|| overrides.effort.clone())
+                    .then(|| settings.effort.clone())
                     .flatten()
             });
             used_agent = name.clone();
@@ -1400,8 +1440,13 @@ impl Inner {
             // Publish the running agent so a same-thread follow-up can be
             // delivered into it while it works. The guard clears the entry
             // when this candidate finishes (including on a fallback).
-            let _running =
-                RunningGuard::enter(&self.running, key.clone(), agent.clone(), context.clone());
+            let _running = RunningGuard::enter(
+                &self.running,
+                key.clone(),
+                name.clone(),
+                agent.clone(),
+                context.clone(),
+            );
 
             // An RPC error can arrive after the adapter has resolved its model.
             // Keep that metadata on this candidate's failure; the next candidate
@@ -2029,6 +2074,7 @@ mod tests {
         dispatcher.inner.running.lock().unwrap().insert(
             "conversation".into(),
             RunningAgent {
+                name: "custom".into(),
                 agent: dispatcher.inner.agents.get("custom").unwrap(),
                 context,
             },
@@ -2095,6 +2141,7 @@ mod tests {
         dispatcher.inner.running.lock().unwrap().insert(
             job.session_key(),
             RunningAgent {
+                name: "codex".into(),
                 agent: dispatcher.inner.agents.get("codex").unwrap(),
                 context,
             },
@@ -2950,8 +2997,8 @@ mod tests {
         assert_eq!(steering.runs(), 1);
 
         let mut settings_job = Job {
-            model_agent: None,
-            configured_model_agent: None,
+            model_agent: Some("steering".into()),
+            configured_model_agent: Some("steering".into()),
             id: Uuid::new_v4(),
             message: message("o/r"),
             mention: crate::mention::extract_mention("@agent --model=inline-model go", "@agent")
@@ -2967,7 +3014,55 @@ mod tests {
         settings_job.mention.effort = Some("high".into());
         assert!(!dispatcher.inner.try_merge_follow_up(&settings_job).await);
         assert!(steering.steers().is_empty());
+        settings_job.mention.effort = None;
+        for repository in ["", "o/r"] {
+            for (model, effort) in [(Some("new-admin-model"), None), (None, Some("high"))] {
+                let settings = UserAgentSettings {
+                    agent: Some("steering".into()),
+                    model: model.map(str::to_owned),
+                    effort: effort.map(str::to_owned),
+                };
+                if repository.is_empty() {
+                    dispatcher.set_user_settings("default", settings).unwrap();
+                } else {
+                    dispatcher
+                        .set_repository_settings(repository, "default", Some(settings))
+                        .unwrap();
+                }
+                assert!(
+                    !dispatcher.inner.try_merge_follow_up(&settings_job).await,
+                    "admin changes must start a new run rather than steer the old process"
+                );
+                if repository.is_empty() {
+                    dispatcher
+                        .set_user_settings("default", UserAgentSettings::default())
+                        .unwrap();
+                } else {
+                    dispatcher
+                        .set_repository_settings(repository, "default", None)
+                        .unwrap();
+                }
+            }
+        }
+        settings_job.agent = "custom".into();
+        assert!(
+            !dispatcher.inner.try_merge_follow_up(&settings_job).await,
+            "an adapter change must not steer the previous adapter"
+        );
+        settings_job.agent = "steering".into();
+        assert!(steering.steers().is_empty());
 
+        dispatcher
+            .set_repository_settings(
+                "other/repo",
+                "default",
+                Some(UserAgentSettings {
+                    agent: Some("steering".into()),
+                    model: Some("unrelated-model".into()),
+                    effort: Some("high".into()),
+                }),
+            )
+            .unwrap();
         let mut follow_up = message("o/r");
         follow_up.author = "other-bot".into();
         // Second mention in the same thread is merged into that run.
@@ -3233,6 +3328,7 @@ mod tests {
         dispatcher.inner.running.lock().unwrap().insert(
             key,
             RunningAgent {
+                name: "plain".into(),
                 agent: plain,
                 context: AgentContext {
                     repository: "o/r".into(),

@@ -414,7 +414,9 @@ model/effort choices use the configured model for that adapter and the adapter's
 effort default. **Use bot defaults** removes the repository override.
 Repository overrides (including adapter-only choices) persist in
 `repository-agent-settings.json` under the session directory. They apply to future
-runs, without changing a running process. The JSON settings endpoint also accepts
+runs, without changing a running process. A follow-up with different agent, model
+or effort settings waits for a new run instead of steering the existing process.
+The JSON settings endpoint also accepts
 `"repository":"owner/repo"`; send `"reset":true` to remove that bot's override.
 
 The **Agent models and effort** table lists every configured agent user (human
