@@ -305,7 +305,33 @@ fn parse_qvalue(value: &str) -> Option<f32> {
 }
 
 /// Operator controls use the same registry as dispatch and fallback selection.
-async fn admin_page(State(state): State<AppState>) -> Html<String> {
+#[derive(Default, serde::Deserialize)]
+struct AdminScope {
+    #[serde(default)]
+    repository: String,
+}
+
+fn valid_repository(repository: &str) -> bool {
+    let parts: Vec<_> = repository.split('/').collect();
+    repository.len() <= 255
+        && parts.len() == 2
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && *part != "."
+                && *part != ".."
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        })
+}
+
+async fn admin_page(
+    State(state): State<AppState>,
+    Query(scope): Query<AdminScope>,
+) -> Result<Html<String>, StatusCode> {
+    if !scope.repository.trim().is_empty() && !valid_repository(scope.repository.trim()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let mut rows = String::new();
     let ranked = state.agents.ordered_names();
     let mut names = ranked.clone();
@@ -347,15 +373,22 @@ async fn admin_page(State(state): State<AppState>) -> Html<String> {
             name = name
         ));
     }
-    let user_rows = agent_user_rows(&state);
+    let repository = scope.repository.trim();
+    let repository = if valid_repository(repository) {
+        repository
+    } else {
+        ""
+    };
+    let user_rows = agent_user_rows(&state, repository);
     let thread_rows = running_thread_rows(&state);
-    Html(format!(
+    Ok(Html(format!(
         include_str!("../web/admin.html"),
         capacity = worker_capacity_summary(&state.dispatcher.capacity()),
         rows = rows,
         user_rows = user_rows,
+        repository = status::escape_html(repository),
         thread_rows = thread_rows
-    ))
+    )))
 }
 
 #[derive(serde::Deserialize)]
@@ -404,6 +437,8 @@ fn worker_capacity_summary(capacity: &crate::session::queue::Capacity) -> String
 #[derive(serde::Deserialize)]
 struct ModelCatalogRequest {
     user: String,
+    #[serde(default)]
+    repository: String,
     /// Preview an adapter without changing the user's saved/runtime settings.
     /// Omitted uses the runtime choice; empty uses configuration.
     agent: Option<String>,
@@ -421,11 +456,21 @@ async fn agent_models(
     else {
         return (StatusCode::BAD_REQUEST, "unknown agent user\n").into_response();
     };
+    if !request.repository.is_empty() && !valid_repository(&request.repository) {
+        return (StatusCode::BAD_REQUEST, "repository must be owner/repo\n").into_response();
+    }
     let name = if let Some(agent) = &request.agent {
         (!agent.is_empty()).then(|| agent.clone())
     } else {
-        state.dispatcher.user_agent(&request.user)
+        state
+            .dispatcher
+            .repository_agent(&request.repository, &request.user)
     }
+    .or_else(|| {
+        (!request.repository.is_empty())
+            .then(|| state.dispatcher.user_agent(&request.user))
+            .flatten()
+    })
     .or_else(|| user.agent.clone())
     .unwrap_or_else(|| state.agents.default_name());
     if state.agents.get(&name).is_err() {
@@ -484,7 +529,7 @@ const MAX_MODEL_LEN: usize = 200;
 /// One row per configured agent user, with its current overrides and the
 /// controls to change them. Human recipients never run an agent, so they are
 /// left out.
-fn agent_user_rows(state: &AppState) -> String {
+fn agent_user_rows(state: &AppState, repository: &str) -> String {
     let mut rows = String::new();
     let reported_models = state.dispatcher.reported_models();
     for (id, user) in &state.config.users {
@@ -493,10 +538,13 @@ fn agent_user_rows(state: &AppState) -> String {
         }
         let agent = state
             .dispatcher
-            .user_agent(id)
+            .repository_agent(repository, id)
             .or_else(|| user.agent.clone())
             .unwrap_or_else(|| state.agents.default_name().to_owned());
-        let settings = state.dispatcher.user_settings(id);
+        let settings = state
+            .dispatcher
+            .repository_settings(repository, id)
+            .unwrap_or_else(|| state.dispatcher.user_settings(id));
         let settings = if settings.agent.as_ref() == Some(&agent) {
             settings
         } else {
@@ -511,9 +559,10 @@ fn agent_user_rows(state: &AppState) -> String {
             include_str!("../web/admin-user-row.html"),
             user = status::escape_html(id),
             agent_options = {
-                let current = state.dispatcher.user_agent(id);
+                let current = state.dispatcher.repository_agent(repository, id);
                 let default_agent = state.agents.default_name();
-                let configured = user.agent.as_deref().unwrap_or(&default_agent);
+                let bot_agent = state.dispatcher.user_agent(id);
+                let configured = if repository.is_empty() { user.agent.as_deref() } else { bot_agent.as_deref().or(user.agent.as_deref()) }.unwrap_or(&default_agent);
                 let mut options = format!(
                     "<option value=\"\"{} data-supports-effort=\"{}\">Configured default ({})</option>",
                     if current.is_none() { " selected" } else { "" },
@@ -679,6 +728,10 @@ async fn terminate_thread(
 #[derive(serde::Deserialize)]
 struct AgentSettingsRequest {
     user: String,
+    #[serde(default)]
+    repository: String,
+    #[serde(default)]
+    reset: bool,
     /// Omitted preserves the runtime choice; empty restores configuration.
     agent: Option<String>,
     /// Empty restores the configured `agent_model`.
@@ -703,6 +756,23 @@ async fn save_agent_settings(
     else {
         return (StatusCode::NOT_FOUND, "unknown agent user\n").into_response();
     };
+    let repository = request.repository.trim();
+    if !repository.is_empty() && !valid_repository(repository) {
+        return (StatusCode::BAD_REQUEST, "repository must be owner/repo\n").into_response();
+    }
+    if request.reset && !repository.is_empty() {
+        return match state
+            .dispatcher
+            .set_repository_settings(repository, &request.user, None)
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to reset settings\n",
+            )
+                .into_response(),
+        };
+    }
     let selected_agent = request.agent.as_deref().filter(|name| !name.is_empty());
     if let Some(agent) = selected_agent
         && state.agents.get(agent).is_err()
@@ -712,8 +782,13 @@ async fn save_agent_settings(
     let effective_agent = if request.agent.is_some() {
         selected_agent.map(str::to_owned)
     } else {
-        state.dispatcher.user_agent(&request.user)
+        state.dispatcher.repository_agent(repository, &request.user)
     }
+    .or_else(|| {
+        (!repository.is_empty())
+            .then(|| state.dispatcher.user_agent(&request.user))
+            .flatten()
+    })
     .or_else(|| user.agent.clone())
     .unwrap_or_else(|| state.agents.default_name());
     let model = request.model.trim();
@@ -747,6 +822,23 @@ async fn save_agent_settings(
         model: (!model.is_empty()).then(|| model.to_owned()),
         effort: (!effort.is_empty()).then(|| effort.to_owned()),
     };
+    if !repository.is_empty() {
+        return match state.dispatcher.set_repository_settings(
+            repository,
+            &request.user,
+            Some(settings),
+        ) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => {
+                tracing::warn!(%error, "failed to save repository settings");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to save repository settings\n",
+                )
+                    .into_response()
+            }
+        };
+    }
     if let Err(error) = state.dispatcher.set_user_settings(&request.user, settings) {
         tracing::warn!(user = %request.user, %error, "failed to save agent settings");
         return (

@@ -4,15 +4,17 @@
 body {{ font: 16px system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }}
 table {{ width: 100%; border-collapse: collapse; }} th, td {{ text-align: left; padding: .8rem; border-bottom: 1px solid #ccc; }}
 button {{ padding: .5rem .8rem; cursor: pointer; }}
-</style></head><body><nav><a href="/status">Status</a> · <a href="/notifications">Notifications</a></nav>
+</style></head><body data-repository="{repository}"><nav><a href="/status">Status</a> · <a href="/notifications">Notifications</a></nav>
 <h1>Agent administration</h1><h2>Remaining capacity</h2><p id="capacity">{capacity}</p><p>Reset a cooldown to make an agent eligible for automatic selection immediately. This does not cancel running jobs.</p>
 <p>Move agents up or down to set automatic selection priority (highest first). Changes apply immediately in memory; restarting restores the configured order. Explicit agent choices take precedence.</p>
 <table id="agent-ranking"><thead><tr><th>Agent</th><th>Availability</th><th>Action</th><th>Priority</th></tr></thead><tbody>{rows}</tbody></table>
 <h2>Running threads</h2><p>Terminate stops the agent run in flight for a thread, and the thread is told so. Mentions already queued for that thread still run afterwards.</p>
 <table><thead><tr><th>Thread</th><th>Agent</th><th>Running since</th><th>Action</th></tr></thead><tbody>{thread_rows}</tbody></table>
-<h2>Agent models and effort</h2><p>Set the agent, model and reasoning effort for an agent user's next runs. The default model choice restores its configured <code>agent_model</code>; the default effort leaves the agent's own choice. Choices load from the agent’s own model catalog for this user (where supported), alongside configured and recently reported models for the same agent; choose Custom model to enter another model ID. Agent changes reset on restart; model and effort changes are saved across restarts and do not affect runs already in progress.</p>
+<h2>Agent models and effort</h2>
+<form method="get" action="/admin"><label>Repository <input name="repository" value="{repository}" placeholder="owner/repo"></label> <button>Choose scope</button> <a href="/admin">Bot-wide settings</a></form>
+<p>Leave repository empty for bot-wide settings. Repository settings apply only to the selected repository and bot user, and persist across restarts. Save creates a complete repository override; Use bot defaults removes it. Explicit mention options take precedence.</p><p>Set the agent, model and reasoning effort for an agent user's next runs. The default model choice restores its configured <code>agent_model</code>; the default effort leaves the agent's own choice. Choices load from the agent’s own model catalog for this user (where supported), alongside configured and recently reported models for the same agent; choose Custom model to enter another model ID. Bot-wide agent changes reset on restart; model and effort changes are saved across restarts and do not affect runs already in progress.</p>
 <table><thead><tr><th>User</th><th>Agent</th><th>Model</th><th>Effort</th><th>Action</th></tr></thead><tbody>{user_rows}</tbody></table>
-<p id="result" role="status" aria-live="polite"></p><p><a href="/admin">Refresh availability</a></p>
+<p id="result" role="status" aria-live="polite"></p><p><a href="/admin?repository={repository}">Refresh availability</a></p>
 <script>
 document.querySelectorAll('button[data-move]').forEach(button => {{
     button.addEventListener('click', async () => {{
@@ -81,6 +83,7 @@ document.querySelectorAll('select[data-model]').forEach(select => {{
                 method: 'POST', headers: {{'Content-Type': 'application/json'}},
                 body: JSON.stringify({{
                     user: row.querySelector('button[data-user]').dataset.user,
+                    repository: document.body.dataset.repository,
                     agent: row.querySelector('select[data-user-agent]').value
                 }})
             }});
@@ -140,6 +143,7 @@ document.querySelectorAll('button[data-user]').forEach(button => {{
                 method: 'POST', headers: {{'Content-Type': 'application/json'}},
                 body: JSON.stringify({{
                     user: button.dataset.user,
+                    repository: document.body.dataset.repository,
                     agent: row.querySelector('select[data-user-agent]').value,
                     model: row.querySelector('select[data-model]').value,
                     effort: row.querySelector('select[data-effort]').value
@@ -148,6 +152,21 @@ document.querySelectorAll('button[data-user]').forEach(button => {{
             if (!response.ok) throw new Error((await response.text()).trim() || 'Save failed (' + response.status + ')');
             window.location.reload();
         }} catch (error) {{ result.textContent = error.message; }}
+        finally {{ button.disabled = false; }}
+    }});
+}});
+document.querySelectorAll('button[data-reset-user]').forEach(button => {{
+    button.hidden = !document.body.dataset.repository;
+    button.addEventListener('click', async () => {{
+        button.disabled = true;
+        try {{
+            const response = await fetch('/admin/agent-settings', {{
+                method: 'POST', headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{user: button.dataset.resetUser, repository: document.body.dataset.repository, reset: true}})
+            }});
+            if (!response.ok) throw new Error('Reset failed (' + response.status + ')');
+            window.location.reload();
+        }} catch (error) {{ document.getElementById('result').textContent = error.message; }}
         finally {{ button.disabled = false; }}
     }});
 }});

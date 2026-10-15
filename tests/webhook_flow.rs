@@ -3532,3 +3532,107 @@ async fn admin_auth_false_allows_access_and_mutation_without_credentials() {
         assert!(h.agents.is_available("custom"));
     }
 }
+
+#[tokio::test]
+async fn admin_repository_settings_are_isolated_persisted_and_resettable() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(dir.path());
+    let post = |app: axum::Router, value: serde_json::Value| async move {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/agent-settings")
+                .header("authorization", "Bearer test-operator-token")
+                .header("content-type", "application/json")
+                .body(Body::from(value.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    };
+    let response = post(h.app.clone(), serde_json::json!({
+        "user": "default", "repository": "owner/project", "agent": "custom", "model": "repo-model"
+    })).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let saved = h
+        .dispatcher
+        .repository_settings("owner/project", "default")
+        .unwrap();
+    assert_eq!(saved.model.as_deref(), Some("repo-model"));
+    assert!(
+        h.dispatcher
+            .repository_settings("other/project", "default")
+            .is_none()
+    );
+    assert!(
+        h.dispatcher
+            .repository_settings("owner/project", "reviewer")
+            .is_none()
+    );
+    assert!(h.dispatcher.user_settings("default").is_empty());
+    let reopened = SessionStore::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.repository_settings("owner/project", "default"),
+        Some(saved)
+    );
+    let response = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin?repository=owner%2Fproject")
+                .header("authorization", "Bearer test-operator-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = body_text(response).await;
+    assert!(html.contains("value=\"owner/project\""));
+    assert!(html.contains("value=\"repo-model\" selected"));
+    for repository in ["../project", "owner/project/extra", "invalid"] {
+        assert_eq!(
+            post(
+                h.app.clone(),
+                serde_json::json!({"user":"default", "repository":repository})
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        post(
+            h.app.clone(),
+            serde_json::json!({"user":"default", "repository":"owner/project", "reset":true})
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        SessionStore::open(dir.path())
+            .unwrap()
+            .repository_settings("owner/project", "default")
+            .is_none()
+    );
+    // Agent-only overrides must also survive a restart.
+    assert_eq!(
+        post(
+            h.app.clone(),
+            serde_json::json!({"user":"default", "repository":"owner/project", "agent":"custom"})
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        SessionStore::open(dir.path())
+            .unwrap()
+            .repository_settings("owner/project", "default")
+            .unwrap()
+            .agent
+            .as_deref(),
+        Some("custom")
+    );
+}

@@ -112,6 +112,7 @@ pub struct SessionStore {
     sessions: Mutex<HashMap<String, Session>>,
     live_output: Mutex<HashMap<Uuid, LiveOutput>>,
     user_settings: Mutex<BTreeMap<String, UserAgentSettings>>,
+    repository_settings: Mutex<BTreeMap<String, UserAgentSettings>>,
 }
 
 /// Read the saved overrides. A missing file means none; an unreadable one is
@@ -154,11 +155,13 @@ impl SessionStore {
         }
 
         let user_settings = load_user_settings(&dir.join(USER_SETTINGS_FILE));
+        let repository_settings = load_user_settings(&dir.join("repository-agent-settings.json"));
         let store = Self {
             dir,
             sessions: Mutex::new(sessions),
             live_output: Mutex::new(HashMap::new()),
             user_settings: Mutex::new(user_settings),
+            repository_settings: Mutex::new(repository_settings),
         };
         // A run can only be executing in the process that started it, so any
         // run persisted without an end time when the store opens is stale.
@@ -453,6 +456,41 @@ impl SessionStore {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(all)?)?;
         std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Repository overrides are isolated by repository and configured user.
+    pub fn repository_settings(&self, repository: &str, user: &str) -> Option<UserAgentSettings> {
+        let key = serde_json::to_string(&(repository, user)).expect("string tuple");
+        self.repository_settings
+            .lock()
+            .expect("repository settings mutex poisoned")
+            .get(&key)
+            .cloned()
+    }
+
+    pub fn set_repository_settings(
+        &self,
+        repository: &str,
+        user: &str,
+        settings: Option<UserAgentSettings>,
+    ) -> Result<()> {
+        let key = serde_json::to_string(&(repository, user)).expect("string tuple");
+        let mut all = self
+            .repository_settings
+            .lock()
+            .expect("repository settings mutex poisoned");
+        let mut next = all.clone();
+        if let Some(settings) = settings {
+            next.insert(key, settings);
+        } else {
+            next.remove(&key);
+        }
+        let path = self.dir.join("repository-agent-settings.json");
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&next)?)?;
+        std::fs::rename(&tmp, &path)?;
+        *all = next;
         Ok(())
     }
 

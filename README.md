@@ -405,6 +405,18 @@ for the thread are not removed and start once the worker frees up. The page uses
 `/status.json`. It returns 404 when the thread is not running, including a run
 that has already produced its outcome, which can no longer be terminated.
 
+Choose a repository (`owner/repo`) in **Agent models and effort** to edit settings
+for each bot in that repository. Leave the repository blank for bot-wide settings.
+Repository overrides take precedence over bot-wide settings; explicit mention
+agent/model/effort options still take precedence for the invocation. Each repository
+save captures the selected adapter, model and effort as a complete override. Empty
+model/effort choices use the configured model for that adapter and the adapter's own
+effort default. **Use bot defaults** removes the repository override.
+Repository overrides (including adapter-only choices) persist in
+`repository-agent-settings.json` under the session directory. They apply to future
+runs, without changing a running process. The JSON settings endpoint also accepts
+`"repository":"owner/repo"`; send `"reset":true` to remove that bot's override.
+
 The **Agent models and effort** table lists every configured agent user (human
 recipients are omitted). For each user an operator can set:
 

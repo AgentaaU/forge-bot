@@ -332,13 +332,17 @@ impl Dispatcher {
         agent_name: &str,
     ) -> Result<Uuid> {
         let user = self.inner.recipient_for(&message);
-        let override_agent = self.user_agent(&user.id);
-        let agent_name =
-            if !is_auto_trigger(&message) && mention.agent.as_deref().is_none_or(str::is_empty) {
-                override_agent.as_deref().unwrap_or(agent_name)
-            } else {
-                agent_name
-            };
+        let override_agent = self.repository_agent(&message.repository, &user.id);
+        let agent_name = if mention.agent.as_deref().is_none_or(str::is_empty)
+            && (!is_auto_trigger(&message)
+                || self
+                    .repository_settings(&message.repository, &user.id)
+                    .is_some())
+        {
+            override_agent.as_deref().unwrap_or(agent_name)
+        } else {
+            agent_name
+        };
         // Resolve eagerly so an unknown agent fails before we persist a job.
         // A typo in `--agent=` is a caller error, not something to swallow, so
         // report it in the thread with the registered names.
@@ -520,7 +524,7 @@ impl Dispatcher {
             .agent
             .clone()
             .filter(|name| !name.is_empty())
-            .or_else(|| self.user_agent(&recipient.id))
+            .or_else(|| self.repository_agent(&message.repository, &recipient.id))
             .or_else(|| recipient.agent.clone())
             .unwrap_or_else(|| self.inner.agents.default_name().to_owned());
         Ok(Some((mention, agent)))
@@ -679,6 +683,27 @@ impl Dispatcher {
     /// Operator overrides (model, effort) for an agent user, set from `/admin`.
     pub fn user_settings(&self, user_id: &str) -> UserAgentSettings {
         self.inner.sessions.user_settings(user_id)
+    }
+
+    pub fn repository_settings(&self, repository: &str, user: &str) -> Option<UserAgentSettings> {
+        self.inner.sessions.repository_settings(repository, user)
+    }
+
+    pub fn set_repository_settings(
+        &self,
+        repository: &str,
+        user: &str,
+        settings: Option<UserAgentSettings>,
+    ) -> Result<()> {
+        self.inner
+            .sessions
+            .set_repository_settings(repository, user, settings)
+    }
+
+    pub fn repository_agent(&self, repository: &str, user: &str) -> Option<String> {
+        self.repository_settings(repository, user)
+            .and_then(|settings| settings.agent)
+            .or_else(|| self.user_agent(user))
     }
 
     /// Runtime adapter override for a configured user.
@@ -1269,7 +1294,11 @@ impl Inner {
         // the addressed user's own agent, like `agent_model`.
         let overrides = user_id
             .as_deref()
-            .map(|id| self.sessions.user_settings(id))
+            .map(|id| {
+                self.sessions
+                    .repository_settings(&job.message.repository, id)
+                    .unwrap_or_else(|| self.sessions.user_settings(id))
+            })
             .unwrap_or_default();
 
         let overrides = if overrides.agent.as_ref() == Some(&model_agent) {
@@ -2174,6 +2203,36 @@ mod tests {
         let mut ignored = message("o/r");
         ignored.body = "no mention".into();
         assert!(dispatcher.route(&ignored).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn repository_agent_selection_is_scoped_and_mentions_take_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = dispatcher_for(explicit_config(dir.path()), dir.path());
+        dispatcher.set_user_agent("shylock-bot", Some("claude".into()));
+        dispatcher
+            .set_repository_settings(
+                "o/r",
+                "shylock-bot",
+                Some(UserAgentSettings {
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let mut msg = message("o/r");
+        msg.body = "@shylock-bot go".into();
+        assert_eq!(dispatcher.route(&msg).unwrap().unwrap().1, "codex");
+        msg.repository = "o/other".into();
+        assert_eq!(dispatcher.route(&msg).unwrap().unwrap().1, "claude");
+        msg.repository = "o/r".into();
+        msg.body = "@shylock-bot --agent=custom go".into();
+        assert_eq!(dispatcher.route(&msg).unwrap().unwrap().1, "custom");
+        msg.body = "@shylock-reviewer go".into();
+        assert_eq!(
+            dispatcher.route(&msg).unwrap().unwrap().1,
+            dispatcher.default_agent_name()
+        );
     }
 
     #[tokio::test]
@@ -4153,6 +4212,57 @@ mod tests {
                 ],
                 "supports_effort = {supports_effort}"
             );
+
+            // Repository settings win only for this repository and user.
+            dispatcher
+                .set_repository_settings(
+                    "o/r",
+                    "default",
+                    Some(UserAgentSettings {
+                        agent: Some("alternate".into()),
+                        model: Some("repository-model".into()),
+                        effort: Some("medium".into()),
+                    }),
+                )
+                .unwrap();
+            submit(dispatcher.clone()).await;
+            wait_for_drain(&sessions).await;
+            assert_eq!(
+                alternate.seen.lock().unwrap().last().unwrap(),
+                &(Some("repository-model".into()), Some("medium".into()))
+            );
+            assert!(
+                dispatcher
+                    .repository_settings("o/other", "default")
+                    .is_none()
+            );
+            let mut scoped_message = message("o/r");
+            scoped_message.body =
+                "@agent --agent=recorder --model=explicit-model --effort=high go".into();
+            dispatcher
+                .submit(
+                    scoped_message,
+                    Mention {
+                        agent: Some("recorder".into()),
+                        model: Some("explicit-model".into()),
+                        effort: supports_effort.then(|| "high".into()),
+                        message: "go".into(),
+                    },
+                    "recorder",
+                )
+                .await
+                .unwrap();
+            wait_for_drain(&sessions).await;
+            assert_eq!(
+                recorder.seen.lock().unwrap().last().unwrap(),
+                &(
+                    Some("explicit-model".into()),
+                    supports_effort.then(|| "high".into())
+                )
+            );
+            dispatcher
+                .set_repository_settings("o/r", "default", None)
+                .unwrap();
 
             // Persist a pending job accepted for the configured adapter before
             // the admin switches adapters and saves new provider settings.
