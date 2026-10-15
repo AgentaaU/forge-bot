@@ -74,6 +74,33 @@ document.querySelectorAll('button[data-key]').forEach(button => {{
 document.querySelectorAll('select[data-model]').forEach(select => {{
     const row = select.closest('tr');
     const catalogStatus = row.querySelector('[data-model-status]');
+    let options = Array.from(select.options);
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.placeholder = 'Search models…';
+    search.setAttribute('aria-label', 'Search ' + select.getAttribute('aria-label').toLowerCase());
+    search.hidden = true;
+    select.before(search);
+    const searchStatus = document.createElement('small');
+    searchStatus.setAttribute('role', 'status');
+    select.after(searchStatus);
+    const isModel = option => option.value !== '' && !option.hasAttribute('data-custom-model');
+    const filterModels = () => {{
+        const selected = select.value;
+        const query = search.value.trim().toLowerCase();
+        const matches = options.filter(option => isModel(option) && option.textContent.toLowerCase().includes(query));
+        // Retain the saved choice even when it does not match the query.
+        select.replaceChildren(...options.filter(option => !isModel(option) || option.value === selected || matches.includes(option)));
+        select.value = selected;
+        searchStatus.textContent = query && !matches.length ? ' No matching models.' : '';
+    }};
+    const updateSearch = () => {{
+        search.hidden = options.filter(isModel).length <= 10;
+        if (search.hidden) search.value = '';
+        filterModels();
+    }};
+    search.addEventListener('input', filterModels);
+    updateSearch();
     let discovery = 0;
     const loadModels = async () => {{
         const current = ++discovery;
@@ -93,11 +120,14 @@ document.querySelectorAll('select[data-model]').forEach(select => {{
             if (current !== discovery) return;
             const selected = select.value;
             for (const model of catalog.models) {{
-                if (!Array.from(select.options).some(option => !option.hasAttribute('data-custom-model') && option.value === model)) {{
-                    select.add(new Option(model, model), select.querySelector('[data-custom-model]'));
+                if (!options.some(option => !option.hasAttribute('data-custom-model') && option.value === model)) {{
+                    options.splice(options.length - 1, 0, new Option(model, model));
                 }}
             }}
+            // Restore the complete menu before applying the current search.
+            select.replaceChildren(...options);
             select.value = selected;
+            updateSearch();
             catalogStatus.textContent = catalog.supported ? '' : ' This agent does not expose a model catalog.';
         }} catch (error) {{
             if (current === discovery) catalogStatus.textContent = error.message;
@@ -107,6 +137,9 @@ document.querySelectorAll('select[data-model]').forEach(select => {{
     let previous = select.value;
     row.querySelector('select[data-user-agent]').addEventListener('change', () => {{
         select.innerHTML = '<option value="">Agent default</option><option data-custom-model>Custom model…</option>';
+        options = Array.from(select.options);
+        search.value = '';
+        updateSearch();
         previous = '';
         loadModels();
     }});
@@ -115,14 +148,16 @@ document.querySelectorAll('select[data-model]').forEach(select => {{
             const model = window.prompt('Enter the model ID accepted by this agent:');
             if (!model || !model.trim()) {{ select.value = previous; return; }}
             const value = model.trim();
-            let option = Array.from(select.options).find(option => !option.hasAttribute('data-custom-model') && option.value === value);
+            let option = options.find(option => !option.hasAttribute('data-custom-model') && option.value === value);
             if (!option) {{
                 option = new Option(value, value);
-                select.add(option, select.querySelector('[data-custom-model]'));
+                options.splice(options.length - 1, 0, option);
             }}
+            select.replaceChildren(...options);
             select.value = value;
         }}
         previous = select.value;
+        updateSearch();
     }});
 }});
 document.querySelectorAll('select[data-user-agent]').forEach(select => {{
