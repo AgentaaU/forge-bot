@@ -64,6 +64,8 @@ pub struct ThreadStatus {
     pub state: ThreadState,
     /// Agent currently running, next to run, or the one that ran last.
     pub agent: String,
+    /// Forge account working on this conversation, when known.
+    pub worker: Option<String>,
     /// Model reported by the active or most recent run, if known.
     pub model: Option<String>,
     /// Effective reasoning effort of the active or most recent run, if known.
@@ -123,6 +125,7 @@ pub fn snapshot(sessions: Vec<Session>, pending: Vec<Job>) -> Vec<ThreadStatus> 
             thread_type: thread_type(first.message.is_pull_request).to_owned(),
             state: ThreadState::Queued,
             agent: first.agent.clone(),
+            worker: first.user_id.clone(),
             model: None,
             effort: None,
             cache: None,
@@ -175,6 +178,11 @@ fn from_session(session: Session, waiting: Vec<Job>) -> ThreadStatus {
     let queued = waiting.len().saturating_sub(usize::from(running.is_some()));
 
     ThreadStatus {
+        worker: session
+            .key
+            .strip_prefix("user:")
+            .and_then(|rest| rest.split_once(':'))
+            .map(|(user, _)| user.to_owned()),
         key: session.key,
         repository: session.repository,
         location: session.location,
@@ -459,6 +467,11 @@ fn render_row(thread: &ThreadStatus, now: DateTime<Utc>) -> String {
     format!(
         include_str!("../../web/status-row.html"),
         agent = agent,
+        worker = thread
+            .worker
+            .as_deref()
+            .map(escape_html)
+            .unwrap_or_else(|| "—".to_owned()),
         details_url = details_url,
         last = last,
         thread_cell = thread_cell,
@@ -811,6 +824,32 @@ mod tests {
     }
 
     #[test]
+    fn worker_is_preserved_for_each_users_sessions_and_queued_jobs() {
+        for runs in [vec![running()], vec![finished(true)], vec![]] {
+            let threads = snapshot(
+                vec![session("user:reviewer:forgejo:owner/repo:issue:1", runs)],
+                vec![],
+            );
+            assert_eq!(threads[0].worker.as_deref(), Some("reviewer"));
+            assert_eq!(
+                serde_json::to_value(&threads[0]).unwrap()["worker"],
+                "reviewer"
+            );
+            assert!(render_html(&threads, None).contains("<td>reviewer</td>"));
+        }
+        let mut queued = job(1, false, "codex");
+        queued.user_id = Some("other-bot".into());
+        let threads = snapshot(vec![], vec![queued]);
+        assert_eq!(threads[0].worker.as_deref(), Some("other-bot"));
+        let legacy = snapshot(vec![session("forgejo:owner/repo:issue:1", vec![])], vec![]);
+        assert!(legacy[0].worker.is_none());
+        let html = render_html(&legacy, None);
+        assert!(html.contains("<th>Worker</th>"));
+        assert!(html.contains("<td>—</td>"));
+        assert!(render_html(&[], None).contains("colspan=\"12\""));
+    }
+
+    #[test]
     fn active_threads_sort_before_idle_ones() {
         let running_key = "forgejo:owner/repo:issue:1";
         let idle_key = "forgejo:owner/repo:issue:2";
@@ -942,6 +981,7 @@ mod tests {
             thread_type: "issue".into(),
             state: ThreadState::Idle,
             agent: "<img src=x>".into(),
+            worker: Some("<script>worker</script>".into()),
             model: Some("<script>model</script>".into()),
             effort: Some("<script>effort</script>".into()),
             cache: None,
@@ -961,6 +1001,7 @@ mod tests {
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("&lt;script&gt;model&lt;/script&gt;"));
         assert!(html.contains("&lt;script&gt;effort&lt;/script&gt;"));
+        assert!(html.contains("&lt;script&gt;worker&lt;/script&gt;"));
         assert!(html.contains("&quot; onmouseover=&quot;"));
         assert!(html.contains("❌"));
     }

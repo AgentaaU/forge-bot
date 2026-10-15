@@ -556,6 +556,24 @@ impl Dispatcher {
         let sessions = self.inner.sessions.list();
         let pending = self.inner.sessions.pending_jobs()?;
         let mut threads = status::snapshot(sessions, pending);
+        for thread in &mut threads {
+            if let Some(user_id) = thread.worker.as_deref() {
+                if let Some(user) = self.inner.config.users.get(user_id) {
+                    thread.worker = Some(self.inner.config.effective_login(user_id, user.role));
+                }
+            } else {
+                thread.worker = self
+                    .inner
+                    .config
+                    .forges
+                    .forgejo
+                    .as_ref()
+                    .and_then(|forgejo| forgejo.bot_username.as_deref())
+                    .map(str::trim)
+                    .filter(|login| !login.is_empty())
+                    .map(str::to_owned);
+            }
+        }
         // Locations built from the internal API base (auto-triggers) must link
         // to the public web UI when the two differ.
         if let Some(forgejo) = self.inner.config.forges.forgejo.as_ref() {
@@ -2014,6 +2032,35 @@ mod tests {
             waiting: false,
         };
         dispatcher.inner.sessions.begin(&job).unwrap();
+        assert_eq!(
+            dispatcher.threads().unwrap()[0].worker.as_deref(),
+            Some("agent")
+        );
+        let mut scoped = job.clone();
+        scoped.user_id = Some("default".into());
+        dispatcher.inner.sessions.begin(&scoped).unwrap();
+        let mut reviewer = job.clone();
+        reviewer.user_id = Some("removed-reviewer".into());
+        dispatcher.inner.sessions.begin(&reviewer).unwrap();
+        let threads = dispatcher.threads().unwrap();
+        assert_eq!(
+            threads
+                .iter()
+                .find(|thread| thread.key == scoped.session_key())
+                .unwrap()
+                .worker
+                .as_deref(),
+            Some("agent")
+        );
+        assert_eq!(
+            threads
+                .iter()
+                .find(|thread| thread.key == reviewer.session_key())
+                .unwrap()
+                .worker
+                .as_deref(),
+            Some("removed-reviewer")
+        );
         let context = AgentContext::default();
         *context.reported_effort.lock().unwrap() = Some("high".into());
         dispatcher.inner.running.lock().unwrap().insert(
@@ -2024,7 +2071,14 @@ mod tests {
             },
         );
         assert_eq!(
-            dispatcher.threads().unwrap()[0].effort.as_deref(),
+            dispatcher
+                .threads()
+                .unwrap()
+                .iter()
+                .find(|thread| thread.key == job.session_key())
+                .unwrap()
+                .effort
+                .as_deref(),
             Some("high")
         );
     }
