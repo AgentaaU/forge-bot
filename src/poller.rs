@@ -29,6 +29,10 @@ struct Cursor {
     last_time: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     seen_reviews: HashMap<i64, String>,
+    // Durable IDs: a later dismissal can update an already submitted review
+    // and make its old inline comments appear recent again.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    seen_review_comments: HashMap<i64, String>,
 }
 
 /// Cached list of repositories to poll.
@@ -348,6 +352,37 @@ impl Poller {
                     continue;
                 };
                 let updated = normalize_time(updated);
+                // Thread replies are absent from the issue-comment API and may
+                // arrive without changing the parent review timestamp. Always
+                // inspect submitted reviews, even when their body was seen.
+                let comments_url = format!("{url}/{id}/comments");
+                let comments = self
+                    .fetch_pages(&comments_url, token, &[])
+                    .await?
+                    .ok_or_else(|| {
+                        BotError::ForgeApi("review comments query is inaccessible".into())
+                    })?;
+                for comment in comments {
+                    let (Some(comment_id), Some(created)) =
+                        (comment["id"].as_i64(), comment["created_at"].as_str())
+                    else {
+                        continue;
+                    };
+                    // Pending review drafts keep their creation time when
+                    // submitted. The parent's update makes them newly visible;
+                    // dedupe IDs remain durable across later parent updates.
+                    let visible_at = normalize_time(created).max(updated.clone());
+                    if visible_at < since || cursor.seen_review_comments.contains_key(&comment_id) {
+                        continue;
+                    }
+                    if let Some(message) =
+                        message_from_review_comment(repo, &pull, &review, &comment)
+                    {
+                        self.dispatch_message(message).await;
+                    }
+                    cursor.seen_review_comments.insert(comment_id, visible_at);
+                    self.set_cursor(&key, cursor.clone());
+                }
                 // Forgejo submitted_at is the creation time, even after a pending
                 // review is submitted. Its updated_at tracks that transition.
                 if updated < since
@@ -511,6 +546,24 @@ fn message_from_comment(repo: &str, comment: &Value) -> Option<ForgeMessage> {
         title: None,
         reply_target: Default::default(),
     })
+}
+
+/// Preserve the individual author, comment ID and inline reply coordinates.
+fn message_from_review_comment(
+    repo: &str,
+    pull: &Value,
+    review: &Value,
+    comment: &Value,
+) -> Option<ForgeMessage> {
+    let mut message = message_from_review(repo, pull, review)?;
+    message.body = comment["body"].as_str()?.to_owned();
+    message.author = comment["user"]["login"].as_str()?.to_owned();
+    message.location = Url::parse(comment["html_url"].as_str()?).ok()?;
+    message.comment_id = Some(comment["id"].as_i64()?);
+    message.event = "issue_comment".into();
+    message.reply_target =
+        crate::forge::forgejo::review_reply_target_with_id(comment, review["id"].as_i64())?;
+    Some(message)
 }
 
 /// Reviews have their own IDs; do not use them as issue-comment IDs.
@@ -702,7 +755,10 @@ mod tests {
                     .into_response(),
             };
         }
-        if path.ends_with("/issues") || path.ends_with("/reviews") {
+        if path.ends_with("/issues")
+            || path.ends_with("/reviews")
+            || path.ends_with("/comments") && path.contains("/reviews/")
+        {
             return axum::response::Json(json!([])).into_response();
         }
 
@@ -839,6 +895,283 @@ mod tests {
             "user": {"login": "shylock-reviewer"},
             "html_url": format!("http://forge.local:3000/o/r/pulls/159#issuecomment-{}", id + 13000)
         })
+    }
+
+    #[tokio::test]
+    async fn polls_new_inline_replies_on_seen_reviews() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(MockState::default());
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let old = "2026-01-01T00:00:00Z";
+        let review_url = "/api/v1/repos/o/r/pulls/159/reviews/1111/comments";
+        let mut parent = review(1111, "COMMENT", old);
+        parent["body"] = json!("");
+        state.pages.lock().unwrap().extend([
+            (
+                "/api/v1/repos/o/r/issues?page=1".into(),
+                MockReply::Json(json!([{"number":159, "title":"inline reply", "body":""}])),
+            ),
+            (
+                "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+                MockReply::Json(json!([parent])),
+            ),
+            (format!("{review_url}?page=1"), MockReply::Json(json!([]))),
+        ]);
+        let base = start_mock(state.clone()).await;
+        let mut config = test_config(dir.path(), &base);
+        config.poller.repositories = vec!["o/r".into()];
+        config.poller.page_limit = 1;
+        let (poller, sessions) = build_poller(config.clone());
+        poller.tick().await.unwrap();
+        assert!(sessions.pending_jobs().unwrap().is_empty());
+
+        // A peer's handoff appears later on the same, unchanged review.
+        let inline = json!({
+            "id":20724, "body":"@shylock-bot review the current head",
+            "user":{"login":"peer-agent"}, "created_at":now,
+            "html_url":"http://forge.local/o/r/pulls/159#issuecomment-20724",
+            "path":"src/lib.rs", "position":44, "pull_request_review_id":1111
+        });
+        let message = message_from_review_comment(
+            "o/r",
+            &json!({"number":159}),
+            &review(1111, "COMMENT", old),
+            &inline,
+        )
+        .unwrap();
+        assert_eq!(message.author, "peer-agent");
+        assert_eq!(message.comment_id, Some(20724));
+        assert_eq!(message.number, Some(159));
+        assert!(
+            matches!(message.reply_target, crate::forge::ReplyTarget::ReviewComment(target)
+            if target.review_id == 1111 && target.path == "src/lib.rs" && target.line == 44)
+        );
+        state.pages.lock().unwrap().insert(
+            format!("{review_url}?page=1"),
+            MockReply::Json(json!([inline])),
+        );
+        poller.tick().await.unwrap();
+        for _ in 0..200 {
+            if sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .is_some_and(|s| s.runs.len() == 1 && s.runs[0].success == Some(true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let session = sessions.get("user:default:forgejo:o/r:pr:159").unwrap();
+        assert_eq!(session.runs.len(), 1);
+        assert_eq!(session.runs[0].success, Some(true));
+        assert!(
+            session.runs[0]
+                .summary
+                .as_deref()
+                .unwrap()
+                .contains("review the current head")
+        );
+        assert!(
+            state
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("/reviews/1111/comments?limit=1&page=2"))
+        );
+        let restarted = Poller::new(Arc::new(config), poller.dispatcher.clone()).unwrap();
+        restarted.tick().await.unwrap();
+        assert!(sessions.pending_jobs().unwrap().is_empty());
+        assert_eq!(
+            sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .unwrap()
+                .runs
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_drafts_dispatch_once_after_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(MockState::default());
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let old =
+            (Utc::now() - chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let review_url = "/api/v1/repos/o/r/pulls/159/reviews/1111/comments";
+        let mut parent = review(1111, "PENDING", &old);
+        parent["body"] = json!("");
+        state.pages.lock().unwrap().extend([
+            (
+                "/api/v1/repos/o/r/issues?page=1".into(),
+                MockReply::Json(json!([{"number":159, "title":"inline reply", "body":""}])),
+            ),
+            (
+                "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+                MockReply::Json(json!([parent.clone()])),
+            ),
+            (format!("{review_url}?page=1"), MockReply::Json(json!([]))),
+        ]);
+        let base = start_mock(state.clone()).await;
+        let mut config = test_config(dir.path(), &base);
+        config.poller.repositories = vec!["o/r".into()];
+        config.poller.page_limit = 1;
+        let (poller, sessions) = build_poller(config.clone());
+        // Drafting does not reset the inline comment's creation timestamp.
+        let inline = json!({
+            "id":20724, "body":"@shylock-bot review the current head",
+            "user":{"login":"peer-agent"}, "created_at":old,
+            "html_url":"http://forge.local/o/r/pulls/159#issuecomment-20724",
+            "path":"src/lib.rs", "position":44, "pull_request_review_id":1111
+        });
+        state.pages.lock().unwrap().insert(
+            format!("{review_url}?page=1"),
+            MockReply::Json(json!([inline])),
+        );
+        poller.tick().await.unwrap();
+        assert!(sessions.get("user:default:forgejo:o/r:pr:159").is_none());
+        assert!(poller.cursor("o/r:reviews").last_time.is_some());
+        parent["state"] = json!("COMMENT");
+        parent["updated_at"] = json!(now);
+        state.pages.lock().unwrap().insert(
+            "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+            MockReply::Json(json!([parent])),
+        );
+        poller.tick().await.unwrap();
+        assert_eq!(
+            poller
+                .cursor("o/r:reviews")
+                .seen_review_comments
+                .get(&20724),
+            Some(&now)
+        );
+        for _ in 0..200 {
+            if sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .is_some_and(|s| s.runs.len() == 1 && s.runs[0].success == Some(true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let session = sessions.get("user:default:forgejo:o/r:pr:159").unwrap();
+        assert_eq!(session.runs.len(), 1);
+        assert_eq!(session.runs[0].success, Some(true));
+        assert!(
+            session.runs[0]
+                .summary
+                .as_deref()
+                .unwrap()
+                .contains("review the current head")
+        );
+        assert!(
+            state
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("/reviews/1111/comments?limit=1&page=2"))
+        );
+        poller.tick().await.unwrap();
+        let restarted = Poller::new(Arc::new(config), poller.dispatcher.clone()).unwrap();
+        restarted.tick().await.unwrap();
+        assert!(sessions.pending_jobs().unwrap().is_empty());
+        assert_eq!(
+            sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .unwrap()
+                .runs
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dismissed_review_does_not_replay_inline_mentions_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(MockState::default());
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let old =
+            (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let review_url = "/api/v1/repos/o/r/pulls/159/reviews/1111/comments";
+        let mut parent = review(1111, "APPROVED", &old);
+        parent["body"] = json!("");
+        state.pages.lock().unwrap().extend([
+            (
+                "/api/v1/repos/o/r/issues?page=1".into(),
+                MockReply::Json(json!([{"number":159, "title":"inline reply", "body":""}])),
+            ),
+            (
+                "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+                MockReply::Json(json!([parent.clone()])),
+            ),
+            (format!("{review_url}?page=1"), MockReply::Json(json!([]))),
+        ]);
+        let base = start_mock(state.clone()).await;
+        let mut config = test_config(dir.path(), &base);
+        config.poller.repositories = vec!["o/r".into()];
+        config.poller.page_limit = 1;
+        let (poller, sessions) = build_poller(config.clone());
+        // Drafting does not reset the inline comment's creation timestamp.
+        let inline = json!({
+            "id":20724, "body":"@shylock-bot review the current head",
+            "user":{"login":"peer-agent"}, "created_at":old,
+            "html_url":"http://forge.local/o/r/pulls/159#issuecomment-20724",
+            "path":"src/lib.rs", "position":44, "pull_request_review_id":1111
+        });
+        state.pages.lock().unwrap().insert(
+            format!("{review_url}?page=1"),
+            MockReply::Json(json!([inline])),
+        );
+        poller.tick().await.unwrap();
+        for _ in 0..200 {
+            if sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .is_some_and(|s| s.runs.len() == 1 && s.runs[0].success == Some(true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let session = sessions.get("user:default:forgejo:o/r:pr:159").unwrap();
+        assert_eq!(session.runs.len(), 1);
+        assert_eq!(session.runs[0].success, Some(true));
+        assert!(
+            session.runs[0]
+                .summary
+                .as_deref()
+                .unwrap()
+                .contains("review the current head")
+        );
+        assert!(
+            state
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("/reviews/1111/comments?limit=1&page=2"))
+        );
+        // The comment is older than the overlap. Its ID must survive
+        // pruning and restart before a dismissal changes the parent timestamp.
+        let restarted = Poller::new(Arc::new(config), poller.dispatcher.clone()).unwrap();
+        parent["dismissed"] = json!(true);
+        parent["updated_at"] = json!(now);
+        state.pages.lock().unwrap().insert(
+            "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+            MockReply::Json(json!([parent])),
+        );
+        restarted.tick().await.unwrap();
+        restarted.tick().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(sessions.pending_jobs().unwrap().is_empty());
+        assert_eq!(
+            sessions
+                .get("user:default:forgejo:o/r:pr:159")
+                .unwrap()
+                .runs
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1033,6 +1366,36 @@ mod tests {
             ),
             (
                 "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+                MockReply::Status(500),
+            ),
+        ]);
+        let base = start_mock(state).await;
+        let (poller, _) = build_poller(test_config(dir.path(), &base));
+        assert!(
+            poller
+                .poll_reviews(&base, Some("tok"), "o/r")
+                .await
+                .is_err()
+        );
+        assert!(poller.cursor("o/r:reviews").last_time.is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_comment_api_failure_keeps_cursor_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(MockState::default());
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        state.pages.lock().unwrap().extend([
+            (
+                "/api/v1/repos/o/r/issues?page=1".into(),
+                MockReply::Json(json!([{"number":159}])),
+            ),
+            (
+                "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
+                MockReply::Json(json!([review(1111, "COMMENT", &now)])),
+            ),
+            (
+                "/api/v1/repos/o/r/pulls/159/reviews/1111/comments?page=1".into(),
                 MockReply::Status(500),
             ),
         ]);

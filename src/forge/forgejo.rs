@@ -412,7 +412,10 @@ fn review_reply_target(comment: &Value) -> Option<ReplyTarget> {
 
 /// Like [`review_reply_target`], but with an explicit review id so a caller can
 /// fall back to the enclosing review when the comment omits it.
-fn review_reply_target_with_id(comment: &Value, review_id: Option<i64>) -> Option<ReplyTarget> {
+pub(crate) fn review_reply_target_with_id(
+    comment: &Value,
+    review_id: Option<i64>,
+) -> Option<ReplyTarget> {
     let review_id = review_id?;
     let path = comment.get("path")?.as_str()?.to_owned();
     let new_position = comment.get("position").and_then(Value::as_i64).unwrap_or(0);
