@@ -36,7 +36,7 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
     prompt.push_str(request.message.trim());
     prompt.push('\n');
 
-    if !context.automatic_event && !context.requester.is_empty() {
+    if !context.is_reviewer && !context.automatic_event && !context.requester.is_empty() {
         prompt.push_str(&format!(
             "\nReply to the caller (@{}) when reporting results or asking for task changes. \
              Mention only the caller in that reply, even when the caller is an agent.\n",
@@ -71,7 +71,9 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
              If changes are needed, post an actionable comment mentioning only {caller_mention}, asking them to fix the findings and mention you again after updating. \
              When the review is OK, rebase the branch onto the current base and squash it to one commit, \
              verify the final diff and checks, then approve the final head and enable auto-merge using fast-forward only. \
-             Do not approve or enable auto-merge while findings or checks remain unresolved.\n",
+             Do not approve or enable auto-merge while findings or checks remain unresolved. \
+             When approving, do not mention the caller or any other user in the review body or completion comment; \
+             report approval and validation results without mentions to avoid invoking another agent.\n",
         ));
     } else if let Some(reviewer) = &context.reviewer {
         prompt.push_str(&format!(
@@ -123,7 +125,17 @@ pub(super) fn build_follow_up_prompt(request: &AgentRequest, context: &AgentCont
         "A follow-up {origin} arrived in this thread while you were working. Treat it \
          as a continuation of the same task and act on it before you finish.\n\n"
     );
-    if !context.automatic_event {
+    if context.is_reviewer {
+        prompt.push_str("When approving, do not mention the caller or any other user in the review body or completion comment; \
+            report approval and validation results without mentions to avoid invoking another agent.\n\n");
+        if context.automatic_event {
+            prompt.push_str("If changes are needed, mention only the PR submitter and ask them to fix the findings and mention you again after updating.\n\n");
+        } else if context.requester.is_empty() {
+            prompt.push_str("If changes are needed, mention only the author of this follow-up comment (read their login from the follow-up location) and ask them to fix the findings and mention you again after updating.\n\n");
+        } else {
+            prompt.push_str(&format!("If changes are needed, mention only @{} and ask them to fix the findings and mention you again after updating.\n\n", context.requester));
+        }
+    } else if !context.automatic_event {
         if context.requester.is_empty() {
             prompt.push_str("Reply to the author of this follow-up comment when reporting its results or asking for task changes. \
                 Read their login from the forge comment at the follow-up location and mention only them, even if they are an agent.\n\n");
@@ -235,10 +247,40 @@ mod tests {
         context.pull_request_author = Some("submitter-bot".into());
         let prompt = build_prompt(&request, &context);
         assert!(prompt.contains("mentioning only '@caller-bot'"));
-        assert!(prompt.contains("Reply to the caller (@caller-bot)"));
+        assert!(!prompt.contains("Reply to the caller"));
+        assert!(prompt.contains("When approving, do not mention the caller or any other user"));
         assert!(prompt.contains("mentioning only @alice and say exactly what you need"));
         assert!(!prompt.contains("read it from the forge PR author"));
         assert!(!prompt.contains("mentioning only '@submitter-bot'"));
+    }
+
+    #[test]
+    fn reviewer_approval_avoids_mentions_for_initial_and_follow_up_prompts() {
+        for automatic in [false, true] {
+            for requester in ["caller-bot", ""] {
+                let (request, mut context) = sample();
+                context.is_reviewer = true;
+                context.automatic_event = automatic;
+                context.requester = requester.into();
+                for prompt in [
+                    build_prompt(&request, &context),
+                    build_follow_up_prompt(&request, &context),
+                ] {
+                    assert!(prompt.contains("When approving, do not mention the caller or any other user in the review body or completion comment"));
+                    assert!(prompt.contains("If changes are needed"));
+                    assert!(!prompt.contains("Reply to the caller"));
+                    assert!(!prompt.contains("Reply to the author"));
+                }
+                let follow_up = build_follow_up_prompt(&request, &context);
+                if automatic {
+                    assert!(follow_up.contains("mention only the PR submitter"));
+                } else if requester.is_empty() {
+                    assert!(follow_up.contains("read their login from the follow-up location"));
+                } else {
+                    assert!(follow_up.contains("mention only @caller-bot"));
+                }
+            }
+        }
     }
 
     #[test]
