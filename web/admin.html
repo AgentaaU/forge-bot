@@ -4,6 +4,7 @@
 body {{ font: 16px system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }}
 table {{ width: 100%; border-collapse: collapse; }} th, td {{ text-align: left; padding: .8rem; border-bottom: 1px solid #ccc; }}
 button {{ padding: .5rem .8rem; cursor: pointer; }}
+[data-save-status] {{ display: block; margin-top: .4rem; }}
 </style></head><body data-repository="{repository}"><nav><a href="/status">Status</a> · <a href="/notifications">Notifications</a></nav>
 <h1>Agent administration</h1><h2>Remaining capacity</h2><p id="capacity">{capacity}</p><p>Reset a cooldown to make an agent eligible for automatic selection immediately. This does not cancel running jobs.</p>
 <p>Move agents up or down to set automatic selection priority (highest first). Changes apply immediately in memory; restarting restores the configured order. Explicit agent choices take precedence.</p>
@@ -12,7 +13,7 @@ button {{ padding: .5rem .8rem; cursor: pointer; }}
 <table><thead><tr><th>Thread</th><th>Agent</th><th>Running since</th><th>Action</th></tr></thead><tbody>{thread_rows}</tbody></table>
 <h2>Agent models and effort</h2>
 <form method="get" action="/admin"><label>Repository <input name="repository" value="{repository}" placeholder="owner/repo"></label> <button>Choose scope</button> <a href="/admin">Bot-wide settings</a></form>
-<p>Leave repository empty for bot-wide settings. Repository settings apply only to the selected repository and bot user, and persist across restarts. Save creates a complete repository override; Use bot defaults removes it. Explicit mention options take precedence.</p><p>Set the agent, model and reasoning effort for an agent user's next runs. The default model choice restores its configured <code>agent_model</code>; the default effort leaves the agent's own choice. Choices load from the agent’s own model catalog for this user (where supported), alongside configured and recently reported models for the same agent; choose Custom model to enter another model ID. Bot-wide agent changes reset on restart; model and effort changes are saved across restarts and do not affect runs already in progress.</p>
+<p>Leave repository empty for bot-wide settings. Repository settings apply only to the selected repository and bot user, and persist across restarts. Selections are not applied until you click Save settings. Save creates a complete repository override; Use bot defaults removes it. Explicit mention options take precedence.</p><p>Set the agent, model and reasoning effort for an agent user's next runs. The default model choice restores its configured <code>agent_model</code>; the default effort leaves the agent's own choice. Choices load from the agent’s own model catalog for this user (where supported), alongside configured and recently reported models for the same agent; choose Custom model to enter another model ID. Bot-wide agent changes reset on restart; model and effort changes are saved across restarts and do not affect runs already in progress.</p>
 <table><thead><tr><th>User</th><th>Agent</th><th>Model</th><th>Effort</th><th>Action</th></tr></thead><tbody>{user_rows}</tbody></table>
 <p id="result" role="status" aria-live="polite"></p><p><a href="/admin?repository={repository}">Refresh availability</a></p>
 <script>
@@ -117,7 +118,7 @@ document.querySelectorAll('select[data-model]').forEach(select => {{
             if (!response.ok) throw new Error(' Models unavailable; saved and custom choices remain usable.');
             const catalog = await response.json();
             // A response for an earlier adapter must not populate the new menu.
-            if (current !== discovery) return;
+            if (current !== discovery || row.dataset.resetApplied === 'true') return;
             const selected = select.value;
             for (const model of catalog.models) {{
                 if (!options.some(option => !option.hasAttribute('data-custom-model') && option.value === model)) {{
@@ -168,41 +169,87 @@ document.querySelectorAll('select[data-user-agent]').forEach(select => {{
         effort.disabled = select.selectedOptions[0].dataset.supportsEffort !== 'true';
     }});
 }});
+const settingsForRow = row => ({{
+    user: row.querySelector('button[data-user]').dataset.user,
+    repository: document.body.dataset.repository,
+    agent: row.querySelector('select[data-user-agent]').value,
+    model: row.querySelector('select[data-model]').value,
+    effort: row.querySelector('select[data-effort]').value
+}});
 document.querySelectorAll('button[data-user]').forEach(button => {{
+    const row = button.closest('tr');
+    const status = row.querySelector('[data-save-status]');
+    let saved = JSON.stringify(settingsForRow(row));
+    const updateDirty = () => {{
+        row.dataset.dirty = String(JSON.stringify(settingsForRow(row)) !== saved);
+        status.textContent = row.dataset.dirty === 'true' ? 'Unsaved changes — click Save settings.' : 'No unsaved changes';
+    }};
+    row.querySelectorAll('select').forEach(select => {{
+        // Model/adapter listeners may restore a canceled custom choice or reset
+        // dependent controls first. Compare the final values for this event.
+        select.addEventListener('change', () => queueMicrotask(updateDirty));
+    }});
     button.addEventListener('click', async () => {{
-        const row = button.closest('tr');
-        const result = document.getElementById('result');
+        const settings = settingsForRow(row);
         button.disabled = true;
+        const reset = row.querySelector('button[data-reset-user]');
+        reset.disabled = true;
+        status.textContent = 'Saving…';
         try {{
             const response = await fetch('/admin/agent-settings', {{
                 method: 'POST', headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify({{
-                    user: button.dataset.user,
-                    repository: document.body.dataset.repository,
-                    agent: row.querySelector('select[data-user-agent]').value,
-                    model: row.querySelector('select[data-model]').value,
-                    effort: row.querySelector('select[data-effort]').value
-                }})
+                body: JSON.stringify(settings)
             }});
             if (!response.ok) throw new Error((await response.text()).trim() || 'Save failed (' + response.status + ')');
-            window.location.reload();
-        }} catch (error) {{ result.textContent = error.message; }}
-        finally {{ button.disabled = false; }}
+            saved = JSON.stringify(settings);
+            updateDirty();
+            if (row.dataset.dirty !== 'true') {{
+                status.textContent = 'Saved for ' + (settings.repository || 'all repositories') + '. Applies to new runs.';
+            }}
+        }} catch (error) {{
+            updateDirty();
+            status.textContent = 'Save failed: ' + error.message;
+        }}
+        finally {{ button.disabled = false; reset.disabled = false; }}
     }});
+}});
+window.addEventListener('beforeunload', event => {{
+    if (document.querySelector('tr[data-dirty="true"]')) {{
+        event.preventDefault();
+        event.returnValue = '';
+    }}
 }});
 document.querySelectorAll('button[data-reset-user]').forEach(button => {{
     button.hidden = !document.body.dataset.repository;
     button.addEventListener('click', async () => {{
+        const row = button.closest('tr');
+        const save = row.querySelector('button[data-user]');
         button.disabled = true;
+        save.disabled = true;
+        let applied = false;
         try {{
             const response = await fetch('/admin/agent-settings', {{
                 method: 'POST', headers: {{'Content-Type': 'application/json'}},
                 body: JSON.stringify({{user: button.dataset.resetUser, repository: document.body.dataset.repository, reset: true}})
             }});
             if (!response.ok) throw new Error('Reset failed (' + response.status + ')');
+            // The reset is committed even if another row's unload warning is
+            // dismissed. Invalidate the old controls before attempting reload
+            // so Stay cannot display or re-save the removed override.
+            applied = true;
+            row.dataset.resetApplied = 'true';
+            row.dataset.dirty = 'false';
+            row.querySelectorAll('select').forEach(select => {{
+                select.replaceChildren(new Option('Bot defaults — reload to view', ''));
+                select.disabled = true;
+            }});
+            row.querySelectorAll('input').forEach(input => input.disabled = true);
+            row.querySelector('[data-save-status]').textContent = 'Reset saved. Bot defaults are active; reload to view them.';
             window.location.reload();
         }} catch (error) {{ document.getElementById('result').textContent = error.message; }}
-        finally {{ button.disabled = false; }}
+        finally {{
+            if (!applied) {{ button.disabled = false; save.disabled = false; }}
+        }}
     }});
 }});
 </script></body></html>

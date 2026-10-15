@@ -409,9 +409,16 @@ Choose a repository (`owner/repo`) in **Agent models and effort** to edit settin
 for each bot in that repository. Leave the repository blank for bot-wide settings.
 Repository overrides take precedence over bot-wide settings; explicit mention
 agent/model/effort options still take precedence for the invocation. Each repository
-save captures the selected adapter, model and effort as a complete override. Empty
+save captures the selected adapter, model and effort as a complete override.
+Choose **Save settings** on the edited user row to apply a selection. Each row
+shows unsaved changes, save errors, or confirmation of the saved scope. Saving
+one row preserves edits in other rows; leaving with unsaved changes prompts
+a warning. Saved repository choices survive reloads and restarts. Empty
 model/effort choices use the configured model for that adapter and the adapter's own
-effort default. **Use bot defaults** removes the repository override.
+effort default. **Use bot defaults** removes the repository override. If you choose to stay
+on the page at an unsaved-changes warning after resetting, the reset row shows
+that bot defaults are active and stays disabled until reload; other rows keep
+their edits.
 Repository overrides (including adapter-only choices) persist in
 `repository-agent-settings.json` under the session directory. They apply to future
 runs, without changing a running process. A follow-up with different agent, model

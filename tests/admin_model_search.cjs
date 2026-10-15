@@ -62,3 +62,146 @@ test('admin model search preserves choices and follows catalog and agent changes
         await browser.close();
     }
 });
+
+test('admin saves report success without discarding other rows and warn about unsaved edits', async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+        const page = await browser.newPage();
+        const errors = [];
+        page.on('pageerror', error => errors.push(error.message));
+        const model = 'openrouter/nvidia/nemotron-3-ultra-550b-a55b:free';
+        const saved = {};
+        let fail = false;
+        let loads = 0;
+        await page.route('**/admin/agent-models', route => route.fulfill({
+            json: { supported: true, models: [model] }
+        }));
+        await page.route('**/admin/agent-settings', async route => {
+            if (fail) return route.fulfill({ status: 500, body: 'failed to save repository settings' });
+            const body = route.request().postDataJSON();
+            assert.equal(body.repository, 'shylock/agent-earn-money');
+            saved[body.user] = body;
+            await route.fulfill({ status: 204 });
+        });
+        await page.route(/\/admin\?/, route => {
+            loads++;
+            const rows = ['alice', 'bob'].map(user => fs.readFileSync('web/admin-user-row.html', 'utf8')
+                .replaceAll('{user}', user)
+                .replace('{agent_options}', '<option value="pi-rpc">pi-rpc</option>')
+                .replace('{model_options}', `<option value="">Agent default</option><option value="${model}"${saved[user]?.model === model ? ' selected' : ''}>${model}</option><option data-custom-model>Custom model…</option>`)
+                .replace('{effort_disabled}', '').replace('{effort_options}', '<option value="">Agent default</option><option value="high">high</option>')).join('');
+            const html = fs.readFileSync('web/admin.html', 'utf8')
+                .replace('{user_rows}', rows).replaceAll('{repository}', 'shylock/agent-earn-money')
+                .replace('{rows}', '').replace('{thread_rows}', '').replace('{capacity}', '')
+                .replaceAll('{{', '{').replaceAll('}}', '}');
+            return route.fulfill({ contentType: 'text/html', body: html });
+        });
+        await page.goto('http://admin.test/admin?repository=shylock/agent-earn-money');
+        const row = user => page.locator('tr').filter({ has: page.locator(`button[data-user="${user}"]`) });
+        const alice = row('alice');
+        const bob = row('bob');
+        const status = alice.locator('[data-save-status]');
+        await alice.locator('select[data-model]').selectOption(model);
+        await bob.locator('select[data-effort]').selectOption('high');
+        await page.waitForFunction(() => document.querySelectorAll('tr[data-dirty="true"]').length === 2);
+        assert.match(await status.textContent(), /Unsaved changes/);
+        const wouldWarn = () => page.evaluate(() => {
+            const event = new Event('beforeunload', { cancelable: true });
+            window.dispatchEvent(event);
+            return event.defaultPrevented;
+        });
+        assert.equal(await wouldWarn(), true);
+        fail = true;
+        await alice.locator('button[data-user]').click();
+        await status.filter({ hasText: 'Save failed:' }).waitFor();
+        assert.equal(await alice.getAttribute('data-dirty'), 'true');
+        assert.equal(await alice.locator('select[data-model]').inputValue(), model);
+        fail = false;
+        await alice.locator('button[data-user]').click();
+        await status.filter({ hasText: 'Saved for shylock/agent-earn-money' }).waitFor();
+        assert.equal(saved.alice.model, model);
+        assert.equal(saved.alice.agent, 'pi-rpc');
+        assert.equal(await alice.getAttribute('data-dirty'), 'false');
+        assert.equal(await bob.locator('select[data-effort]').inputValue(), 'high');
+        assert.equal(await bob.getAttribute('data-dirty'), 'true');
+        assert.equal(loads, 1, 'saving must not reload and discard another user\'s edits');
+        assert.equal(await wouldWarn(), true, 'another row still has unsaved edits');
+        await bob.locator('select[data-effort]').selectOption('');
+        await page.waitForFunction(() => !document.querySelector('tr[data-dirty="true"]'));
+        assert.equal(await wouldWarn(), false, 'reverting edits clears the warning');
+        await page.reload();
+        assert.equal(await alice.locator('select[data-model]').inputValue(), model);
+        assert.deepEqual(errors, []);
+    } finally {
+        await browser.close();
+    }
+});
+
+for (const editResetRow of [false, true]) {
+    test(`reset stays committed after dismissing unload (reset row edited: ${editResetRow})`, async () => {
+        const browser = await chromium.launch({ headless: true });
+        try {
+            const page = await browser.newPage();
+            const errors = [];
+            page.on('pageerror', error => errors.push(error.message));
+            let resets = 0;
+            let loads = 0;
+            let overridden = true;
+            await page.route('**/admin/agent-models', route => route.fulfill({ json: { supported: true, models: [] } }));
+            await page.route('**/admin/agent-settings', route => {
+                const body = route.request().postDataJSON();
+                assert.equal(body.user, 'alice');
+                assert.equal(body.repository, 'owner/project');
+                assert.equal(body.reset, true);
+                resets++;
+                overridden = false;
+                return route.fulfill({ status: 204 });
+            });
+            await page.route(/\/admin\?/, route => {
+                loads++;
+                const rows = ['alice', 'bob'].map(user => fs.readFileSync('web/admin-user-row.html', 'utf8')
+                    .replaceAll('{user}', user)
+                    .replace('{agent_options}', '<option value="pi-rpc">pi-rpc</option>')
+                    .replace('{model_options}', `<option value="">Agent default</option><option value="old-model"${user === 'alice' && overridden ? ' selected' : ''}>old-model</option><option data-custom-model>Custom model…</option>`)
+                    .replace('{effort_disabled}', '').replace('{effort_options}', '<option value="">Agent default</option><option value="high">high</option>')).join('');
+                const html = fs.readFileSync('web/admin.html', 'utf8')
+                    .replace('{user_rows}', rows).replaceAll('{repository}', 'owner/project')
+                    .replace('{rows}', '').replace('{thread_rows}', '').replace('{capacity}', '')
+                    .replaceAll('{{', '{').replaceAll('}}', '}');
+                return route.fulfill({ contentType: 'text/html', body: html });
+            });
+            await page.goto('http://admin.test/admin?repository=owner/project');
+            const row = user => page.locator('tr').filter({ has: page.locator(`button[data-user="${user}"]`) });
+            const alice = row('alice');
+            const bob = row('bob');
+            if (editResetRow) await alice.locator('select[data-effort]').selectOption('high');
+            await bob.locator('select[data-effort]').selectOption('high');
+            const stayed = new Promise(resolve => page.once('dialog', async dialog => {
+                assert.equal(dialog.type(), 'beforeunload');
+                await dialog.dismiss();
+                resolve();
+            }));
+            await alice.locator('button[data-reset-user]').click();
+            await stayed;
+            assert.equal(resets, 1);
+            assert.equal(overridden, false);
+            assert.equal(loads, 1, 'Stay cancels reload');
+            assert.match(await alice.locator('[data-save-status]').textContent(), /Reset saved.*Bot defaults are active/);
+            assert.equal(await alice.getAttribute('data-dirty'), 'false');
+            assert.equal(await alice.locator('select[data-model]').inputValue(), '');
+            assert.equal(await alice.locator('button[data-user]').isDisabled(), true, 'removed override cannot be saved back');
+            assert.equal(await alice.locator('select[data-model]').isDisabled(), true);
+            assert.equal(await bob.locator('select[data-effort]').inputValue(), 'high');
+            assert.equal(await bob.getAttribute('data-dirty'), 'true');
+            assert.equal(await bob.locator('select[data-effort]').isEnabled(), true);
+            // After clearing the other edit, reload restores live, effective defaults.
+            await bob.locator('select[data-effort]').selectOption('');
+            await page.reload();
+            assert.equal(await alice.locator('select[data-model]').inputValue(), '');
+            assert.equal(await alice.locator('button[data-user]').isEnabled(), true);
+            assert.deepEqual(errors, []);
+        } finally {
+            await browser.close();
+        }
+    });
+}
