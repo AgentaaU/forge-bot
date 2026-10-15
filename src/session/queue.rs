@@ -1505,24 +1505,26 @@ impl Inner {
                 && is_capacity_limited(&outcome.summary, &self.config.capacity.markers);
 
             if capacity_limited {
-                let fallback_cooldown =
-                    if crate::agent::capacity::is_model_overloaded(&outcome.summary) {
-                        Duration::from_secs(self.config.capacity.overload_cooldown_secs.max(1))
-                    } else {
-                        fallback_cooldown
-                    };
+                let overloaded = crate::agent::capacity::is_model_overloaded(&outcome.summary);
+                let reason = if overloaded {
+                    UnavailableReason::ProviderOverloaded
+                } else {
+                    UnavailableReason::CapacityLimit
+                };
+                let fallback_cooldown = if overloaded {
+                    Duration::from_secs(self.config.capacity.overload_cooldown_secs.max(1))
+                } else {
+                    fallback_cooldown
+                };
                 let cooldown =
                     crate::agent::capacity::retry_after(&outcome.summary, chrono::Utc::now())
                         .unwrap_or(fallback_cooldown);
-                self.agents.mark_unavailable_with_reason(
-                    name,
-                    cooldown,
-                    UnavailableReason::CapacityLimit,
-                );
+                self.agents
+                    .mark_unavailable_with_reason(name, cooldown, reason.clone());
                 unavailable_hits += 1;
                 tracing::warn!(job = %job.id, agent = %name, summary = %outcome.summary, "agent hit a capacity limit");
                 last_outcome = Some(outcome);
-                previous_reason = Some(UnavailableReason::CapacityLimit);
+                previous_reason = Some(reason);
                 continue;
             }
 
@@ -3433,11 +3435,20 @@ mod tests {
                 "Selected model is at capacity. Please try a different model.",
                 60,
             ),
+            (
+                "Upstream error from Nvidia: Service temporarily overloaded",
+                60,
+            ),
+            (
+                "Upstream error from Nvidia: Service temporarily overloaded. Retry after 2 minutes",
+                120,
+            ),
             ("You have hit your usage limit", 18000),
             ("Selected model is at capacity. Retry after 2 minutes", 120),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut config = capacity_config(dir.path());
+            config.reply.ack = true;
             config
                 .agents
                 .overrides
@@ -3447,11 +3458,12 @@ mod tests {
             let config = Arc::new(config);
             let registry = isolated_registry(&config, &["capacity-agent", "good-agent"]);
             let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+            let api = Arc::new(RecordingApi::default());
             let dispatcher = Dispatcher::new(
                 config.clone(),
                 registry.clone(),
                 sessions.clone(),
-                Arc::new(RecordingApi::default()),
+                api.clone(),
                 Policy::new(&config.policy),
             )
             .unwrap();
@@ -3469,6 +3481,23 @@ mod tests {
                 .await
                 .unwrap();
             wait_for_drain(&sessions).await;
+            let reason = if error.contains("usage limit") {
+                UnavailableReason::CapacityLimit
+            } else {
+                UnavailableReason::ProviderOverloaded
+            };
+            assert_eq!(
+                registry.unavailable_reason("capacity-agent"),
+                Some(reason.clone())
+            );
+            assert!(
+                api.comments
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|body| body.contains(reason.label())),
+                "fallback notice must explain the failure: {error}"
+            );
             let remaining = registry.cooldown_remaining("capacity-agent").unwrap();
             assert!(
                 remaining <= Duration::from_secs(expected),

@@ -27,6 +27,8 @@ pub const BUILTIN_AGENTS: &[&str] = &["codex", "agy", "pi-rpc", "pi", "claude", 
 pub enum UnavailableReason {
     /// The agent reported a quota, rate or provider-capacity error.
     CapacityLimit,
+    /// The selected model or provider is temporarily overloaded.
+    ProviderOverloaded,
     /// The agent process could not be started (missing binary, bad command).
     StartFailed,
     /// Any other failure that put the agent on cooldown.
@@ -38,6 +40,7 @@ impl UnavailableReason {
     pub fn label(&self) -> &'static str {
         match self {
             Self::CapacityLimit => "capacity limit",
+            Self::ProviderOverloaded => "provider overloaded",
             Self::StartFailed => "start failed",
             Self::Failed => "failed",
         }
@@ -659,6 +662,10 @@ mod tests {
     #[test]
     fn unavailable_reason_labels_are_user_facing() {
         assert_eq!(UnavailableReason::CapacityLimit.label(), "capacity limit");
+        assert_eq!(
+            UnavailableReason::ProviderOverloaded.label(),
+            "provider overloaded"
+        );
         assert_eq!(UnavailableReason::StartFailed.label(), "start failed");
         assert_eq!(UnavailableReason::Failed.label(), "failed");
         assert_eq!(

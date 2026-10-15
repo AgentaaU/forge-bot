@@ -111,6 +111,7 @@ pub fn is_model_overloaded(text: &str) -> bool {
         "model is currently overloaded",
         "overloaded_error",
         "server_overloaded",
+        "service temporarily overloaded",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -510,6 +511,16 @@ mod tests {
             &[]
         ));
         assert!(is_capacity_limited("You exceeded your current quota", &[]));
+    }
+
+    #[test]
+    fn nvidia_service_overload_is_transient() {
+        assert!(is_model_overloaded(
+            "Upstream error from Nvidia: Service temporarily overloaded"
+        ));
+        assert!(is_model_overloaded("SERVICE TEMPORARILY OVERLOADED"));
+        assert!(!is_model_overloaded("Go usage limit exceeded"));
+        assert!(!is_model_overloaded("rate limit exceeded"));
     }
 
     #[test]
