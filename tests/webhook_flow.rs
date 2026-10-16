@@ -3636,3 +3636,85 @@ async fn admin_repository_settings_are_isolated_persisted_and_resettable() {
         Some("custom")
     );
 }
+
+#[tokio::test]
+async fn signed_inline_agent_handoff_on_older_review_without_polling_is_deduplicated() {
+    let api = Router::new()
+        .route(
+            "/api/v1/repos/shylock/forge-bot/pulls/32/reviews",
+            get(|| async { Json(json!([{"id":1140}, {"id":1141}])) }),
+        )
+        .route(
+            "/api/v1/repos/shylock/forge-bot/pulls/32/reviews/1141/comments",
+            get(|| async { Json(json!([])) }),
+        )
+        .route(
+            "/api/v1/repos/shylock/forge-bot/pulls/32/reviews/1140/comments",
+            get(|| async { Json(json!([{"id":21044, "path":"src/lib.rs", "position":42}])) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, api).await.unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), |config| {
+        config.poller.enabled = false;
+        let forge = config.forges.forgejo.as_mut().unwrap();
+        forge.base_url = base;
+        forge.token = Some("test-token".into());
+        config.users.insert(
+            "reviewer".into(),
+            UserConfig {
+                role: UserRole::Reviewer,
+                host_user: "reviewer".into(),
+                agent: None,
+                agent_model: None,
+                token: None,
+            },
+        );
+    });
+    let payload = json!({
+        "action":"created",
+        "issue":{"number":32, "pull_request":{}, "html_url":"http://forge.local/shylock/forge-bot/pulls/32"},
+        "repository":{"full_name":"shylock/forge-bot"},
+        "comment":{"id":21044, "body":"@reviewer --agent=custom review this head",
+            "user":{"login":"shylock-bot"},
+            "html_url":"http://forge.local/shylock/forge-bot/pulls/32#issuecomment-21044"}
+    }).to_string();
+    let mut accepted = Vec::new();
+    for _ in 0..2 {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(signed_request("issue_comment", &payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        accepted.push(serde_json::from_slice::<Value>(&body).unwrap()["accepted"].clone());
+    }
+    assert_eq!(accepted, vec![json!(1), json!(0)]);
+    for _ in 0..200 {
+        if harness
+            .sessions
+            .get("user:reviewer:forgejo:shylock/forge-bot:pr:32")
+            .is_some_and(|s| s.runs.len() == 1 && s.runs[0].success == Some(true))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let session = harness
+        .sessions
+        .get("user:reviewer:forgejo:shylock/forge-bot:pr:32")
+        .unwrap();
+    assert_eq!(session.runs.len(), 1);
+    assert_eq!(session.runs[0].success, Some(true));
+    let prompt = session.runs[0].summary.as_deref().unwrap();
+    assert!(prompt.contains("review id 1140, file `src/lib.rs`, line 42"));
+    assert!(prompt.contains("top-level PR conversation comment"));
+    server.abort();
+}

@@ -68,7 +68,7 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
         };
         prompt.push_str(&format!(
             "\nYou are acting as a reviewer. On a pull request, inspect the current diff and run relevant checks. \
-             If changes are needed, post an actionable comment mentioning only {caller_mention}, asking them to fix the findings and mention you again after updating. \
+             If changes are needed, post an actionable top-level PR conversation comment mentioning only {caller_mention}, asking them to fix the findings and mention you again after updating. \
              When the review is OK, rebase the branch onto the current base and squash it to one commit, \
              verify the final diff and checks, then approve the final head and enable auto-merge using fast-forward only. \
              Do not approve or enable auto-merge while findings or checks remain unresolved. \
@@ -77,7 +77,7 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
         ));
     } else if let Some(reviewer) = &context.reviewer {
         prompt.push_str(&format!(
-            "\nWhenever you submit or update a pull request, post a separate comment on that PR \
+            "\nWhenever you submit or update a pull request, post a separate top-level conversation comment on that PR \
              mentioning only @{reviewer} and asking them to review the current head. Include the changes \
              and validation results. Use a new comment after each update so the reviewer is invoked again.\n"
         ));
@@ -94,9 +94,12 @@ pub(super) fn build_prompt(request: &AgentRequest, context: &AgentContext) -> St
 
     if let ReplyTarget::ReviewComment(target) = &context.reply_target {
         prompt.push_str(&format!(
-            "\nThis mention is an inline pull-request review comment. Post any reply in \
+            "\nThis mention is an inline pull-request review comment. Post your response to the caller in \
              the same review thread (review id {}, file `{}`, line {}) instead of \
-             opening a new top-level comment.\n",
+             opening a new top-level comment. Agent handoffs, including review requests and requests to fix findings, \
+             must instead be new top-level PR conversation comments (POST /repos/{{owner}}/{{repo}}/issues/{{index}}/comments). \
+             Forgejo 16.0.6 does not emit a webhook for replies created through the review-comment API; \
+             an inline agent mention may never invoke the recipient.\n",
             target.review_id, target.path, target.line
         ));
     }
@@ -217,9 +220,14 @@ mod tests {
         let prompt = build_prompt(&request, &context);
         assert!(prompt.contains("Whenever you submit or update a pull request"));
         assert!(prompt.contains("mentioning only @review-bot"));
+        assert!(prompt.contains("separate top-level conversation comment"));
+        assert!(prompt.contains(
+            "Agent handoffs, including review requests and requests to fix findings, must instead"
+        ));
         context.is_reviewer = true;
         let prompt = build_prompt(&request, &context);
         assert!(prompt.contains("mentioning only '@alice'"));
+        assert!(prompt.contains("actionable top-level PR conversation comment"));
         assert!(prompt.contains("squash it to one commit"));
         assert!(prompt.contains("approve the final head"));
         assert!(prompt.contains("fast-forward only"));
@@ -365,7 +373,7 @@ mod tests {
                 "Your working directory: /srv/worker\n\n",
                 "Requested work:\nfix this\n",
                 "\nReply to the caller (@alice) when reporting results or asking for task changes. Mention only the caller in that reply, even when the caller is an agent.\n",
-                "\nThis mention is an inline pull-request review comment. Post any reply in the same review thread (review id 7, file `src/lib.rs`, line 42) instead of opening a new top-level comment.\n",
+                "\nThis mention is an inline pull-request review comment. Post your response to the caller in the same review thread (review id 7, file `src/lib.rs`, line 42) instead of opening a new top-level comment. Agent handoffs, including review requests and requests to fix findings, must instead be new top-level PR conversation comments (POST /repos/{owner}/{repo}/issues/{index}/comments). Forgejo 16.0.6 does not emit a webhook for replies created through the review-comment API; an inline agent mention may never invoke the recipient.\n",
                 "\nUse the tools available to you (forge CLI/API, git, shell, filesystem) to gather context, make changes, run tests, and commit/push when appropriate. Reply on the forge when you are done. Forge credentials are available in the environment.\n",
             )
         );

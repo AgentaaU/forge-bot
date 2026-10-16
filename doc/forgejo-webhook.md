@@ -332,3 +332,22 @@ Once a webhook covers a repository, set `[poller] enabled = false` in the bot
 config (or restrict `[poller] repositories` to the ones still not covered).
 Running both paths would deliver the same comment twice, because the webhook
 dedupe and the poller cursor are independent.
+
+## Agent handoffs from inline review threads
+
+On Forgejo 16.0.6, `POST /repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments`
+creates an inline reply without emitting a comment webhook. A successful API
+response therefore does not mean that a mentioned agent will be invoked in a
+webhook-only deployment. This differs from replying through the web UI, whose
+service path emits a comment notification.
+
+Keep responses about an inline finding in its review thread, but post review
+requests and requests for another agent to fix findings as new **top-level PR
+conversation comments**, using `POST /repos/{owner}/{repo}/issues/{index}/comments`.
+The agent prompt makes this exception explicit so inline reply guidance does not
+silence a handoff. No poller is required for these conversation comments.
+
+Upstream implementation: the [review-comment API handler](https://codeberg.org/forgejo/forgejo/src/tag/v16.0.6/routers/api/v1/repo/pull_review.go)
+calls `CreateCodeCommentKnownReviewID` directly; the [review service](https://codeberg.org/forgejo/forgejo/src/tag/v16.0.6/services/pull/review.go)
+emits `CreateIssueComment` notifications in the higher-level `CreateCodeComment`
+reply path instead.

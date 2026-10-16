@@ -146,11 +146,12 @@ impl ForgeAdapter for ForgejoAdapter {
             // Forgejo sends replies to inline review comments as issue_comment
             // events, often without the review id, path, or position. Resolve
             // the comment id through the review API before dispatching it.
+            // Include bot-authored comments: explicit users can hand work to
+            // another agent, and that recipient needs the same thread context.
             for message in messages.iter_mut().filter(|message| {
                 message.is_pull_request
                     && message.comment_id.is_some()
                     && matches!(message.reply_target, ReplyTarget::Conversation)
-                    && self.bot_username.as_deref() != Some(message.author.as_str())
             }) {
                 if let Some(target) = self.find_review_reply_target(message).await? {
                     message.reply_target = target;
