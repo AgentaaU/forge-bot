@@ -115,8 +115,17 @@ def load_threads():
     return ["thread-1"] if not threads_path else []
 
 
+turn_count = 0
+
+
 def finish_turn(turn_status=None):
     final = turn_status or status
+    transport = turn_count <= int(os.environ.get("FAKE_CODEX_TRANSPORT_FAILURES", "0"))
+    if transport:
+        final = "failed"
+    if os.environ.get("FAKE_CODEX_TOOL_STARTED") == "1":
+        send({"method": "item/started", "params": {"threadId": thread_id,
+              "turnId": "turn-1", "item": {"type": "commandExecution"}}})
     text = "CODEX-REPLY"
     if steered:
         text = "steered: " + " ".join(steered)
@@ -136,6 +145,8 @@ def finish_turn(turn_status=None):
     if final == "failed":
         turn["error"] = json.loads(os.environ.get(
             "FAKE_CODEX_ERROR", '{"message":"the model refused the request"}'))
+    if transport:
+        turn["error"] = {"message": "stream disconnected before completion: Transport error: network error: error decoding response body", "codexErrorInfo": "other"}
     send({"method": "turn/completed",
           "params": {"threadId": thread_id, "turn": turn}})
 
@@ -179,6 +190,7 @@ for line in sys.stdin:
         else:
             send({"id": request_id, "error": {"code": -32600, "message": "unknown thread"}})
     elif method == "turn/start":
+        turn_count += 1
         if fail_turn:
             send({"id": request_id, "error": {"code": -32600, "message": "turn start failed"}})
             continue

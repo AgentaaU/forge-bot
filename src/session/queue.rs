@@ -1508,6 +1508,7 @@ impl Inner {
             }
 
             if !outcome.success {
+                tracing::warn!(job = %job.id, agent = %name, summary = %outcome.summary, "agent attempt failed");
                 failures.push(format!("**{name}**: {}", truncate(&outcome.summary, 1000)));
             }
 
@@ -1725,7 +1726,11 @@ impl Inner {
         } else {
             "❌ failed"
         };
-        let summary = truncate(&outcome.summary, 6000);
+        let summary = if outcome.success {
+            truncate(&outcome.summary, 6000)
+        } else {
+            "Please try again later. Failure details are recorded in the server logs and run history.".into()
+        };
         let body = if summary.trim().is_empty() {
             format!("🤖 Agent **{agent}** {status} in {:?}.", outcome.duration)
         } else {
@@ -1746,18 +1751,18 @@ impl Inner {
         if !self.claim_outcome(job) {
             return;
         }
-        let mut message = no_available_agent_message(&self.agents.unavailable_agents());
-        if !failures.is_empty() {
-            message.push_str("\n\n");
-            message.push_str(&truncate(&failures.join("\n\n"), 5500));
-        }
-        let outcome = AgentOutcome::failure(&message, Default::default());
+        let message = no_available_agent_message(&self.agents.unavailable_agents());
+        let details = format!("{message}\n\n{}", failures.join("\n\n"));
+        let outcome = AgentOutcome::failure(&details, Default::default());
         self.persist_outcome(key, job, &job.agent, &outcome);
         self.reply(&job.message, &message, job.user_id.as_deref())
             .await;
     }
 
     fn persist_outcome(&self, key: &str, job: &Job, agent: &str, outcome: &AgentOutcome) {
+        if !outcome.success {
+            tracing::warn!(job = %job.id, agent, summary = %outcome.summary, "agent run failed");
+        }
         if let Some(usage) = outcome.usage {
             match usage.hit_rate() {
                 Some(hit) => tracing::info!(
@@ -4647,7 +4652,8 @@ mod tests {
             comments.iter().any(|c| {
                 c.contains("broken-agent")
                     && c.contains("❌ failed")
-                    && c.contains("wrong argument")
+                    && c.contains("server logs")
+                    && !c.contains("wrong argument")
             }),
             "a failed run must be reported even with result replies disabled: {comments:?}"
         );
@@ -4734,9 +4740,8 @@ mod tests {
                 assert!(summary.contains(text), "{summary}");
             }
             assert!(
-                api.comments()
-                    .iter()
-                    .any(|body| expected.iter().all(|text| body.contains(text))),
+                api.comments().iter().any(|body| body.contains("❌ failed")
+                    && !expected.iter().any(|text| body.contains(text))),
                 "{:?}",
                 api.comments()
             );
@@ -4787,13 +4792,18 @@ mod tests {
             assert!(
                 comments
                     .iter()
-                    .any(|body| body.contains("usage limit") && body.contains(expected)),
+                    .all(|body| !body.contains(expected) && !body.contains("usage limit")),
                 "{comments:?}"
             );
             let session = sessions
                 .get(&SessionStore::key(&message("o/r"), Some("default")))
                 .unwrap();
             assert_eq!(session.runs[0].success, Some(false));
+            let summary = session.runs[0].summary.as_deref().unwrap();
+            assert!(
+                summary.contains("usage limit") && summary.contains(expected),
+                "{summary}"
+            );
         }
     }
 

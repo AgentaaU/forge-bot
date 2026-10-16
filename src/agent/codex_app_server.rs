@@ -219,149 +219,185 @@ impl CodexAppServerAgent {
             .lock()
             .expect("effort mutex poisoned") = effort.clone();
 
-        // Subscribe before `turn/start` so no part of the turn is missed.
-        let mut events = process.subscribe();
-        let mut turn = json!({
-            "threadId": thread_id,
-            "input": [{ "type": "text", "text": prompt }],
-        });
-        if let Some(effort) = effort {
-            turn["effort"] = json!(effort);
-        }
-        let response = process
-            .request("turn/start", turn, deadline)
-            .await
-            .map_err(|error| BotError::Agent {
-                name: "codex".into(),
-                reason: error.to_string(),
-            })?;
-        let turn_id = response["turn"]["id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        if turn_id.is_empty() {
-            return Ok(AgentOutcome::failure(
-                "codex app-server did not return a turn id".to_owned(),
-                started.elapsed(),
-            ));
-        }
-        *live.active_turn.lock().expect("codex turn mutex poisoned") = Some(turn_id.clone());
+        let mut attempt = 0;
+        loop {
+            // Subscribe before `turn/start` so no part of the turn is missed.
+            let mut events = process.subscribe();
+            let mut turn = json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": prompt }],
+            });
+            if let Some(effort) = &effort {
+                turn["effort"] = json!(effort);
+            }
+            let response = process
+                .request("turn/start", turn, deadline)
+                .await
+                .map_err(|error| BotError::Agent {
+                    name: "codex".into(),
+                    reason: error.to_string(),
+                })?;
+            let turn_id = response["turn"]["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if turn_id.is_empty() {
+                return Ok(AgentOutcome::failure(
+                    "codex app-server did not return a turn id".to_owned(),
+                    started.elapsed(),
+                ));
+            }
+            *live.active_turn.lock().expect("codex turn mutex poisoned") = Some(turn_id.clone());
 
-        let mut text = String::new();
-        let mut usage = TokenUsage::default();
-        let turn = loop {
-            let event = match deadline {
-                Some(deadline) => {
-                    match tokio::time::timeout_at(deadline, process.next_event(&mut events)).await {
-                        Ok(Some(event)) => event,
-                        Ok(None) => {
+            let mut text = String::new();
+            let mut tool_started = false;
+            let mut usage = TokenUsage::default();
+            let turn = loop {
+                let event = match deadline {
+                    Some(deadline) => {
+                        match tokio::time::timeout_at(deadline, process.next_event(&mut events))
+                            .await
+                        {
+                            Ok(Some(event)) => event,
+                            Ok(None) => {
+                                *live.active_turn.lock().expect("codex turn mutex poisoned") = None;
+                                return Ok(AgentOutcome::failure(
+                                    "codex app-server exited before the turn completed".to_owned(),
+                                    started.elapsed(),
+                                ));
+                            }
+                            Err(_) => {
+                                let _ = process
+                                    .request(
+                                        "turn/interrupt",
+                                        json!({ "threadId": thread_id, "turnId": turn_id }),
+                                        Some(Instant::now() + Duration::from_secs(2)),
+                                    )
+                                    .await;
+                                *live.active_turn.lock().expect("codex turn mutex poisoned") = None;
+                                let timeout = self.config.timeout.unwrap_or_default();
+                                return Ok(AgentOutcome::failure(
+                                    format!("agent timed out after {timeout:?}"),
+                                    started.elapsed(),
+                                ));
+                            }
+                        }
+                    }
+                    None => match process.next_event(&mut events).await {
+                        Some(event) => event,
+                        None => {
                             *live.active_turn.lock().expect("codex turn mutex poisoned") = None;
                             return Ok(AgentOutcome::failure(
                                 "codex app-server exited before the turn completed".to_owned(),
                                 started.elapsed(),
                             ));
                         }
-                        Err(_) => {
-                            let _ = process
-                                .request(
-                                    "turn/interrupt",
-                                    json!({ "threadId": thread_id, "turnId": turn_id }),
-                                    Some(Instant::now() + Duration::from_secs(2)),
-                                )
-                                .await;
-                            *live.active_turn.lock().expect("codex turn mutex poisoned") = None;
-                            let timeout = self.config.timeout.unwrap_or_default();
-                            return Ok(AgentOutcome::failure(
-                                format!("agent timed out after {timeout:?}"),
-                                started.elapsed(),
-                            ));
+                    },
+                };
+                match event["method"].as_str().unwrap_or_default() {
+                    "turn/completed" => {
+                        if event["params"]["turn"]["id"].as_str() == Some(turn_id.as_str()) {
+                            break event["params"]["turn"].clone();
                         }
                     }
-                }
-                None => match process.next_event(&mut events).await {
-                    Some(event) => event,
-                    None => {
-                        *live.active_turn.lock().expect("codex turn mutex poisoned") = None;
-                        return Ok(AgentOutcome::failure(
-                            "codex app-server exited before the turn completed".to_owned(),
-                            started.elapsed(),
-                        ));
+                    "item/agentMessage/delta" => {
+                        if event["params"]["turnId"].as_str() == Some(turn_id.as_str())
+                            && let Some(delta) = event["params"]["delta"].as_str()
+                        {
+                            text.push_str(delta);
+                            append_live(&context.live_output, delta);
+                        }
                     }
-                },
+                    "item/started" => {
+                        if event["params"]["turnId"].as_str() == Some(turn_id.as_str()) {
+                            let kind = event["params"]["item"]["type"].as_str().unwrap_or_default();
+                            tool_started |=
+                                !matches!(kind, "agentMessage" | "reasoning" | "userMessage");
+                        }
+                    }
+                    "thread/tokenUsage/updated" => {
+                        if event["params"]["turnId"].as_str() == Some(turn_id.as_str()) {
+                            let last = &event["params"]["tokenUsage"]["last"];
+                            usage = TokenUsage {
+                                prompt_tokens: last["inputTokens"].as_u64().unwrap_or(0),
+                                cached_tokens: last["cachedInputTokens"].as_u64().unwrap_or(0),
+                            };
+                        }
+                    }
+                    _ if event.get("id").is_some() => answer_server_request(process, &event),
+                    _ => {}
+                }
             };
-            match event["method"].as_str().unwrap_or_default() {
-                "turn/completed" => {
-                    if event["params"]["turn"]["id"].as_str() == Some(turn_id.as_str()) {
-                        break event["params"]["turn"].clone();
-                    }
-                }
-                "item/agentMessage/delta" => {
-                    if event["params"]["turnId"].as_str() == Some(turn_id.as_str())
-                        && let Some(delta) = event["params"]["delta"].as_str()
-                    {
-                        text.push_str(delta);
-                        append_live(&context.live_output, delta);
-                    }
-                }
-                "thread/tokenUsage/updated" => {
-                    if event["params"]["turnId"].as_str() == Some(turn_id.as_str()) {
-                        let last = &event["params"]["tokenUsage"]["last"];
-                        usage = TokenUsage {
-                            prompt_tokens: last["inputTokens"].as_u64().unwrap_or(0),
-                            cached_tokens: last["cachedInputTokens"].as_u64().unwrap_or(0),
-                        };
-                    }
-                }
-                _ if event.get("id").is_some() => answer_server_request(process, &event),
-                _ => {}
-            }
-        };
-        *live.active_turn.lock().expect("codex turn mutex poisoned") = None;
+            *live.active_turn.lock().expect("codex turn mutex poisoned") = None;
 
-        // The completed turn carries the authoritative final message.
-        let final_text = turn
-            .get("items")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|item| item["type"] == "agentMessage")
-                    .filter_map(|item| item["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(text);
+            // The completed turn carries the authoritative final message.
+            let final_text = turn
+                .get("items")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| item["type"] == "agentMessage")
+                        .filter_map(|item| item["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(text);
 
-        let status = turn["status"].as_str().unwrap_or("failed");
-        let mut outcome = if status == "completed" {
-            AgentOutcome::success(final_text, started.elapsed())
-        } else {
-            // Preserve codes for classification, but keep provider text outside
-            // JSON so punctuation at the end of reset times remains parseable.
-            let mut error = turn["error"].clone();
-            let mut details = Vec::new();
-            for field in ["message", "additionalDetails"] {
-                if let Some(text) = error[field].as_str() {
-                    details.push(text.to_owned());
-                    error
-                        .as_object_mut()
-                        .expect("error with text fields is an object")
-                        .remove(field);
-                }
-            }
-            if !error.is_null() && !error.as_object().is_some_and(|fields| fields.is_empty()) {
-                details.insert(0, error.to_string());
-            }
-            let detail = if details.iter().all(|text| text.trim().is_empty()) {
-                status.to_owned()
+            let status = turn["status"].as_str().unwrap_or("failed");
+            let mut outcome = if status == "completed" {
+                AgentOutcome::success(final_text, started.elapsed())
             } else {
-                details.join("\n")
+                // Preserve codes for classification, but keep provider text outside
+                // JSON so punctuation at the end of reset times remains parseable.
+                let mut error = turn["error"].clone();
+                let mut details = Vec::new();
+                for field in ["message", "additionalDetails"] {
+                    if let Some(text) = error[field].as_str() {
+                        details.push(text.to_owned());
+                        error
+                            .as_object_mut()
+                            .expect("error with text fields is an object")
+                            .remove(field);
+                    }
+                }
+                if !error.is_null() && !error.as_object().is_some_and(|fields| fields.is_empty()) {
+                    details.insert(0, error.to_string());
+                }
+                let detail = if details.iter().all(|text| text.trim().is_empty()) {
+                    status.to_owned()
+                } else {
+                    details.join("\n")
+                };
+                AgentOutcome::failure(format!("codex turn {status}: {detail}"), started.elapsed())
             };
-            AgentOutcome::failure(format!("codex turn {status}: {detail}"), started.elapsed())
-        };
-        outcome.usage = (usage.prompt_tokens > 0).then_some(usage);
-        Ok(outcome)
+            outcome.usage = (usage.prompt_tokens > 0).then_some(usage);
+            // A disconnected response stream before tool execution is safe to
+            // retry on the same thread. Never replay a turn that may have effects.
+            tool_started |= turn["items"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    !matches!(
+                        item["type"].as_str(),
+                        Some("agentMessage" | "reasoning" | "userMessage")
+                    )
+                })
+            });
+            if status == "failed"
+                && !tool_started
+                && attempt < 2
+                && is_transport_failure(&turn["error"])
+            {
+                let delay = Duration::from_millis(250 * (1 << attempt));
+                if deadline.is_none_or(|end| Instant::now() + delay < end) {
+                    attempt += 1;
+                    tracing::warn!(attempt, error = %turn["error"], "retrying codex response stream failure");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+            return Ok(outcome);
+        }
     }
 
     /// Start a fresh Codex thread or resume the one remembered for `key`.
@@ -598,6 +634,16 @@ fn answer_server_request(process: &WireProcess, event: &Value) {
     };
     tracing::debug!(method, "answering codex app-server request");
     process.respond(&event["id"], result);
+}
+
+/// Match only response transport errors, never quota, auth, or model errors.
+fn is_transport_failure(error: &Value) -> bool {
+    let message = error["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    message.contains("stream disconnected before completion")
+        && (message.contains("transport error") || message.contains("network error"))
 }
 
 #[cfg(test)]
@@ -1001,6 +1047,45 @@ mod tests {
             assert!(outcome.success);
             assert_eq!(outcome.model, None);
             assert_eq!(*ctx.reported_model.lock().unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn response_stream_retries_are_bounded_and_do_not_replay_tools() {
+        for (failures, tool, expected, success) in [
+            (1, false, 2, true),
+            (9, false, 3, false),
+            (1, true, 1, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("log.jsonl");
+            let mut config = base_config(&log);
+            config
+                .env
+                .insert("FAKE_CODEX_TRANSPORT_FAILURES".into(), failures.to_string());
+            if tool {
+                config
+                    .env
+                    .insert("FAKE_CODEX_TOOL_STARTED".into(), "1".into());
+            }
+            let agent = agent(config, Arc::new(SessionStore::load(dir.path())));
+            let outcome = agent.run(&request(), &context(dir.path())).await.unwrap();
+            assert_eq!(outcome.success, success, "{outcome:?}");
+            let calls = std::fs::read_to_string(log).unwrap();
+            assert_eq!(
+                calls
+                    .lines()
+                    .filter(|line| line.contains("turn/start"))
+                    .count(),
+                expected
+            );
+            assert_eq!(
+                calls
+                    .lines()
+                    .filter(|line| line.contains("thread/start"))
+                    .count(),
+                1
+            );
         }
     }
 

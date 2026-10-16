@@ -126,6 +126,9 @@ Implemented:
   channel (an operator-supplied command/args, a Codex/Kimi build without the
   persistent protocol, `agy`, `claude`) queue the follow-up and run it as the
   next turn
+- [x] Codex response-stream recovery: the default app-server adapter retries
+  transport disconnects at most twice on the same thread, with short backoff
+  within the original timeout. Turns that started tool work are never replayed.
 - [x] Agent forge access (credentials via environment, optional checkout)
 - [x] Per-conversation job scheduling: at most one run per issue/PR at a time,
   while different conversations run in parallel. Since a conversation runs at
@@ -211,7 +214,7 @@ most important options:
 | `[forgejo]` | `base_url`, `webhook_secret`, `token`, `bot_username`. |
 | `[policy]` | `allow_all`, `allowed_users`, `allowed_repos`. |
 | `[workspace]` | Whether to clone a checkout, and where. |
-| `[reply]` | `ack` defaults to true; the acknowledgement and any fallback notices share one status comment. `result` defaults to false because agents normally reply themselves; set `result = true` to also post completion summaries. |
+| `[reply]` | `ack` defaults to true; the acknowledgement and any fallback notices share one status comment. `result` defaults to false because agents normally reply themselves; set `result = true` to also post completion summaries. Failures always post a brief notice; provider diagnostics stay in server logs and run history. |
 | `[session]` | Queue/state directory, worker count (the global cap on concurrent agent runs), recovery, and how long an idle thread keeps its status (`retention_secs`, `0` disables eviction). |
 | `[capacity]` | Capacity/quota detection: `fallback`, `cooldown_secs` (default 5 h), extra `markers` (`[quota]` is an alias). |
 | `[agents.<name>]` | Per-agent `command`, `args`, `prompt`, `timeout_secs`, `env`. |
