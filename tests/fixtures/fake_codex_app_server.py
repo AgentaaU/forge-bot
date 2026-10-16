@@ -15,6 +15,7 @@ Environment:
   until a ``turn/steer`` arrives.
 * ``FAKE_CODEX_STEER_LOG`` records steer text.
 * ``FAKE_CODEX_STATUS`` overrides the final turn status (``failed``).
+* ``FAKE_CODEX_ERROR`` supplies the failed turn error as JSON.
 * ``FAKE_CODEX_REJECT_STEER=1`` answers ``turn/steer`` with an error.
 * ``FAKE_CODEX_FAIL_TURN=1`` answers ``turn/start`` with an error.
 * ``FAKE_CODEX_APPROVAL=1`` emits an approval request and waits for its answer.
@@ -133,7 +134,8 @@ def finish_turn(turn_status=None):
     turn = {"id": "turn-1", "status": final, "items": [
         {"type": "agentMessage", "id": "i1", "text": text}]}
     if final == "failed":
-        turn["error"] = {"message": "the model refused the request"}
+        turn["error"] = json.loads(os.environ.get(
+            "FAKE_CODEX_ERROR", '{"message":"the model refused the request"}'))
     send({"method": "turn/completed",
           "params": {"threadId": thread_id, "turn": turn}})
 

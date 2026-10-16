@@ -25,6 +25,8 @@ use chrono_tz::Tz;
 pub const DEFAULT_CAPACITY_MARKERS: &[&str] = &[
     // Quota / usage limit.
     "usage limit",
+    "usagelimitexceeded",
+    "usage_limit_exceeded",
     "hit your limit",
     "hit your usage limit",
     "reached your limit",
@@ -511,6 +513,8 @@ mod tests {
             &[]
         ));
         assert!(is_capacity_limited("You exceeded your current quota", &[]));
+        assert!(is_capacity_limited("usageLimitExceeded", &[]));
+        assert!(is_capacity_limited("usage_limit_exceeded", &[]));
     }
 
     #[test]

@@ -1343,6 +1343,7 @@ impl Inner {
         // least the requested agent, so it is never empty.
         let candidates = self.candidate_agents(&job.agent);
 
+        let mut failures = Vec::new();
         let mut last_outcome: Option<AgentOutcome> = None;
         let mut used_agent = candidates[0].clone();
         let mut unavailable_hits = 0usize;
@@ -1414,16 +1415,19 @@ impl Inner {
             let agent = match self.agents.get(name) {
                 Ok(agent) => agent,
                 Err(error) => {
-                    last_outcome =
-                        Some(AgentOutcome::failure(error.to_string(), Default::default()));
+                    let outcome = AgentOutcome::failure(error.to_string(), Default::default());
+                    failures.push(format!("**{name}**: {}", truncate(&outcome.summary, 1000)));
+                    last_outcome = Some(outcome);
                     break;
                 }
             };
             if context.explicit_effort && !agent.supports_effort() {
-                last_outcome = Some(AgentOutcome::failure(
+                let outcome = AgentOutcome::failure(
                     format!("agent `{name}` does not support the explicitly requested effort"),
                     Default::default(),
-                ));
+                );
+                failures.push(format!("**{name}**: {}", truncate(&outcome.summary, 1000)));
+                last_outcome = Some(outcome);
                 break;
             }
             if context.effort.is_some() && !agent.supports_effort() {
@@ -1479,7 +1483,9 @@ impl Inner {
                     );
                     unavailable_hits += 1;
                     tracing::warn!(job = %job.id, agent = %name, %error, "agent cannot be started");
-                    last_outcome = Some(agent_failure(&error));
+                    let outcome = agent_failure(&error);
+                    failures.push(format!("**{name}**: {}", truncate(&outcome.summary, 1000)));
+                    last_outcome = Some(outcome);
                     previous_reason = Some(UnavailableReason::StartFailed);
                     continue;
                 }
@@ -1499,6 +1505,10 @@ impl Inner {
             // once it has recovered.
             if outcome.success {
                 self.agents.mark_available(name);
+            }
+
+            if !outcome.success {
+                failures.push(format!("**{name}**: {}", truncate(&outcome.summary, 1000)));
             }
 
             let capacity_limited = !outcome.success
@@ -1555,8 +1565,8 @@ impl Inner {
             .await;
         }
 
-        let Some(outcome) = last_outcome else {
-            self.finish_no_agent(&key, &job).await;
+        let Some(mut outcome) = last_outcome else {
+            self.finish_no_agent(&key, &job, &failures).await;
             return;
         };
 
@@ -1567,8 +1577,11 @@ impl Inner {
         // disabled the caller asked us not to look further, so report the run
         // itself.
         if self.config.capacity.fallback && unavailable_hits == candidates.len() {
-            self.finish_no_agent(&key, &job).await;
+            self.finish_no_agent(&key, &job, &failures).await;
         } else {
+            if !outcome.success && failures.len() > 1 {
+                outcome.summary = truncate(&failures.join("\n\n"), 5500);
+            }
             self.finish(&key, &job, &used_agent, &outcome).await;
         }
     }
@@ -1729,11 +1742,15 @@ impl Inner {
     /// error, so it is always posted even when result replies are disabled.
     /// The reply names the reason each configured agent is out of rotation
     /// when the registry knows it (issue #94).
-    async fn finish_no_agent(&self, key: &str, job: &Job) {
+    async fn finish_no_agent(&self, key: &str, job: &Job, failures: &[String]) {
         if !self.claim_outcome(job) {
             return;
         }
-        let message = no_available_agent_message(&self.agents.unavailable_agents());
+        let mut message = no_available_agent_message(&self.agents.unavailable_agents());
+        if !failures.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(&truncate(&failures.join("\n\n"), 5500));
+        }
         let outcome = AgentOutcome::failure(&message, Default::default());
         self.persist_outcome(key, job, &job.agent, &outcome);
         self.reply(&job.message, &message, job.user_id.as_deref())
@@ -4634,6 +4651,150 @@ mod tests {
             }),
             "a failed run must be reported even with result replies disabled: {comments:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_effort_keeps_all_preceding_failures() {
+        struct FailingAgent(&'static str);
+        #[async_trait::async_trait]
+        impl Agent for FailingAgent {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn supports_effort(&self) -> bool {
+                true
+            }
+            async fn run(&self, _: &AgentRequest, _: &AgentContext) -> Result<AgentOutcome> {
+                Ok(AgentOutcome::failure(
+                    format!("{} provider failed", self.0),
+                    Duration::ZERO,
+                ))
+            }
+        }
+        for count in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = capacity_config(dir.path());
+            config.agent_sequence = vec!["first".into()];
+            if count == 2 {
+                config.agent_sequence.push("second".into());
+            }
+            config.agent_sequence.push("good-agent".into());
+            for name in ["first", "second"] {
+                config.agents.overrides.insert(
+                    name.into(),
+                    crate::config::AgentConfig {
+                        command: Some("true".into()),
+                        ..Default::default()
+                    },
+                );
+            }
+            let config = Arc::new(config);
+            let mut registry = AgentRegistry::from_config(&config);
+            registry.insert_for_test("first", Arc::new(FailingAgent("first")));
+            if count == 2 {
+                registry.insert_for_test("second", Arc::new(FailingAgent("second")));
+            }
+            let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+            let api = Arc::new(RecordingApi::default());
+            let dispatcher = Dispatcher::new(
+                config.clone(),
+                Arc::new(registry),
+                sessions.clone(),
+                api.clone(),
+                Policy::new(&config.policy),
+            )
+            .unwrap();
+            dispatcher
+                .submit(
+                    message("o/r"),
+                    Mention {
+                        model: None,
+                        effort: Some("high".into()),
+                        agent: Some("first".into()),
+                        message: "go".into(),
+                    },
+                    "first",
+                )
+                .await
+                .unwrap();
+            wait_for_drain(&sessions).await;
+            let session = sessions
+                .get(&SessionStore::key(&message("o/r"), Some("default")))
+                .unwrap();
+            let summary = session.runs[0].summary.as_deref().unwrap();
+            assert_eq!(session.runs[0].success, Some(false));
+            let mut expected = vec![
+                "first provider failed",
+                "does not support the explicitly requested effort",
+            ];
+            if count == 2 {
+                expected.push("second provider failed");
+            }
+            for text in &expected {
+                assert!(summary.contains(text), "{summary}");
+            }
+            assert!(
+                api.comments()
+                    .iter()
+                    .any(|body| expected.iter().all(|text| body.contains(text))),
+                "{:?}",
+                api.comments()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_fallbacks_preserve_each_failure() {
+        for names in [
+            vec!["capacity-agent", "broken-agent"],
+            vec!["capacity-agent", "overloaded-agent"],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = capacity_config(dir.path());
+            config.reply.result = false;
+            let config = Arc::new(config);
+            let registry = isolated_registry(&config, &names);
+            let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+            let api = Arc::new(RecordingApi::default());
+            let dispatcher = Dispatcher::new(
+                config.clone(),
+                registry,
+                sessions.clone(),
+                api.clone(),
+                Policy::new(&config.policy),
+            )
+            .unwrap();
+            dispatcher
+                .submit(
+                    message("o/r"),
+                    Mention {
+                        model: None,
+                        effort: None,
+                        agent: Some("capacity-agent".into()),
+                        message: "go".into(),
+                    },
+                    "capacity-agent",
+                )
+                .await
+                .unwrap();
+            wait_for_drain(&sessions).await;
+            let expected = if names[1] == "broken-agent" {
+                "wrong argument"
+            } else {
+                "overloaded_error"
+            };
+            let comments = api.comments();
+            assert!(
+                comments
+                    .iter()
+                    .any(|body| body.contains("usage limit") && body.contains(expected)),
+                "{comments:?}"
+            );
+            let session = sessions
+                .get(&SessionStore::key(&message("o/r"), Some("default")))
+                .unwrap();
+            assert_eq!(session.runs[0].success, Some(false));
+        }
     }
 
     #[tokio::test]

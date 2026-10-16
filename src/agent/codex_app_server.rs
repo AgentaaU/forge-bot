@@ -337,10 +337,27 @@ impl CodexAppServerAgent {
         let mut outcome = if status == "completed" {
             AgentOutcome::success(final_text, started.elapsed())
         } else {
-            let detail = turn["error"]["message"]
-                .as_str()
-                .filter(|message| !message.trim().is_empty())
-                .unwrap_or(status);
+            // Preserve codes for classification, but keep provider text outside
+            // JSON so punctuation at the end of reset times remains parseable.
+            let mut error = turn["error"].clone();
+            let mut details = Vec::new();
+            for field in ["message", "additionalDetails"] {
+                if let Some(text) = error[field].as_str() {
+                    details.push(text.to_owned());
+                    error
+                        .as_object_mut()
+                        .expect("error with text fields is an object")
+                        .remove(field);
+                }
+            }
+            if !error.is_null() && !error.as_object().is_some_and(|fields| fields.is_empty()) {
+                details.insert(0, error.to_string());
+            }
+            let detail = if details.iter().all(|text| text.trim().is_empty()) {
+                status.to_owned()
+            } else {
+                details.join("\n")
+            };
             AgentOutcome::failure(format!("codex turn {status}: {detail}"), started.elapsed())
         };
         outcome.usage = (usage.prompt_tokens > 0).then_some(usage);
@@ -1000,6 +1017,72 @@ mod tests {
         assert_eq!(outcome.model.as_deref(), Some("codex-default"));
         assert!(outcome.summary.contains("failed"), "{outcome:?}");
         assert!(outcome.summary.contains("refused"), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn failed_turn_preserves_structured_quota_and_retry_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = base_config(&dir.path().join("log.jsonl"));
+        config
+            .env
+            .insert("FAKE_CODEX_STATUS".into(), "failed".into());
+        config.env.insert(
+            "FAKE_CODEX_ERROR".into(),
+            json!({
+                "message": "Request cannot be completed",
+                "codexErrorInfo": "usageLimitExceeded",
+                "additionalDetails": "Try again in 2 minutes"
+            })
+            .to_string(),
+        );
+        let agent = agent(config, Arc::new(SessionStore::load(dir.path())));
+        let outcome = agent.run(&request(), &context(dir.path())).await.unwrap();
+        assert!(!outcome.success);
+        assert!(outcome.summary.contains("Request cannot be completed"));
+        assert!(crate::agent::capacity::is_capacity_limited(
+            &outcome.summary,
+            &[]
+        ));
+        assert_eq!(
+            crate::agent::capacity::retry_after(&outcome.summary, chrono::Utc::now()),
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_turn_preserves_local_reset_times_in_text_fields() {
+        use chrono::{Local, TimeZone};
+        let now = Local
+            .with_ymd_and_hms(2026, 9, 13, 18, 11, 0)
+            .single()
+            .unwrap()
+            .to_utc();
+        for field in ["message", "additionalDetails"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = base_config(&dir.path().join("log.jsonl"));
+            config
+                .env
+                .insert("FAKE_CODEX_STATUS".into(), "failed".into());
+            let mut error =
+                json!({"message": "Request failed", "codexErrorInfo": "usageLimitExceeded"});
+            error[field] = json!("Try again at Sep 13th, 2026 7:11 PM.");
+            config
+                .env
+                .insert("FAKE_CODEX_ERROR".into(), error.to_string());
+            let agent = agent(config, Arc::new(SessionStore::load(dir.path())));
+            let outcome = agent.run(&request(), &context(dir.path())).await.unwrap();
+            assert!(!outcome.success);
+            assert!(crate::agent::capacity::is_capacity_limited(
+                &outcome.summary,
+                &[]
+            ));
+            assert_eq!(
+                crate::agent::capacity::retry_after(&outcome.summary, now),
+                Some(Duration::from_secs(3600)),
+                "{field}: {}",
+                outcome.summary
+            );
+        }
     }
 
     #[tokio::test]
