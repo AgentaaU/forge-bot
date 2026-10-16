@@ -408,6 +408,13 @@ for the thread are not removed and start once the worker frees up. The page uses
 `/status.json`. It returns 404 when the thread is not running, including a run
 that has already produced its outcome, which can no longer be terminated.
 
+Repository scopes are checked against the configured forges when opening the admin
+page and saving overrides. A missing or inaccessible repository reports an error;
+a forge lookup failure leaves settings unchanged. Check spelling and bot access
+before retrying. The shared page accepts access from any configured agent user; saves validate
+the selected user. If validation fails for a scope with existing overrides, a
+reset-only recovery page lets operators remove them without allowing new saves.
+
 Choose a repository (`owner/repo`) in **Agent models and effort** to edit settings
 for each bot in that repository. Leave the repository blank for bot-wide settings.
 Repository overrides take precedence over bot-wide settings; explicit mention

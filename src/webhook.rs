@@ -325,12 +325,67 @@ fn valid_repository(repository: &str) -> bool {
         })
 }
 
+/// Reject misspelled scopes before displaying editable controls or saving them.
+async fn validate_repository_scope(
+    state: &AppState,
+    repository: &str,
+    user: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    if repository.is_empty() {
+        return Ok(());
+    }
+    if !valid_repository(repository) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "repository must be owner/repo\n".into(),
+        ));
+    }
+    match state.dispatcher.repository_exists(repository, user).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "Repository `{repository}` was not found or is inaccessible. Check the repository name and bot access.\n"
+            ),
+        )),
+        Err(error) => {
+            tracing::warn!(%error, repository, "could not validate repository scope");
+            Err((StatusCode::BAD_GATEWAY, "Could not validate repository with the forge. Settings were not changed; try again.\n".into()))
+        }
+    }
+}
+
 async fn admin_page(
     State(state): State<AppState>,
     Query(scope): Query<AdminScope>,
-) -> Result<Html<String>, StatusCode> {
-    if !scope.repository.trim().is_empty() && !valid_repository(scope.repository.trim()) {
-        return Err(StatusCode::BAD_REQUEST);
+) -> Result<Html<String>, (StatusCode, String)> {
+    if let Err(error) = validate_repository_scope(&state, scope.repository.trim(), None).await {
+        let repository = scope.repository.trim();
+        let mut reset_rows = String::new();
+        if valid_repository(repository) {
+            for (id, user) in &state.config.users {
+                if user.role.is_agent()
+                    && state
+                        .dispatcher
+                        .repository_settings(repository, id)
+                        .is_some()
+                {
+                    let id = status::escape_html(id);
+                    reset_rows.push_str(&format!(
+                        "<li>{id} <button data-reset-user=\"{id}\">Use bot defaults</button></li>"
+                    ));
+                }
+            }
+        }
+        if reset_rows.is_empty() {
+            return Err(error);
+        }
+        return Ok(Html(format!(
+            include_str!("../web/admin-recovery.html"),
+            repository = status::escape_html(repository),
+            error = status::escape_html(&error.1),
+            reset_rows = reset_rows,
+        )));
     }
     let mut rows = String::new();
     let ranked = state.agents.ordered_names();
@@ -772,6 +827,9 @@ async fn save_agent_settings(
             )
                 .into_response(),
         };
+    }
+    if let Err(error) = validate_repository_scope(&state, repository, Some(&request.user)).await {
+        return error.into_response();
     }
     let selected_agent = request.agent.as_deref().filter(|name| !name.is_empty());
     if let Some(agent) = selected_agent

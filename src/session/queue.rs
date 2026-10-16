@@ -695,6 +695,41 @@ impl Dispatcher {
         self.inner.sessions.user_settings(user_id)
     }
 
+    /// Check one user's access for saves, or any configured agent user's
+    /// access for the shared administration page.
+    pub async fn repository_exists(&self, repository: &str, user: Option<&str>) -> Result<bool> {
+        if let Some(user) = user {
+            return self
+                .inner
+                .api_for(Some(user))
+                .repository_exists(repository)
+                .await;
+        }
+        let mut failure = None;
+        for user in self
+            .inner
+            .identities
+            .users()
+            .iter()
+            .filter(|user| user.is_agent())
+        {
+            match self
+                .inner
+                .api_for(Some(&user.id))
+                .repository_exists(repository)
+                .await
+            {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => failure = Some(error),
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(false),
+        }
+    }
+
     pub fn repository_settings(&self, repository: &str, user: &str) -> Option<UserAgentSettings> {
         self.inner.sessions.repository_settings(repository, user)
     }

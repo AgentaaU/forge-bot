@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Repository settings recovery</title></head>
+<body data-repository="{repository}">
+<nav><a href="/admin">Agent administration</a></nav>
+<h1>Repository settings recovery</h1>
+<p role="alert">{error}</p>
+<p>Saved overrides exist for <strong>{repository}</strong>. You can remove them below. Editing and saving settings is unavailable until repository access can be verified.</p>
+<ul>{reset_rows}</ul><p id="result" role="status" aria-live="polite"></p>
+<script>
+document.querySelectorAll('button[data-reset-user]').forEach(button => {{
+    button.addEventListener('click', async () => {{
+        button.disabled = true;
+        const result = document.getElementById('result');
+        try {{
+            const response = await fetch('/admin/agent-settings', {{
+                method: 'POST', headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{repository: document.body.dataset.repository, user: button.dataset.resetUser, reset: true}})
+            }});
+            if (!response.ok) throw new Error('Reset failed (' + response.status + ')');
+            result.textContent = 'Override removed. Bot defaults are active for ' + button.dataset.resetUser + '.';
+            button.closest('li').remove();
+        }} catch (error) {{ result.textContent = error.message; button.disabled = false; }}
+    }});
+}});
+</script></body></html>

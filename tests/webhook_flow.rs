@@ -54,6 +54,15 @@ fn harness(dir: &std::path::Path) -> Harness {
 
 #[allow(clippy::field_reassign_with_default)]
 fn harness_with(dir: &std::path::Path, configure: impl FnOnce(&mut Config)) -> Harness {
+    harness_with_api(dir, configure, Arc::new(NoopForgeApi))
+}
+
+#[allow(clippy::field_reassign_with_default)]
+fn harness_with_api(
+    dir: &std::path::Path,
+    configure: impl FnOnce(&mut Config),
+    api: Arc<dyn forge_bot::forge_api::ForgeApi>,
+) -> Harness {
     let mut config = Config::default();
     config.bind = "127.0.0.1:0".into();
     config.auth = true;
@@ -118,7 +127,7 @@ fn harness_with(dir: &std::path::Path, configure: impl FnOnce(&mut Config)) -> H
         config.clone(),
         agents.clone(),
         sessions.clone(),
-        Arc::new(NoopForgeApi),
+        api,
         policy,
     )
     .unwrap();
@@ -3716,5 +3725,203 @@ async fn signed_inline_agent_handoff_on_older_review_without_polling_is_deduplic
     let prompt = session.runs[0].summary.as_deref().unwrap();
     assert!(prompt.contains("review id 1140, file `src/lib.rs`, line 42"));
     assert!(prompt.contains("top-level PR conversation comment"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn admin_rejects_unknown_repository_scopes_without_saving() {
+    struct RepositoryApi;
+    #[async_trait::async_trait]
+    impl forge_bot::forge_api::ForgeApi for RepositoryApi {
+        async fn repository_exists(&self, repository: &str) -> forge_bot::error::Result<bool> {
+            match repository {
+                "owner/project" => Ok(true),
+                "owner/unavailable" => Err(forge_bot::error::BotError::ForgeApi("offline".into())),
+                _ => Ok(false),
+            }
+        }
+        async fn post_comment(&self, _: &url::Url, _: &str) -> forge_bot::error::Result<()> {
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness_with_api(dir.path(), |_| {}, Arc::new(RepositoryApi));
+    for (repository, expected) in [
+        ("owner/projct", StatusCode::NOT_FOUND),
+        ("owner/unavailable", StatusCode::BAD_GATEWAY),
+        ("owner/project", StatusCode::OK),
+    ] {
+        let page = h
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin?repository={repository}"))
+                    .header("authorization", "Bearer test-operator-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), expected);
+        if expected == StatusCode::NOT_FOUND {
+            assert!(body_text(page).await.contains("Check the repository name"));
+        }
+        let saved = h.app.clone().oneshot(Request::builder()
+            .method("POST").uri("/admin/agent-settings")
+            .header("authorization", "Bearer test-operator-token")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"repository":repository, "user":"default", "agent":"codex", "effort":"low"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(
+            saved.status(),
+            if expected == StatusCode::OK {
+                StatusCode::NO_CONTENT
+            } else {
+                expected
+            }
+        );
+        assert_eq!(
+            SessionStore::open(dir.path())
+                .unwrap()
+                .repository_settings(repository, "default")
+                .is_some(),
+            expected == StatusCode::OK
+        );
+    }
+    // An old typo can still be removed even if the repository no longer exists.
+    h.dispatcher
+        .set_repository_settings("owner/projct", "default", Some(Default::default()))
+        .unwrap();
+    let page = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin?repository=owner/projct")
+                .header("authorization", "Bearer test-operator-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = body_text(page).await;
+    assert!(html.contains("Repository settings recovery"));
+    assert!(html.contains("Check the repository name"));
+    assert!(html.contains("data-repository=\"owner/projct\""));
+    assert!(html.contains("data-reset-user=\"default\""));
+    assert!(!html.contains("Save settings"));
+    // Follow the reset-only page's action and verify its persisted result.
+    let reset = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/agent-settings")
+                .header("authorization", "Bearer test-operator-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"repository":"owner/projct", "user":"default", "reset":true})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::NO_CONTENT);
+    assert!(
+        h.dispatcher
+            .repository_settings("owner/projct", "default")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn admin_scope_uses_all_agent_credentials_but_saves_use_selected_user() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let api = Router::new().route(
+        "/api/v1/repos/owner/private",
+        get(move |headers: axum::http::HeaderMap| {
+            let recorded = recorded.clone();
+            async move {
+                let auth = headers
+                    .get("authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                recorded.lock().unwrap().push(auth.clone());
+                if auth == "token reviewer-token" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, api).await.unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness_with(dir.path(), |config| {
+        // Use production construction of separate HTTP clients per user;
+        // no agent process needs to be started by these admin requests.
+        let passwd = config.executor.passwd_file.clone();
+        config.executor = Default::default();
+        config.executor.passwd_file = passwd;
+        config.users.get_mut("default").unwrap().token = Some("default-token".into());
+        config.users.insert(
+            "reviewer".into(),
+            UserConfig {
+                role: UserRole::Reviewer,
+                host_user: "reviewer".into(),
+                agent: None,
+                agent_model: None,
+                token: Some("reviewer-token".into()),
+            },
+        );
+        config.forges.forgejo.as_mut().unwrap().base_url = base;
+    });
+    let page = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin?repository=owner/private")
+                .header("authorization", "Bearer test-operator-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(body_text(page).await.contains("Save settings"));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["token default-token", "token reviewer-token"]
+    );
+    for (user, expected) in [
+        ("reviewer", StatusCode::NO_CONTENT),
+        ("default", StatusCode::NOT_FOUND),
+    ] {
+        calls.lock().unwrap().clear();
+        let response = h.app.clone().oneshot(Request::builder()
+            .method("POST").uri("/admin/agent-settings")
+            .header("authorization", "Bearer test-operator-token")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"repository":"owner/private", "user":user, "agent":"codex", "effort":"low"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(*calls.lock().unwrap(), [format!("token {user}-token")]);
+        assert_eq!(
+            h.dispatcher
+                .repository_settings("owner/private", user)
+                .is_some(),
+            user == "reviewer"
+        );
+    }
     server.abort();
 }

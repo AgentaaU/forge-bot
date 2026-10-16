@@ -17,6 +17,14 @@ use crate::location::{ForgeKind, ForgeLocation};
 /// Minimal forge API used by the gateway.
 #[async_trait]
 pub trait ForgeApi: Send + Sync {
+    /// Whether a repository is visible on a configured forge. Fail closed when
+    /// validation is unavailable rather than persisting an unchecked scope.
+    async fn repository_exists(&self, _repository: &str) -> Result<bool> {
+        Err(BotError::ForgeApi(
+            "repository validation is unavailable".into(),
+        ))
+    }
+
     /// Read the PR author's login when supported by the forge.
     async fn pull_request_author(&self, _message: &ForgeMessage) -> Result<Option<String>> {
         Ok(None)
@@ -314,6 +322,65 @@ impl HttpForgeApi {
 
 #[async_trait]
 impl ForgeApi for HttpForgeApi {
+    async fn repository_exists(&self, repository: &str) -> Result<bool> {
+        let mut requests = Vec::new();
+        if let Some(cfg) = &self.config.forges.forgejo {
+            let mut request = self.client.get(format!(
+                "{}/api/v1/repos/{repository}",
+                cfg.base_url.trim_end_matches('/')
+            ));
+            if let Some(token) = &self.forgejo_token {
+                request = request.header("Authorization", format!("token {token}"));
+            }
+            requests.push(request);
+        }
+        if let Some(cfg) = &self.config.forges.github {
+            let base = if cfg.base_url.is_empty() {
+                "https://api.github.com"
+            } else {
+                cfg.base_url.trim_end_matches('/')
+            };
+            let mut request = self.client.get(format!("{base}/repos/{repository}"));
+            if let Some(token) = &cfg.token {
+                request = request.bearer_auth(token);
+            }
+            requests.push(request);
+        }
+        if let Some(cfg) = &self.config.forges.gitlab {
+            let base = if cfg.base_url.is_empty() {
+                "https://gitlab.com"
+            } else {
+                cfg.base_url.trim_end_matches('/')
+            };
+            let mut request = self.client.get(format!(
+                "{base}/api/v4/projects/{}",
+                urlencoding(repository)
+            ));
+            if let Some(token) = &cfg.token {
+                request = request.header("PRIVATE-TOKEN", token);
+            }
+            requests.push(request);
+        }
+        if requests.is_empty() {
+            return Err(BotError::ForgeApi("no forge is configured".into()));
+        }
+        let mut failure = None;
+        for request in requests {
+            match request.send().await {
+                Ok(response) if response.status().is_success() => return Ok(true),
+                Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {}
+                Ok(response) => {
+                    failure = Some(forge_error(response.status(), "repository lookup failed"))
+                }
+                Err(error) => failure = Some(error.into()),
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(false),
+        }
+    }
+
     async fn pull_request_author(&self, message: &ForgeMessage) -> Result<Option<String>> {
         if !message.is_pull_request
             || !matches!(message.forge, ForgeKind::Forgejo | ForgeKind::Gitea)
@@ -430,6 +497,10 @@ pub struct NoopForgeApi;
 
 #[async_trait]
 impl ForgeApi for NoopForgeApi {
+    async fn repository_exists(&self, _repository: &str) -> Result<bool> {
+        Ok(true)
+    }
+
     async fn post_comment(&self, location: &Url, body: &str) -> Result<()> {
         tracing::debug!(%location, %body, "noop forge api: dropping comment");
         Ok(())
@@ -664,6 +735,61 @@ mod tests {
         config.forges.github = github;
         config.forges.gitlab = gitlab;
         config
+    }
+
+    #[tokio::test]
+    async fn validates_repository_with_forge_endpoints_and_credentials() {
+        for kind in ["forgejo", "github", "gitlab"] {
+            for status in [200, 404, 403, 500] {
+                let (base, request) = one_shot(status).await;
+                let mut config = Config {
+                    forges: Default::default(),
+                    ..Default::default()
+                };
+                let path = match kind {
+                    "forgejo" => {
+                        config.forges.forgejo = Some(ForgejoConfig {
+                            base_url: base,
+                            token: Some("global".into()),
+                            ..Default::default()
+                        });
+                        "/api/v1/repos/owner/project"
+                    }
+                    "github" => {
+                        config.forges.github = Some(crate::config::GithubConfig {
+                            base_url: base,
+                            token: Some("github-token".into()),
+                            ..Default::default()
+                        });
+                        "/repos/owner/project"
+                    }
+                    _ => {
+                        config.forges.gitlab = Some(crate::config::GitlabConfig {
+                            base_url: base,
+                            token: Some("gitlab-token".into()),
+                            ..Default::default()
+                        });
+                        "/api/v4/projects/owner%2Fproject"
+                    }
+                };
+                let api =
+                    HttpForgeApi::with_forgejo_token(config, Some("user-token".into())).unwrap();
+                let result = api.repository_exists("owner/project").await;
+                match status {
+                    200 => assert!(result.unwrap()),
+                    404 => assert!(!result.unwrap()),
+                    _ => assert!(result.is_err()),
+                }
+                let request = request.await.unwrap();
+                assert!(request.starts_with(&format!("GET {path} ")), "{request}");
+                let credential = match kind {
+                    "forgejo" => "authorization: token user-token",
+                    "github" => "authorization: Bearer github-token",
+                    _ => "private-token: gitlab-token",
+                };
+                assert!(request.contains(credential), "{request}");
+            }
+        }
     }
 
     #[tokio::test]
