@@ -122,7 +122,11 @@ Implemented:
   the next turn. `pi-rpc` receives it as a `steer`, the default `codex`
   binary is driven through `codex app-server` and uses `turn/steer`, and the
   default `kimi` binary uses wire mode's `steer` (Wire 1.4+). The thread gets
-  a "📎 Merged into the current run." notice. Adapters with no live steering
+  a "📎 Merged into the current run." notice. Follow-ups received during
+  workspace or adapter startup are reconsidered every 100 ms, in queue order.
+  An implicit follow-up can join the fallback selected for its original adapter;
+  explicit adapter/model/effort requirements still require compatible launch
+  settings. Adapters with no live steering
   channel (an operator-supplied command/args, a Codex/Kimi build without the
   persistent protocol, `agy`, `claude`) queue the follow-up and run it as the
   next turn

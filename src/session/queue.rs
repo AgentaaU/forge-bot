@@ -140,6 +140,8 @@ struct ActiveRun {
 struct RunningAgent {
     /// Registry name, which can differ from the adapter implementation name.
     name: String,
+    /// Adapter selected before capacity/startup fallback.
+    requested_agent: String,
     agent: Arc<dyn Agent>,
     context: AgentContext,
 }
@@ -156,6 +158,7 @@ impl<'a> RunningGuard<'a> {
         running: &'a Mutex<HashMap<String, RunningAgent>>,
         key: String,
         name: String,
+        requested_agent: String,
         agent: Arc<dyn Agent>,
         context: AgentContext,
     ) -> Self {
@@ -166,6 +169,7 @@ impl<'a> RunningGuard<'a> {
                 key.clone(),
                 RunningAgent {
                     name,
+                    requested_agent,
                     agent,
                     context,
                 },
@@ -831,8 +835,29 @@ async fn scheduler_loop(
     // Conversations with queued work that are not running, in arrival order.
     let mut ready: VecDeque<String> = VecDeque::new();
 
+    // Adapters publish their live turn asynchronously, after workspace and
+    // process startup. Reconsider queued heads so a mention received during
+    // that window can still join the run. Receipts (including uncertain ones)
+    // remove jobs through the same path as immediate delivery.
+    let mut retry = tokio::time::interval(Duration::from_millis(100));
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = retry.tick(), if !queues.is_empty() => {
+                let keys: Vec<_> = queues.keys()
+                    .filter(|key| running.contains(*key)).cloned().collect();
+                for key in keys {
+                    let queue = queues.get_mut(&key).expect("queue exists");
+                    if let Some(job) = queue.front()
+                        && inner.try_merge_follow_up(job).await
+                    {
+                        queue.pop_front();
+                    }
+                    if queue.is_empty() {
+                        queues.remove(&key);
+                    }
+                }
+            }
             incoming = rx.recv() => {
                 let Some(job) = incoming else { break };
                 let key = job.session_key();
@@ -841,7 +866,9 @@ async fn scheduler_loop(
                     // into the live run before queueing another one. A
                     // persistent adapter takes it mid-run; a one-shot adapter
                     // returns `None` and the job keeps its old queueing path.
-                    if !inner.try_merge_follow_up(&job).await {
+                    if queues.get(&key).is_some_and(|queue| !queue.is_empty())
+                        || !inner.try_merge_follow_up(&job).await
+                    {
                         queues.entry(key).or_default().push_back(job);
                     }
                 } else if running.len() < concurrency {
@@ -1107,12 +1134,13 @@ impl Inner {
             agents.get(&key).map(|running| {
                 (
                     running.name.clone(),
+                    running.requested_agent.clone(),
                     running.agent.clone(),
                     running.context.clone(),
                 )
             })
         };
-        let Some((name, agent, mut context)) = running else {
+        let Some((name, requested_agent, agent, mut context)) = running else {
             return false;
         };
 
@@ -1123,14 +1151,18 @@ impl Inner {
             return false;
         };
         let settings = self.run_settings(job, &user);
-        let (model, effort) = if settings.agent.as_deref() == Some(job.agent.as_str()) {
+        let (model, effort) = if settings.agent.as_deref() == Some(name.as_str()) {
             (settings.model, settings.effort)
         } else {
             (None, None)
         };
         // A live process cannot adopt another adapter or launch settings.
         // Queue this mention so the next run uses the saved admin choices.
-        if name != job.agent || context.model != model || context.effort != effort {
+        // An implicit follow-up may join the fallback chosen for the same
+        // requested adapter. Explicit adapter choices must still match exactly.
+        let same_adapter =
+            name == job.agent || (job.mention.agent.is_none() && requested_agent == job.agent);
+        if !same_adapter || context.model != model || context.effort != effort {
             return false;
         }
 
@@ -1483,6 +1515,7 @@ impl Inner {
                 &self.running,
                 key.clone(),
                 name.clone(),
+                job.agent.clone(),
                 agent.clone(),
                 context.clone(),
             );
@@ -2134,6 +2167,7 @@ mod tests {
             "conversation".into(),
             RunningAgent {
                 name: "custom".into(),
+                requested_agent: "custom".into(),
                 agent: dispatcher.inner.agents.get("custom").unwrap(),
                 context,
             },
@@ -2201,6 +2235,7 @@ mod tests {
             job.session_key(),
             RunningAgent {
                 name: "codex".into(),
+                requested_agent: "codex".into(),
                 agent: dispatcher.inner.agents.get("codex").unwrap(),
                 context,
             },
@@ -2948,6 +2983,8 @@ mod tests {
         release: tokio::sync::Notify,
         steers: std::sync::Mutex<Vec<String>>,
         recipients: std::sync::Mutex<Vec<(bool, String)>>,
+        ready: std::sync::atomic::AtomicBool,
+        uncertain: bool,
     }
 
     impl SteeringAgent {
@@ -2957,6 +2994,8 @@ mod tests {
                 release: tokio::sync::Notify::new(),
                 steers: std::sync::Mutex::new(Vec::new()),
                 recipients: std::sync::Mutex::new(Vec::new()),
+                ready: std::sync::atomic::AtomicBool::new(true),
+                uncertain: false,
             }
         }
 
@@ -2994,14 +3033,142 @@ mod tests {
             request: &AgentRequest,
             context: &AgentContext,
         ) -> Result<Option<crate::agent::SteerReceipt>> {
+            if !self.ready.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             self.recipients
                 .lock()
                 .unwrap()
                 .push((context.automatic_event, context.requester.clone()));
             self.steers.lock().unwrap().push(request.message.clone());
             self.release.notify_one();
-            Ok(Some(crate::agent::SteerReceipt::merged()))
+            Ok(Some(if self.uncertain {
+                crate::agent::SteerReceipt::uncertain()
+            } else {
+                crate::agent::SteerReceipt::merged()
+            }))
         }
+    }
+
+    #[tokio::test]
+    async fn follow_up_received_before_adapter_readiness_is_retried() {
+        check_startup_follow_up(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn implicit_follow_up_joins_the_ready_fallback() {
+        check_startup_follow_up(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn uncertain_retried_follow_up_is_not_replayed() {
+        check_startup_follow_up(false, true).await;
+    }
+
+    async fn check_startup_follow_up(fallback: bool, uncertain: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = if fallback {
+            capacity_config(dir.path())
+        } else {
+            test_config(dir.path())
+        };
+        config.reply.ack = true;
+        config.policy.allow_all = true;
+        config.agent_sequence = if fallback {
+            vec!["capacity-agent".into(), "steering".into()]
+        } else {
+            vec!["steering".into()]
+        };
+        let requested = if fallback {
+            "capacity-agent"
+        } else {
+            "steering"
+        };
+        let config = Arc::new(config);
+
+        let steering = Arc::new(SteeringAgent {
+            uncertain,
+            ..SteeringAgent::new()
+        });
+        steering.ready.store(false, Ordering::SeqCst);
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test("steering", steering.clone());
+        // Keep the fallback deterministic: only the test agent is available.
+        for name in registry.names() {
+            if name != "steering" && !(fallback && name == "capacity-agent") {
+                registry.mark_unavailable(&name, Duration::from_secs(3600));
+            }
+        }
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let api = Arc::new(RecordingForgeApi::new());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(registry),
+            sessions.clone(),
+            api.clone(),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        // First mention starts the run, which blocks until steered.
+        dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    model: None,
+                    effort: None,
+                    agent: None,
+                    message: "first".into(),
+                },
+                requested,
+            )
+            .await
+            .unwrap();
+        dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    model: None,
+                    effort: None,
+                    agent: None,
+                    message: "second".into(),
+                },
+                requested,
+            )
+            .await
+            .unwrap();
+        // The first run is held open but its protocol is not ready yet.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(steering.steers().is_empty());
+        assert_eq!(steering.runs(), 1);
+        steering.ready.store(true, Ordering::SeqCst);
+        if fallback {
+            // Explicitly selecting the original adapter must not steer its fallback.
+            let mut explicit = sessions
+                .pending_jobs()
+                .unwrap()
+                .into_iter()
+                .find(|job| job.mention.message == "second")
+                .unwrap();
+            explicit.mention.agent = Some(requested.into());
+            assert!(!dispatcher.inner.try_merge_follow_up(&explicit).await);
+            explicit.mention.agent = None;
+            explicit.mention.model = Some("required-model".into());
+            assert!(!dispatcher.inner.try_merge_follow_up(&explicit).await);
+            explicit.mention.model = None;
+            explicit.mention.effort = Some("high".into());
+            assert!(!dispatcher.inner.try_merge_follow_up(&explicit).await);
+        }
+        tokio::time::timeout(Duration::from_secs(5), wait_for_drain(&sessions))
+            .await
+            .unwrap();
+        assert_eq!(
+            steering.runs(),
+            1,
+            "the queued follow-up must not launch a second run"
+        );
+        assert_eq!(steering.steers(), vec!["second".to_owned()]);
+        assert_eq!(dispatcher.inner.waiting_jobs.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3388,6 +3555,7 @@ mod tests {
             key,
             RunningAgent {
                 name: "plain".into(),
+                requested_agent: "plain".into(),
                 agent: plain,
                 context: AgentContext {
                     repository: "o/r".into(),
