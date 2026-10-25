@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct Mention {
     /// Optional agent selected inline, e.g. `@agent --agent=codex`.
     pub agent: Option<String>,
-    /// Explicit model for this invocation.
+    /// Explicit model; the dispatcher also snapshots an inherited conversation model here.
     #[serde(default)]
     pub model: Option<String>,
     /// Explicit reasoning effort for this invocation.

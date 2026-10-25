@@ -106,6 +106,16 @@ impl UserAgentSettings {
     }
 }
 
+/// Explicit adapter/model choice shared by an issue and its linked PRs.
+/// Reported models and capacity fallbacks never change this preference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSelection {
+    pub agent: String,
+    pub model: Option<String>,
+}
+
+const CONVERSATION_SELECTIONS_FILE: &str = "conversation-selections.json";
+
 /// Persists sessions and pending jobs under a directory.
 pub struct SessionStore {
     dir: PathBuf,
@@ -113,6 +123,7 @@ pub struct SessionStore {
     live_output: Mutex<HashMap<Uuid, LiveOutput>>,
     user_settings: Mutex<BTreeMap<String, UserAgentSettings>>,
     repository_settings: Mutex<BTreeMap<String, UserAgentSettings>>,
+    conversation_selections: Mutex<BTreeMap<String, ConversationSelection>>,
 }
 
 /// Read the saved overrides. A missing file means none; an unreadable one is
@@ -156,12 +167,19 @@ impl SessionStore {
 
         let user_settings = load_user_settings(&dir.join(USER_SETTINGS_FILE));
         let repository_settings = load_user_settings(&dir.join("repository-agent-settings.json"));
+        let selection_path = dir.join(CONVERSATION_SELECTIONS_FILE);
+        let conversation_selections = match std::fs::read(&selection_path) {
+            Ok(raw) => serde_json::from_slice(&raw)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(error.into()),
+        };
         let store = Self {
             dir,
             sessions: Mutex::new(sessions),
             live_output: Mutex::new(HashMap::new()),
             user_settings: Mutex::new(user_settings),
             repository_settings: Mutex::new(repository_settings),
+            conversation_selections: Mutex::new(conversation_selections),
         };
         // A run can only be executing in the process that started it, so any
         // run persisted without an end time when the store opens is stale.
@@ -191,6 +209,80 @@ impl SessionStore {
             Some(user) => format!("user:{user}:{base}"),
             None => base,
         }
+    }
+
+    /// Keep execution/status keys separate, but share explicit choices with
+    /// the linked issue. Include the user and forge to isolate agent accounts.
+    fn selection_key(message: &ForgeMessage, user_id: Option<&str>) -> String {
+        let mut conversation = message.clone();
+        if message.is_pull_request
+            && let Some(issue) = &message.linked_issue
+        {
+            conversation.repository = issue
+                .repository
+                .clone()
+                .unwrap_or_else(|| message.repository.clone());
+            conversation.number = Some(issue.number);
+            conversation.is_pull_request = false;
+        }
+        Self::key(&conversation, user_id)
+    }
+
+    pub fn conversation_selection(
+        &self,
+        message: &ForgeMessage,
+        user_id: Option<&str>,
+    ) -> Option<ConversationSelection> {
+        self.conversation_selections
+            .lock()
+            .expect("selection mutex poisoned")
+            .get(&Self::selection_key(message, user_id))
+            .cloned()
+    }
+
+    /// Apply the last explicit choice and save any new one before enqueueing.
+    /// The job receives a snapshot, so queued/recovered work cannot accidentally
+    /// pick up a later mention's settings. Effort remains invocation-only.
+    pub fn select_conversation(
+        &self,
+        job: &mut Job,
+        validate_agent: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<()> {
+        let key = Self::selection_key(&job.message, job.user_id.as_deref());
+        let mut selections = self
+            .conversation_selections
+            .lock()
+            .expect("selection mutex poisoned");
+        let previous = selections.get(&key);
+        let explicit_agent = job.mention.agent.as_deref().filter(|name| !name.is_empty());
+        let agent = explicit_agent
+            .map(str::to_owned)
+            .or_else(|| previous.map(|selection| selection.agent.clone()))
+            .unwrap_or_else(|| job.agent.clone());
+        validate_agent(&agent)?;
+        let model = job.mention.model.clone().or_else(|| {
+            previous
+                .filter(|selection| selection.agent == agent)
+                .and_then(|selection| selection.model.clone())
+        });
+        if explicit_agent.is_some() || job.mention.model.is_some() {
+            let mut next = selections.clone();
+            next.insert(
+                key,
+                ConversationSelection {
+                    agent: agent.clone(),
+                    model: model.clone(),
+                },
+            );
+            let path = self.dir.join(CONVERSATION_SELECTIONS_FILE);
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_vec_pretty(&next)?)?;
+            std::fs::rename(tmp, path)?;
+            *selections = next;
+        }
+        job.agent = agent;
+        job.mention.model = model;
+        Ok(())
     }
 
     /// Start (or continue) a session for a job.
@@ -585,6 +677,121 @@ mod tests {
             created_at: Utc::now(),
             status_comment: None,
             waiting: false,
+        }
+    }
+
+    #[test]
+    fn conversation_choices_survive_restart_and_linked_prs_without_leaking() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut original = job();
+        original.user_id = Some("bot".into());
+        original.mention.agent = Some("codex".into());
+        original.mention.model = Some("gpt-6-astra".into());
+        original.mention.effort = Some("high".into());
+        store
+            .select_conversation(&mut original, |_| Ok(()))
+            .unwrap();
+        drop(store);
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut follow_up = job();
+        follow_up.user_id = Some("bot".into());
+        follow_up.agent = "pi-rpc".into();
+        follow_up.message.is_pull_request = true;
+        follow_up.message.number = Some(3);
+        follow_up.message.linked_issue = Some(crate::forge::IssueRef {
+            repository: None,
+            number: 2,
+        });
+        let fresh = follow_up.clone();
+        store
+            .select_conversation(&mut follow_up, |_| Ok(()))
+            .unwrap();
+        assert_eq!(follow_up.agent, "codex");
+        assert_eq!(follow_up.mention.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(follow_up.mention.effort, None);
+        // Recovery retains the accepted snapshot even after another selection.
+        store.save_job(&follow_up).unwrap();
+        let mut changed = fresh.clone();
+        changed.mention.agent = Some("claude".into());
+        store.select_conversation(&mut changed, |_| Ok(())).unwrap();
+        assert_eq!(changed.mention.model, None);
+        let recovered = store.pending_jobs().unwrap();
+        assert_eq!(recovered[0].agent, "codex");
+        assert_eq!(recovered[0].mention.model.as_deref(), Some("gpt-6-astra"));
+        let mut issue = job();
+        issue.user_id = Some("bot".into());
+        store.select_conversation(&mut issue, |_| Ok(())).unwrap();
+        assert_eq!(issue.agent, "claude", "PR updates the shared issue choice");
+
+        for variant in 0..5 {
+            let mut other = fresh.clone();
+            match variant {
+                0 => other.user_id = Some("reviewer".into()),
+                1 => other.message.repository = "other/repo".into(),
+                2 => other.message.forge = ForgeKind::GitHub,
+                3 => other.message.linked_issue = None,
+                _ => other.message.linked_issue.as_mut().unwrap().number = 9,
+            }
+            store.select_conversation(&mut other, |_| Ok(())).unwrap();
+            assert_eq!(other.agent, "pi-rpc", "variant {variant}");
+            assert_eq!(other.mention.model, None);
+        }
+        let mut cross_repo = fresh;
+        cross_repo.message.repository = "other/repo".into();
+        cross_repo.message.linked_issue.as_mut().unwrap().repository = Some("a/b".into());
+        store
+            .select_conversation(&mut cross_repo, |_| Ok(()))
+            .unwrap();
+        assert_eq!(cross_repo.agent, "claude");
+    }
+
+    #[test]
+    fn conversation_choice_updates_are_explicit_and_transactional() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut original = job();
+        original.mention.model = Some("model-one".into());
+        store
+            .select_conversation(&mut original, |_| Ok(()))
+            .unwrap();
+        let mut same = job();
+        same.mention.agent = Some("codex".into());
+        store.select_conversation(&mut same, |_| Ok(())).unwrap();
+        assert_eq!(same.mention.model.as_deref(), Some("model-one"));
+        let mut change_model = job();
+        change_model.agent = "pi-rpc".into();
+        change_model.mention.model = Some("model-two".into());
+        store
+            .select_conversation(&mut change_model, |_| Ok(()))
+            .unwrap();
+        assert_eq!(change_model.agent, "codex");
+        assert_eq!(change_model.mention.model.as_deref(), Some("model-two"));
+
+        let mut invalid = job();
+        invalid.mention.agent = Some("typo".into());
+        assert!(
+            store
+                .select_conversation(&mut invalid, |name| Err(
+                    crate::error::BotError::UnknownAgent(name.into())
+                ))
+                .is_err()
+        );
+        // Failed disk writes must leave the remembered preference untouched.
+        let tmp = dir
+            .path()
+            .join(CONVERSATION_SELECTIONS_FILE)
+            .with_extension("json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(store.select_conversation(&mut invalid, |_| Ok(())).is_err());
+        std::fs::remove_dir(tmp).unwrap();
+        let reopened = SessionStore::open(dir.path()).unwrap();
+        for store in [&store, &reopened] {
+            let mut plain = job();
+            plain.agent = "pi-rpc".into();
+            store.select_conversation(&mut plain, |_| Ok(())).unwrap();
+            assert_eq!(plain.agent, "codex");
+            assert_eq!(plain.mention.model.as_deref(), Some("model-two"));
         }
     }
 

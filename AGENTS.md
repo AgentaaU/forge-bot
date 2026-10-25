@@ -10,7 +10,10 @@ for that configured agent user only. This permission does not apply to
 legacy configurations without user tables.
 
 An explicit model requirement in the user's AT—the `agent…` part of an
-`@agent… do something` mention—takes precedence for that invocation.
-Use exactly the required model and document why.
+`@agent… do something` mention—takes precedence and is remembered for that
+agent user's conversation, including PRs linked to its issue. Later calls inherit
+the explicit agent/model choice until another explicit choice replaces it.
+Use exactly the required model; do not infer preferences from reported models
+or capacity fallbacks.
 
 Models reported by agents may be stored and displayed in forge-bot status.

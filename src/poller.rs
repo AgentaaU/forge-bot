@@ -265,10 +265,33 @@ impl Poller {
                 cursor.last_time = Some(normalize_time(created));
             }
 
-            let Some(message) = message_from_comment(repo, &comment) else {
+            let Some(mut message) = message_from_comment(repo, &comment) else {
                 continue;
             };
+            // The comment list omits the PR description. Resolve its issue link
+            // before routing a mention, just as webhook/review payloads do.
+            // On API failure retain the cursor so we retry rather than launch
+            // with unrelated defaults.
+            if message.is_pull_request
+                && let Some(number) = message.number
+                && !self.dispatcher.policy().is_ignored(&message.author)
+                && matches!(self.dispatcher.route(&message), Ok(Some(_)))
+            {
+                let mut request = self
+                    .client
+                    .get(format!("{base}/api/v1/repos/{repo}/pulls/{number}"));
+                if let Some(token) = token {
+                    request = request.header("Authorization", format!("token {token}"));
+                }
+                let pull: Value = request.send().await?.error_for_status()?.json().await?;
+                message.linked_issue = pull["body"]
+                    .as_str()
+                    .and_then(crate::forge::linked_issue_ref);
+                message.title = pull["title"].as_str().map(str::to_owned);
+            }
             self.dispatch_message(message).await;
+            // A later PR lookup can fail; do not replay earlier accepted work.
+            self.set_cursor(repo, cursor.clone());
         }
 
         self.set_cursor(repo, cursor);
@@ -523,14 +546,28 @@ fn message_from_comment(repo: &str, comment: &Value) -> Option<ForgeMessage> {
         .and_then(|s| Url::parse(s).ok())?;
 
     let comment_id = comment["id"].as_i64();
-    let number = comment["issue_url"]
+    // Forgejo leaves issue_url empty (or absent) for PR conversation comments.
+    // Use the URL that identifies the object, including when both are present.
+    let pull_request_url = comment["pull_request_url"]
         .as_str()
-        .and_then(|url| url.rsplit('/').next())
-        .and_then(|tail| tail.parse::<u64>().ok());
-    let is_pull_request = comment["pull_request_url"]
-        .as_str()
-        .map(|url| !url.is_empty())
-        .unwrap_or(false);
+        .filter(|url| !url.is_empty());
+    let is_pull_request = pull_request_url.is_some();
+    let number = pull_request_url
+        .or_else(|| comment["issue_url"].as_str())
+        .and_then(|url| Url::parse(url).ok())
+        .and_then(|url| {
+            url.path()
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .filter(|number| *number > 0);
+    // A malformed PR must not create a shared pr:0 session/preference.
+    if is_pull_request && number.is_none() {
+        return None;
+    }
 
     Some(ForgeMessage {
         forge: ForgeKind::Forgejo,
@@ -645,18 +682,36 @@ mod tests {
     }
 
     #[test]
-    fn detects_pull_request_comments() {
-        let comment = json!({
-            "id": 1,
-            "body": "@shylock-bot x",
-            "html_url": "http://forge.local:3000/o/r/pulls/5#issuecomment-1",
-            "issue_url": "http://forge.local:3000/o/r/issues/5",
-            "pull_request_url": "http://forge.local:3000/o/r/pulls/5",
-            "user": { "login": "bob" }
-        });
-        let message = message_from_comment("o/r", &comment).unwrap();
-        assert!(message.is_pull_request);
-        assert_eq!(message.number, Some(5));
+    fn detects_pull_request_comments_with_empty_or_missing_issue_url() {
+        for issue_url in [None, Some(""), Some("http://forge.local/o/r/issues/99")] {
+            let mut comment = json!({
+                "id": 1,
+                "body": "@shylock-bot x",
+                "html_url": "http://forge.local/o/r/pulls/5#issuecomment-1",
+                "pull_request_url": "http://forge.local/o/r/pulls/5",
+                "user": { "login": "bob" }
+            });
+            if let Some(issue_url) = issue_url {
+                comment["issue_url"] = json!(issue_url);
+            }
+            let message = message_from_comment("o/r", &comment).unwrap();
+            assert!(message.is_pull_request);
+            assert_eq!(message.number, Some(5));
+            // Query strings/fragments/trailing slashes do not form the number.
+            comment["pull_request_url"] = json!("http://forge.local/o/r/pulls/5/?x=1#anchor");
+            assert_eq!(
+                message_from_comment("o/r", &comment).unwrap().number,
+                Some(5)
+            );
+            for invalid in [
+                "not-a-url",
+                "http://forge.local/o/r/pulls/no-number",
+                "http://forge.local/o/r/pulls/0",
+            ] {
+                comment["pull_request_url"] = json!(invalid);
+                assert!(message_from_comment("o/r", &comment).is_none());
+            }
+        }
     }
 
     #[test]
@@ -1408,6 +1463,175 @@ mod tests {
                 .is_err()
         );
         assert!(poller.cursor("o/r:reviews").last_time.is_none());
+    }
+
+    #[tokio::test]
+    async fn polled_pr_comments_inherit_isolate_and_retry_without_replaying_work() {
+        type SeenChoices = Arc<Mutex<Vec<(&'static str, Option<u64>, Option<String>)>>>;
+        struct Recorder {
+            name: &'static str,
+            seen: SeenChoices,
+        }
+        #[async_trait::async_trait]
+        impl crate::agent::Agent for Recorder {
+            fn name(&self) -> &str {
+                self.name
+            }
+            async fn run(
+                &self,
+                _: &crate::agent::AgentRequest,
+                context: &crate::agent::AgentContext,
+            ) -> Result<crate::agent::AgentOutcome> {
+                self.seen.lock().unwrap().push((
+                    self.name,
+                    context.issue_number,
+                    context.model.clone(),
+                ));
+                Ok(crate::agent::AgentOutcome::success("done", Duration::ZERO))
+            }
+        }
+        async fn drain(sessions: &SessionStore) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !sessions.pending_jobs().unwrap().is_empty()
+                    || sessions.list().iter().any(|session| session.is_running())
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        // Both real Forgejo shapes must resolve a PR independently of issue_url.
+        for omit_issue_url in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(MockState::default());
+            let mut issue = comment(
+                1,
+                "@shylock-bot --agent=codex --model=gpt-6-astra start",
+                "alice",
+            );
+            issue["issue_url"] = json!("http://forge.local/o/r/issues/555");
+            issue["html_url"] = json!("http://forge.local/o/r/issues/555#issuecomment-1");
+            let pr_comment = |id: i64, number: u64, body: &str| {
+                let mut value = json!({
+                    "id": id, "body": body,
+                    "html_url": format!("http://forge.local/o/r/pulls/{number}#issuecomment-{id}"),
+                    "pull_request_url": format!("http://forge.local/o/r/pulls/{number}"),
+                    "user": {"login": "alice"}
+                });
+                if !omit_issue_url {
+                    value["issue_url"] = json!("");
+                }
+                value
+            };
+            state.comments.lock().unwrap().insert(
+                "o/r".into(),
+                MockReply::Json(json!([
+                    issue,
+                    pr_comment(2, 556, "@shylock-bot continue"),
+                    pr_comment(
+                        3,
+                        557,
+                        "@shylock-bot --agent=codex --model=other-model start"
+                    ),
+                    pr_comment(4, 558, "@shylock-bot start"),
+                    pr_comment(5, 557, "@shylock-bot continue")
+                ])),
+            );
+            let parent = "/api/v1/repos/o/r/pulls/556?page=1";
+            state.pages.lock().unwrap().extend([
+                (parent.into(), MockReply::Status(500)),
+                (
+                    "/api/v1/repos/o/r/pulls/557?page=1".into(),
+                    MockReply::Json(json!({"body": "unrelated PR"})),
+                ),
+                (
+                    "/api/v1/repos/o/r/pulls/558?page=1".into(),
+                    MockReply::Json(json!({"body": "another unrelated PR"})),
+                ),
+            ]);
+            let base = start_mock(state.clone()).await;
+            let config = Arc::new(test_config(dir.path(), &base));
+            let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+            let seen: SeenChoices = Default::default();
+            let mut registry = AgentRegistry::from_config(&config);
+            for name in ["codex", "custom"] {
+                registry.insert_for_test(
+                    name,
+                    Arc::new(Recorder {
+                        name,
+                        seen: seen.clone(),
+                    }),
+                );
+            }
+            let dispatcher = Dispatcher::new(
+                config.clone(),
+                Arc::new(registry),
+                sessions.clone(),
+                Arc::new(NoopForgeApi),
+                crate::build_policy(&config),
+            )
+            .unwrap();
+            let poller = Poller::new(config, dispatcher).unwrap();
+
+            assert!(poller.poll_repo(&base, Some("tok"), "o/r").await.is_err());
+            drain(&sessions).await;
+            assert_eq!(poller.cursor("o/r").last_id, 1);
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![("codex", Some(555), Some("gpt-6-astra".into()))]
+            );
+            // A second failed lookup must not repeat the earlier accepted issue.
+            assert!(poller.poll_repo(&base, Some("tok"), "o/r").await.is_err());
+            drain(&sessions).await;
+            assert_eq!(seen.lock().unwrap().len(), 1);
+            state.pages.lock().unwrap().insert(
+                parent.into(),
+                MockReply::Json(json!({
+                    "number": 556, "title": "research", "body": "Addresses #555."
+                })),
+            );
+            poller.poll_repo(&base, Some("tok"), "o/r").await.unwrap();
+            drain(&sessions).await;
+            assert_eq!(poller.cursor("o/r").last_id, 5);
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![
+                    ("codex", Some(555), Some("gpt-6-astra".into())),
+                    ("codex", Some(556), Some("gpt-6-astra".into())),
+                    ("codex", Some(557), Some("other-model".into())),
+                    ("custom", Some(558), None),
+                    ("codex", Some(557), Some("other-model".into())),
+                ]
+            );
+            assert!(
+                sessions
+                    .list()
+                    .iter()
+                    .all(|session| !session.key.ends_with(":pr:0"))
+            );
+            poller.poll_repo(&base, Some("tok"), "o/r").await.unwrap();
+            drain(&sessions).await;
+            assert_eq!(seen.lock().unwrap().len(), 5);
+            let requests = state.requests.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.as_str() == "GET /api/v1/repos/o/r/pulls/556")
+                    .count(),
+                3
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| r == "GET /api/v1/repos/o/r/pulls/557")
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| r == "GET /api/v1/repos/o/r/pulls/558")
+            );
+        }
     }
 
     #[test]

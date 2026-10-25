@@ -357,16 +357,7 @@ impl Dispatcher {
         } else {
             agent_name
         };
-        // Resolve eagerly so an unknown agent fails before we persist a job.
-        // A typo in `--agent=` is a caller error, not something to swallow, so
-        // report it in the thread with the registered names.
-        let resolved = self.inner.agents.get(agent_name);
         let user_id = Some(user.id.clone());
-        if let Err(BotError::UnknownAgent(name)) = &resolved {
-            let body = unknown_agent_message(name, &self.inner.agents.names());
-            self.inner.reply(&message, &body, user_id.as_deref()).await;
-        }
-        resolved?;
 
         // A mention that lands while its conversation is busy will wait for the
         // run already in flight instead of starting, so say that rather than
@@ -394,6 +385,25 @@ impl Dispatcher {
             status_comment: None,
             waiting,
         };
+
+        // Resolve and validate under the selection lock before saving a choice:
+        // typos must not replace a working conversation preference.
+        if let Err(error) = self
+            .inner
+            .sessions
+            .select_conversation(&mut job, |name| self.inner.agents.get(name).map(|_| ()))
+        {
+            if let BotError::UnknownAgent(name) = &error {
+                self.inner
+                    .reply(
+                        &job.message,
+                        &unknown_agent_message(name, &self.inner.agents.names()),
+                        job.user_id.as_deref(),
+                    )
+                    .await;
+            }
+            return Err(error);
+        }
 
         // Acknowledge as soon as the job is accepted. When the forge can edit
         // the comment, remember its id so each fallback notice can be appended
@@ -513,7 +523,7 @@ impl Dispatcher {
     /// Resolve the mention and adapter for a message.
     ///
     /// A configured user is addressed by its derived login; the adapter
-    /// precedence is `--agent` → user `agent` → registry default.
+    /// precedence is `--agent` → conversation selection → admin/user defaults.
     ///
     /// Returns `Ok(None)` when the message does not address a configured user.
     /// A comment that addresses more than one configured user is rejected
@@ -538,6 +548,12 @@ impl Dispatcher {
             .agent
             .clone()
             .filter(|name| !name.is_empty())
+            .or_else(|| {
+                self.inner
+                    .sessions
+                    .conversation_selection(message, Some(&recipient.id))
+                    .map(|selection| selection.agent)
+            })
             .or_else(|| self.repository_agent(&message.repository, &recipient.id))
             .or_else(|| recipient.agent.clone())
             .unwrap_or_else(|| self.inner.agents.default_name().to_owned());
@@ -1424,7 +1440,7 @@ impl Inner {
         for (index, name) in candidates.iter().enumerate() {
             context.explicit_model = job.mention.model.is_some();
             context.explicit_effort = job.mention.effort.is_some();
-            // Inline requirements belong to this invocation, including fallback.
+            // Inline or inherited requirements apply to this invocation, including fallback.
             context.model = job.mention.model.clone().or_else(|| {
                 (name == &model_agent)
                     .then(|| settings.model.clone())
@@ -4385,6 +4401,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_issue_choice_follows_linked_pr_review_after_fallback_and_restart() {
+        struct ChoiceRecorder {
+            name: &'static str,
+            fail_once: std::sync::atomic::AtomicBool,
+            seen: Mutex<Vec<Option<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl Agent for ChoiceRecorder {
+            fn name(&self) -> &str {
+                self.name
+            }
+            async fn run(&self, _: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
+                self.seen.lock().unwrap().push(context.model.clone());
+                let mut outcome = if self.fail_once.swap(false, Ordering::SeqCst) {
+                    AgentOutcome::failure("rate limit exceeded (429)", Duration::ZERO)
+                } else {
+                    AgentOutcome::success("done", Duration::ZERO)
+                };
+                outcome.model = Some("reported-provider-default".into());
+                Ok(outcome)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = explicit_config(dir.path());
+        config.policy.allow_all = true;
+        config.agent_sequence = vec!["pi-rpc".into(), "codex".into()];
+        config.users.get_mut("shylock-bot").unwrap().agent = Some("pi-rpc".into());
+        let config = Arc::new(config);
+        let codex = Arc::new(ChoiceRecorder {
+            name: "codex",
+            fail_once: true.into(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let pi = Arc::new(ChoiceRecorder {
+            name: "pi-rpc",
+            fail_once: false.into(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test("codex", codex.clone());
+        registry.insert_for_test("pi-rpc", pi.clone());
+        let registry = Arc::new(registry);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry.clone(),
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+        let mut issue = message_at("shylock/stock-analysis", 555);
+        issue.body = "@shylock-bot --agent=codex --model=gpt-6-astra Do it.".into();
+        let (mention, agent) = dispatcher.route(&issue).unwrap().unwrap();
+        dispatcher.submit(issue, mention, &agent).await.unwrap();
+        wait_for_drain(&sessions).await;
+        assert_eq!(
+            *codex.seen.lock().unwrap(),
+            vec![Some("gpt-6-astra".into())]
+        );
+        assert_eq!(pi.seen.lock().unwrap().len(), 1, "first run fell back");
+
+        // Reproduce #555 -> inline review #556, including its non-closing link.
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "action": "created",
+            "issue": {"number": 556, "pull_request": {}, "body": "Addresses #555."},
+            "comment": {"id": 22441, "body": "@shylock-bot Don't submit these logs",
+                "html_url": "http://forge.local/shylock/stock-analysis/pulls/556#issuecomment-22441",
+                "user": {"login": "shylock"}},
+            "repository": {"full_name": "shylock/stock-analysis"}
+        })).unwrap();
+        let pr = crate::forge::parse_comment_payload(
+            ForgeKind::Forgejo,
+            "http://forge.local",
+            &payload,
+            "issue_comment",
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(pr.linked_issue.as_ref().unwrap().number, 555);
+        let reopened = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let restarted = Dispatcher::new(
+            config.clone(),
+            registry,
+            reopened.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+        let (mention, agent) = restarted.route(&pr).unwrap().unwrap();
+        assert_eq!(
+            agent, "codex",
+            "fallback must not replace the explicit choice"
+        );
+        assert_eq!(mention.model, None, "the new mention has no explicit model");
+        restarted.submit(pr.clone(), mention, &agent).await.unwrap();
+        wait_for_drain(&reopened).await;
+        assert_eq!(
+            *codex.seen.lock().unwrap(),
+            vec![Some("gpt-6-astra".into()); 2]
+        );
+        assert_eq!(pi.seen.lock().unwrap().len(), 1);
+
+        // Both another bot on this PR and this bot on another issue use defaults.
+        let mut reviewer = pr.clone();
+        reviewer.body = "@shylock-reviewer review".into();
+        assert_eq!(restarted.route(&reviewer).unwrap().unwrap().1, "pi-rpc");
+        let mut unrelated = message_at("shylock/stock-analysis", 557);
+        unrelated.body = "@shylock-bot go".into();
+        let (mention, agent) = restarted.route(&unrelated).unwrap().unwrap();
+        assert_eq!(agent, "pi-rpc");
+        restarted.submit(unrelated, mention, &agent).await.unwrap();
+        wait_for_drain(&reopened).await;
+        assert_eq!(pi.seen.lock().unwrap().last(), Some(&None));
+
+        // A new explicit adapter clears the old provider's model for this thread.
+        let mut switched = pr.clone();
+        switched.body = "@shylock-bot --agent=pi-rpc continue".into();
+        let (mention, agent) = restarted.route(&switched).unwrap().unwrap();
+        restarted.submit(switched, mention, &agent).await.unwrap();
+        wait_for_drain(&reopened).await;
+        let (mention, agent) = restarted.route(&pr).unwrap().unwrap();
+        assert_eq!(agent, "pi-rpc");
+        restarted.submit(pr, mention, &agent).await.unwrap();
+        wait_for_drain(&reopened).await;
+        assert_eq!(pi.seen.lock().unwrap().last(), Some(&None));
+    }
+
+    #[tokio::test]
     async fn admin_settings_override_the_users_model_and_effort() {
         /// Records the model and effort each run was handed.
         struct Recorder {
@@ -4512,7 +4657,7 @@ mod tests {
             );
             dispatcher
                 .submit(
-                    message("o/r"),
+                    message_at("o/r", 2),
                     Mention {
                         model: None,
                         effort: None,
@@ -4528,7 +4673,7 @@ mod tests {
             if supports_effort {
                 dispatcher
                     .submit(
-                        message("o/r"),
+                        message_at("o/r", 3),
                         crate::mention::extract_mention(
                             "@agent --agent=alternate --model=inline-model --effort=xhigh go",
                             "@agent",
@@ -4543,7 +4688,7 @@ mod tests {
                     alternate.seen.lock().unwrap()[2],
                     (Some("inline-model".into()), Some("xhigh".into()))
                 );
-                // A later request restores the existing admin settings.
+                // The unrelated original issue still uses its admin settings.
                 submit(dispatcher.clone()).await;
                 wait_for_drain(&sessions).await;
                 assert_eq!(
@@ -4586,7 +4731,7 @@ mod tests {
                     .repository_settings("o/other", "default")
                     .is_none()
             );
-            let mut scoped_message = message("o/r");
+            let mut scoped_message = message_at("o/r", 4);
             scoped_message.body =
                 "@agent --agent=recorder --model=explicit-model --effort=high go".into();
             dispatcher

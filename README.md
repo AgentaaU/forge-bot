@@ -421,9 +421,10 @@ reset-only recovery page lets operators remove them without allowing new saves.
 
 Choose a repository (`owner/repo`) in **Agent models and effort** to edit settings
 for each bot in that repository. Leave the repository blank for bot-wide settings.
-Repository overrides take precedence over bot-wide settings; explicit mention
-agent/model/effort options still take precedence for the invocation. Each repository
-save captures the selected adapter, model and effort as a complete override.
+Repository overrides take precedence over bot-wide settings. Saved conversation
+agent/model choices take precedence over those defaults; explicit mention options
+update the conversation choice (effort applies only to that invocation). Each
+repository save captures the selected adapter, model and effort as a complete override.
 Choose **Save settings** on the edited user row to apply a selection. Each row
 shows unsaved changes, save errors, or confirmation of the saved scope. Saving
 one row preserves edits in other rows; leaving with unsaved changes prompts
@@ -678,8 +679,16 @@ mention. Colon selector forms are no longer accepted.
 Leading `--agent=`, `--model=`, and `--effort=` options may appear in any
 order. The last repeated option wins. Model IDs are passed through exactly;
 effort must be one of `low`, `medium`, `high`, or `xhigh`.
-Inline model and effort override configured and admin choices for this
-invocation, including fallback adapters, and do not change later requests.
+An explicit agent/model choice overrides configured and admin defaults and is
+remembered for later calls to the same bot in that conversation, including a PR
+whose description closes/fixes/resolves or addresses the issue. These choices
+survive restarts and are isolated by bot user and forge; unrelated issues and PRs keep their own
+defaults. A new explicit choice updates the conversation. Switching adapters
+without specifying a model clears the previous adapter's model. Capacity fallbacks
+and agent-reported models never replace the saved choice. Effort remains specific
+to the invocation. Model requirements apply to fallback adapters as before.
+Selections made before this feature was installed must be specified once again;
+old run history does not distinguish explicit models from adapter defaults.
 Options end at the first instruction word or unknown, empty, or invalid option;
 that text remains part of the instruction. Options on subsequent lines are
 instruction text. Model and effort are passed through the agent's CLI or RPC

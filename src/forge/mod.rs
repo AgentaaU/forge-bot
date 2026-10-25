@@ -411,18 +411,28 @@ pub(crate) fn parse_description_payload(
     }])
 }
 
-/// Find the first issue referenced with a closing keyword
-/// (`close(s|d)`, `fix(es|ed)`, `resolve(s|d)`) in a description.
+/// Find the first issue referenced with a closing keyword or `addresses`.
 ///
-/// Forgejo, GitHub and GitLab all recognize those keywords to link a pull
-/// request to the issue it addresses. The reference may be `#123` (same
-/// repository) or `owner/repo#123` (another repository); keeping the
+/// Alongside forge closing keywords, recognize non-closing `Addresses #123`
+/// links so follow-up research PRs can continue their originating issue.
+/// The reference may be `#123` (same repository) or `owner/repo#123` (another repository); keeping the
 /// owner/repo lets a pull request and the issue it closes share one
 /// conversation even across repositories.
 pub(crate) fn linked_issue_ref(body: &str) -> Option<IssueRef> {
     // Longest forms first so `closes` is not shadowed by `close`.
-    const KEYWORDS: [&str; 9] = [
-        "closes", "closed", "close", "fixes", "fixed", "fix", "resolves", "resolved", "resolve",
+    const KEYWORDS: [&str; 12] = [
+        "closes",
+        "closed",
+        "close",
+        "fixes",
+        "fixed",
+        "fix",
+        "resolves",
+        "resolved",
+        "resolve",
+        "addresses",
+        "addressed",
+        "address",
     ];
 
     let lower = body.to_ascii_lowercase();
@@ -645,6 +655,8 @@ mod tests {
             })
         }
 
+        assert_eq!(linked_issue_ref("Addresses #555."), same(555));
+        assert_eq!(linked_issue_ref("addressable #555"), None);
         assert_eq!(linked_issue_ref("Fixes #42"), same(42));
         assert_eq!(linked_issue_ref("closes: #7"), same(7));
         assert_eq!(linked_issue_ref("Resolved #100 and more"), same(100));
