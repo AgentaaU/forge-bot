@@ -114,15 +114,16 @@ pub fn snapshot(sessions: Vec<Session>, pending: Vec<Job>) -> Vec<ThreadStatus> 
     // in the queue with no run records at all.
     for (key, mut waiting) in pending_by_key {
         let first = waiting.remove(0);
+        let canonical = first.message.conversation_message();
         let updated_at = waiting
             .last()
             .map_or(first.created_at, |job| job.created_at);
         threads.push(ThreadStatus {
             key,
-            repository: first.message.repository.clone(),
-            location: first.message.location.to_string(),
-            number: first.message.number,
-            thread_type: thread_type(first.message.is_pull_request).to_owned(),
+            repository: canonical.repository,
+            location: canonical.location.to_string(),
+            number: canonical.number,
+            thread_type: thread_type(canonical.is_pull_request).to_owned(),
             state: ThreadState::Queued,
             agent: first.agent.clone(),
             worker: first.user_id.clone(),
@@ -698,6 +699,24 @@ mod tests {
             effort: None,
             cache: None,
         }
+    }
+
+    #[test]
+    fn linked_pr_queued_before_first_run_uses_issue_status() {
+        let mut pr = job(4, true, "codex");
+        pr.message.linked_issue = Some(crate::forge::IssueRef {
+            repository: Some("other/repo".into()),
+            number: 3,
+        });
+        let threads = snapshot(vec![], vec![pr]);
+        assert_eq!(threads.len(), 1);
+        let thread = &threads[0];
+        assert_eq!(thread.key, "forgejo:other/repo:issue:3");
+        assert_eq!(thread.repository, "other/repo");
+        assert_eq!(thread.number, Some(3));
+        assert_eq!(thread.thread_type, "issue");
+        assert_eq!(thread.location, "http://forge.local/other/repo/issues/3");
+        assert_eq!(thread.state, ThreadState::Queued);
     }
 
     #[test]

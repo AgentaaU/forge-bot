@@ -358,6 +358,9 @@ impl Dispatcher {
             agent_name
         };
         let user_id = Some(user.id.clone());
+        self.inner
+            .sessions
+            .reconcile_linked_session(&message, user_id.as_deref())?;
 
         // A mention that lands while its conversation is busy will wait for the
         // run already in flight instead of starting, so say that rather than
@@ -827,6 +830,73 @@ impl Dispatcher {
     }
 }
 
+/// Whether work for one object key is still running, queued, or persisted.
+///
+/// A PR that only gained its issue link after being enqueued still runs under
+/// its old object key. Linked work must wait for all of it, including jobs that
+/// are queued but not started yet.
+fn object_has_work(
+    inner: &Inner,
+    key: &str,
+    running: &HashSet<String>,
+    queues: &HashMap<String, VecDeque<Job>>,
+) -> bool {
+    running.contains(key)
+        || queues.get(key).is_some_and(|queue| !queue.is_empty())
+        || inner
+            .sessions
+            .get(key)
+            .is_some_and(|session| session.is_running())
+        || inner
+            .sessions
+            .pending_jobs()
+            .map(|jobs| jobs.iter().any(|job| job.session_key() == key))
+            .unwrap_or(false)
+}
+
+/// Release linked conversations whose old object key just settled.
+fn settle_dependencies(
+    inner: &Inner,
+    settled: &str,
+    running: &HashSet<String>,
+    queues: &HashMap<String, VecDeque<Job>>,
+    ready: &mut VecDeque<String>,
+    blocked: &mut HashMap<String, HashSet<String>>,
+) {
+    // The old key may still have queued jobs; wait for all of them.
+    if object_has_work(inner, settled, running, queues) {
+        return;
+    }
+    let waiting: Vec<String> = blocked
+        .iter()
+        .filter(|(_, dependencies)| dependencies.contains(settled))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in waiting {
+        if let Some(job) = queues.get(&key).and_then(|queue| {
+            queue.iter().find(|job| {
+                SessionStore::object_key(&job.message, job.user_id.as_deref()) == settled
+            })
+        }) && let Err(error) = inner
+            .sessions
+            .reconcile_linked_session(&job.message, job.user_id.as_deref())
+        {
+            tracing::warn!(%error, key, "failed to reconcile linked session");
+        }
+        let Some(dependencies) = blocked.get_mut(&key) else {
+            continue;
+        };
+        dependencies.remove(settled);
+        if !dependencies.is_empty() {
+            continue;
+        }
+        blocked.remove(&key);
+        if !running.contains(&key) && queues.get(&key).is_some_and(|queue| !queue.is_empty()) {
+            ready.push_back(key);
+        }
+    }
+}
+
 /// Receive jobs and run them with bounded concurrency.
 ///
 /// Jobs are scheduled per conversation: at most one run per session key, and
@@ -850,6 +920,11 @@ async fn scheduler_loop(
     let mut queues: HashMap<String, VecDeque<Job>> = HashMap::new();
     // Conversations with queued work that are not running, in arrival order.
     let mut ready: VecDeque<String> = VecDeque::new();
+    // Canonical conversation -> old PR object keys that must settle first.
+    // A PR can gain its issue link while its pre-link run is still active. The
+    // linked job's key is already canonical, so remember the dependency until
+    // every job under the old key has finished.
+    let mut blocked: HashMap<String, HashSet<String>> = HashMap::new();
 
     // Adapters publish their live turn asynchronously, after workspace and
     // process startup. Reconsider queued heads so a mention received during
@@ -861,7 +936,8 @@ async fn scheduler_loop(
         tokio::select! {
             _ = retry.tick(), if !queues.is_empty() => {
                 let keys: Vec<_> = queues.keys()
-                    .filter(|key| running.contains(*key)).cloned().collect();
+                    .filter(|key| running.contains(*key) && !blocked.contains_key(*key))
+                    .cloned().collect();
                 for key in keys {
                     let queue = queues.get_mut(&key).expect("queue exists");
                     if let Some(job) = queue.front()
@@ -877,28 +953,44 @@ async fn scheduler_loop(
             incoming = rx.recv() => {
                 let Some(job) = incoming else { break };
                 let key = job.session_key();
+                // Register the old PR dependency before deciding whether this
+                // job can steer or start. The issue may already have a run, in
+                // which case its queue would otherwise bypass the old PR work.
+                let old_key = SessionStore::object_key(&job.message, job.user_id.as_deref());
+                if old_key != key && object_has_work(&inner, &old_key, &running, &queues) {
+                    blocked.entry(key.clone()).or_default().insert(old_key);
+                }
+                let is_blocked = blocked.get(&key).is_some_and(|deps| !deps.is_empty());
                 if running.contains(&key) {
                     // The conversation is busy: try to deliver the follow-up
                     // into the live run before queueing another one. A
                     // persistent adapter takes it mid-run; a one-shot adapter
                     // returns `None` and the job keeps its old queueing path.
-                    if queues.get(&key).is_some_and(|queue| !queue.is_empty())
+                    // A job waiting on old PR work must not steer into the
+                    // issue run, even when the adapter supports steering.
+                    if is_blocked
+                        || queues.get(&key).is_some_and(|queue| !queue.is_empty())
                         || !inner.try_merge_follow_up(&job).await
                     {
                         queues.entry(key).or_default().push_back(job);
                     }
-                } else if running.len() < concurrency {
+                } else if !is_blocked && running.len() < concurrency {
                     running.insert(key.clone());
                     spawn_job(&inner, job, key, &done_tx);
                 } else {
-                    if queues.entry(key.clone()).or_default().is_empty() {
+                    let queue = queues.entry(key.clone()).or_default();
+                    if !is_blocked && queue.is_empty() {
                         ready.push_back(key.clone());
                     }
-                    queues.get_mut(&key).expect("queue exists").push_back(job);
+                    queue.push_back(job);
                 }
             }
             Some(key) = done_rx.recv() => {
                 running.remove(&key);
+                // A PR may have been linked while its old key was busy. Only
+                // release linked work once every job under that old key has
+                // settled, then fold the old history into the issue session.
+                settle_dependencies(&inner, &key, &running, &queues, &mut ready, &mut blocked);
                 // Jobs that arrived while this conversation ran still need
                 // to be dispatched.
                 if queues.get(&key).is_some_and(|queue| !queue.is_empty()) {
@@ -911,7 +1003,10 @@ async fn scheduler_loop(
         // that are already running is a no-op defence: they never enter
         // `ready` while running.
         while running.len() < concurrency {
-            let Some(position) = ready.iter().position(|key| !running.contains(key)) else {
+            let Some(position) = ready
+                .iter()
+                .position(|key| !running.contains(key) && !blocked.contains_key(key))
+            else {
                 break;
             };
             let key = ready.remove(position).expect("position is valid");
@@ -1159,6 +1254,19 @@ impl Inner {
         let Some((name, requested_agent, agent, mut context)) = running else {
             return false;
         };
+
+        // A linked PR in another repository has the same conversation key as
+        // its issue, but it needs its own checkout and repository environment.
+        // Steering would silently run it in the issue's workspace, so queue it
+        // as the next job instead.
+        let workspace = self.workspaces.path_for_run(
+            &job.message,
+            context.host_user.as_deref(),
+            job.user_id.as_deref(),
+        );
+        if context.repository != job.message.repository || context.workspace != workspace {
+            return false;
+        }
 
         if context.explicit_model || context.explicit_effort {
             return false;
@@ -2999,6 +3107,7 @@ mod tests {
         release: tokio::sync::Notify,
         steers: std::sync::Mutex<Vec<String>>,
         recipients: std::sync::Mutex<Vec<(bool, String)>>,
+        contexts: std::sync::Mutex<Vec<(String, String)>>,
         ready: std::sync::atomic::AtomicBool,
         uncertain: bool,
     }
@@ -3010,6 +3119,7 @@ mod tests {
                 release: tokio::sync::Notify::new(),
                 steers: std::sync::Mutex::new(Vec::new()),
                 recipients: std::sync::Mutex::new(Vec::new()),
+                contexts: std::sync::Mutex::new(Vec::new()),
                 ready: std::sync::atomic::AtomicBool::new(true),
                 uncertain: false,
             }
@@ -3021,6 +3131,10 @@ mod tests {
 
         fn steers(&self) -> Vec<String> {
             self.steers.lock().unwrap().clone()
+        }
+
+        fn contexts(&self) -> Vec<(String, String)> {
+            self.contexts.lock().unwrap().clone()
         }
     }
 
@@ -3039,6 +3153,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((context.automatic_event, context.requester.clone()));
+            self.contexts.lock().unwrap().push((
+                context.repository.clone(),
+                context.workspace.to_string_lossy().into_owned(),
+            ));
             self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.release.notified().await;
             Ok(AgentOutcome::success("done", Duration::ZERO))
@@ -6181,6 +6299,399 @@ echo "end:$token" >> "$AGENT_LOG"
             first_start < first_end && first_end < second_start,
             "runs must be ordered and not overlap: {contents}"
         );
+    }
+
+    #[tokio::test]
+    async fn linked_issue_pr_jobs_share_queue_and_status_with_spare_workers() {
+        for cross_repo in [false, true] {
+            for pr_first in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (dispatcher, sessions, log, release) = gated_dispatcher(dir.path(), 2);
+                let issue = message_at("o/r", 3);
+                let mut pr = message_at(if cross_repo { "other/repo" } else { "o/r" }, 4);
+                pr.is_pull_request = true;
+                pr.location = url::Url::parse(&format!(
+                    "http://forge.local/{}/pulls/4#issuecomment-9",
+                    pr.repository
+                ))
+                .unwrap();
+                pr.linked_issue = Some(crate::forge::IssueRef {
+                    repository: cross_repo.then(|| "o/r".into()),
+                    number: 3,
+                });
+                let (first, second) = if pr_first { (pr, issue) } else { (issue, pr) };
+                for (message, token) in [(first, "TOKEN_A"), (second.clone(), "TOKEN_B")] {
+                    dispatcher
+                        .submit(
+                            message,
+                            Mention {
+                                agent: Some("gate".into()),
+                                model: None,
+                                effort: None,
+                                message: token.into(),
+                            },
+                            "gate",
+                        )
+                        .await
+                        .unwrap();
+                    if token == "TOKEN_A" {
+                        wait_for_log(&log, "start:TOKEN_A").await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(
+                    !std::fs::read_to_string(&log)
+                        .unwrap()
+                        .contains("start:TOKEN_B")
+                );
+                let threads = dispatcher.threads().unwrap();
+                assert_eq!(threads.len(), 1);
+                assert_eq!(threads[0].number, Some(3));
+                assert_eq!(threads[0].thread_type, "issue");
+                assert_eq!(threads[0].queued, 1);
+                assert_eq!(threads[0].location, "http://forge.local/o/r/issues/3");
+                let pending = sessions.pending_jobs().unwrap();
+                let follow_up = pending
+                    .iter()
+                    .find(|job| job.mention.message == "TOKEN_B")
+                    .unwrap();
+                assert_eq!(follow_up.message.location, second.location);
+                assert_eq!(follow_up.message.is_pull_request, second.is_pull_request);
+                release_token(&release, "TOKEN_A");
+                wait_for_log(&log, "start:TOKEN_B").await;
+                release_token(&release, "TOKEN_B");
+                wait_for_drain(&sessions).await;
+                let threads = dispatcher.threads().unwrap();
+                assert_eq!(threads.len(), 1);
+                assert_eq!(threads[0].runs, 2);
+                let reopened = SessionStore::open(dir.path()).unwrap();
+                assert_eq!(reopened.list().len(), 1);
+                assert_eq!(reopened.list()[0].runs.len(), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_repository_linked_follow_up_must_queue_for_its_own_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.policy.allow_all = true;
+        config.session.workers = 2;
+        config.agent_sequence = vec!["steering".into()];
+        let config = Arc::new(config);
+
+        let steering = Arc::new(SteeringAgent::new());
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test("steering", steering.clone());
+        for name in registry.names() {
+            if name != "steering" {
+                registry.mark_unavailable(&name, Duration::from_secs(3600));
+            }
+        }
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(registry),
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        dispatcher
+            .submit(
+                message_at("o/r", 1),
+                Mention {
+                    model: None,
+                    effort: None,
+                    agent: Some("steering".into()),
+                    message: "first".into(),
+                },
+                "steering",
+            )
+            .await
+            .unwrap();
+        wait_for_counter(&steering.runs, 1).await;
+
+        // The PR lives in another repository but shares the issue's canonical
+        // conversation key. It must not inherit the issue's workspace.
+        let mut pr = message_at("other/repo", 4);
+        pr.is_pull_request = true;
+        pr.location = Url::parse("http://forge.local/other/repo/pulls/4#issuecomment-9").unwrap();
+        pr.linked_issue = Some(crate::forge::IssueRef {
+            repository: Some("o/r".into()),
+            number: 1,
+        });
+        dispatcher
+            .submit(
+                pr,
+                Mention {
+                    model: None,
+                    effort: None,
+                    agent: Some("steering".into()),
+                    message: "second".into(),
+                },
+                "steering",
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            steering.steers().is_empty(),
+            "the cross-repository PR must not be steered into the issue run"
+        );
+        assert_eq!(steering.runs(), 1);
+        assert!(
+            sessions
+                .pending_jobs()
+                .unwrap()
+                .iter()
+                .any(|job| job.mention.message == "second"),
+            "the rejected merge must stay queued instead of being deleted"
+        );
+
+        steering.release.notify_one();
+        wait_for_counter(&steering.runs, 2).await;
+        let contexts = steering.contexts();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].0, "o/r");
+        assert_eq!(contexts[1].0, "other/repo");
+        assert!(
+            contexts[1].1.ends_with("other__repo-4"),
+            "the PR needs its own checkout, got {}",
+            contexts[1].1
+        );
+        steering.release.notify_one();
+        wait_for_drain(&sessions).await;
+    }
+
+    #[tokio::test]
+    async fn link_added_during_run_must_serialize_old_pr_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dispatcher, sessions, log, release) = gated_dispatcher(dir.path(), 2);
+
+        let mut pr = message_at("o/r", 4);
+        pr.is_pull_request = true;
+        pr.location = Url::parse("http://forge.local/o/r/pulls/4#issuecomment-4").unwrap();
+        let mention = |token: &str| Mention {
+            model: None,
+            effort: None,
+            agent: Some("gate".into()),
+            message: token.into(),
+        };
+
+        dispatcher
+            .submit(pr.clone(), mention("TOKEN_A"), "gate")
+            .await
+            .unwrap();
+        wait_for_log(&log, "start:TOKEN_A").await;
+
+        // This mention still sees the unlinked PR, so it queues behind A under
+        // the old PR key.
+        dispatcher
+            .submit(pr.clone(), mention("TOKEN_B"), "gate")
+            .await
+            .unwrap();
+
+        // The link is added while A runs. This mention already uses the issue
+        // key, but must still wait for both A and the queued B.
+        let mut linked = pr;
+        linked.linked_issue = Some(crate::forge::IssueRef {
+            repository: None,
+            number: 3,
+        });
+        dispatcher
+            .submit(linked.clone(), mention("TOKEN_C"), "gate")
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let contents = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !contents.contains("start:TOKEN_B"),
+            "the same PR must serialize: {contents}"
+        );
+        assert!(
+            !contents.contains("start:TOKEN_C"),
+            "the linked job must wait for all old PR work: {contents}"
+        );
+
+        release_token(&release, "TOKEN_A");
+        wait_for_log(&log, "start:TOKEN_B").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("start:TOKEN_C"),
+            "the linked job must also wait for queued old PR work"
+        );
+
+        release_token(&release, "TOKEN_B");
+        wait_for_log(&log, "start:TOKEN_C").await;
+        release_token(&release, "TOKEN_C");
+        wait_for_drain(&sessions).await;
+
+        let stored = sessions.list();
+        assert_eq!(stored.len(), 1, "old PR history must fold into the issue");
+        assert_eq!(stored[0].key, SessionStore::key(&linked, Some("default")));
+        assert_eq!(stored[0].runs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn link_added_while_issue_runs_must_wait_for_old_pr_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dispatcher, sessions, log, release) = gated_dispatcher(dir.path(), 2);
+
+        let mut pr = message_at("o/r", 4);
+        pr.is_pull_request = true;
+        pr.location = Url::parse("http://forge.local/o/r/pulls/4#issuecomment-4").unwrap();
+        let mention = |token: &str| Mention {
+            model: None,
+            effort: None,
+            agent: Some("gate".into()),
+            message: token.into(),
+        };
+
+        // The old PR run and the linked issue run are both active when the PR
+        // gains its link. The linked job queues behind the issue, but must not
+        // start on that queue alone.
+        dispatcher
+            .submit(pr.clone(), mention("TOKEN_A"), "gate")
+            .await
+            .unwrap();
+        wait_for_log(&log, "start:TOKEN_A").await;
+        dispatcher
+            .submit(message_at("o/r", 3), mention("TOKEN_X"), "gate")
+            .await
+            .unwrap();
+        wait_for_log(&log, "start:TOKEN_X").await;
+
+        let mut linked = pr;
+        linked.linked_issue = Some(crate::forge::IssueRef {
+            repository: None,
+            number: 3,
+        });
+        dispatcher
+            .submit(linked.clone(), mention("TOKEN_C"), "gate")
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("start:TOKEN_C"),
+            "the linked job must not start while both runs are active"
+        );
+
+        // Finishing the issue run must not release the linked job while the
+        // old PR work is still in flight.
+        release_token(&release, "TOKEN_X");
+        wait_for_log(&log, "end:TOKEN_X").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("start:TOKEN_C"),
+            "the linked job must wait for the old PR run, not just the issue run"
+        );
+
+        release_token(&release, "TOKEN_A");
+        wait_for_log(&log, "start:TOKEN_C").await;
+        release_token(&release, "TOKEN_C");
+        wait_for_drain(&sessions).await;
+
+        let stored = sessions.list();
+        assert_eq!(stored.len(), 1, "old PR history must fold into the issue");
+        assert_eq!(stored[0].key, SessionStore::key(&linked, Some("default")));
+        assert_eq!(stored[0].runs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn blocked_link_must_not_steer_into_a_running_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.policy.allow_all = true;
+        config.session.workers = 2;
+        config.agent_sequence = vec!["steering".into()];
+        let config = Arc::new(config);
+
+        let steering = Arc::new(SteeringAgent::new());
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test("steering", steering.clone());
+        for name in registry.names() {
+            if name != "steering" {
+                registry.mark_unavailable(&name, Duration::from_secs(3600));
+            }
+        }
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(registry),
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+        let mention = |text: &str| Mention {
+            model: None,
+            effort: None,
+            agent: Some("steering".into()),
+            message: text.into(),
+        };
+
+        let mut pr = message_at("o/r", 4);
+        pr.is_pull_request = true;
+        pr.location = Url::parse("http://forge.local/o/r/pulls/4#issuecomment-4").unwrap();
+        dispatcher
+            .submit(pr.clone(), mention("old PR"), "steering")
+            .await
+            .unwrap();
+        wait_for_counter(&steering.runs, 1).await;
+        dispatcher
+            .submit(message_at("o/r", 3), mention("issue"), "steering")
+            .await
+            .unwrap();
+        wait_for_counter(&steering.runs, 2).await;
+
+        let mut linked = pr;
+        linked.linked_issue = Some(crate::forge::IssueRef {
+            repository: None,
+            number: 3,
+        });
+        dispatcher
+            .submit(linked, mention("linked"), "steering")
+            .await
+            .unwrap();
+
+        // The steerable issue run must not consume the linked job while its
+        // old PR work is still active. This covers both immediate and retried
+        // follow-up delivery.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            steering.steers().is_empty(),
+            "the linked job must not steer into the running issue"
+        );
+        assert_eq!(steering.runs(), 2);
+        assert!(
+            sessions
+                .pending_jobs()
+                .unwrap()
+                .iter()
+                .any(|job| job.mention.message == "linked")
+        );
+
+        // Release every run; the linked job may start or merge only after the
+        // old PR work settles.
+        for _ in 0..100 {
+            steering.release.notify_waiters();
+            if sessions.pending_jobs().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(sessions.pending_jobs().unwrap().is_empty());
     }
 
     /// Terminating a thread stops its run, records it as failed, and frees the

@@ -887,7 +887,7 @@ async fn handles_pull_request_review_events() {
 
     let session = harness
         .sessions
-        .get("user:default:forgejo:shylock/forge-bot:pr:16")
+        .get("user:default:forgejo:shylock/forge-bot:issue:5")
         .expect("review session should exist");
     assert_eq!(session.runs.len(), 1);
     assert_eq!(session.runs[0].success, Some(true));
@@ -925,7 +925,7 @@ async fn handles_rejected_review_bodies() {
 
     let session = harness
         .sessions
-        .get("user:default:forgejo:shylock/forge-bot:pr:17")
+        .get("user:default:forgejo:shylock/forge-bot:issue:6")
         .expect("rejected-review session should exist");
     assert_eq!(session.runs.len(), 1);
     assert_eq!(session.runs[0].success, Some(true));
@@ -968,7 +968,7 @@ async fn rejected_review_peer_handoff_works_with_polling_disabled() {
     for _ in 0..200 {
         if harness
             .sessions
-            .get("user:default:forgejo:shylock/forge-bot:pr:17")
+            .get("user:default:forgejo:shylock/forge-bot:issue:6")
             .is_some_and(|s| s.runs.len() == 1 && s.runs[0].success == Some(true))
         {
             break;
@@ -977,7 +977,7 @@ async fn rejected_review_peer_handoff_works_with_polling_disabled() {
     }
     let session = harness
         .sessions
-        .get("user:default:forgejo:shylock/forge-bot:pr:17")
+        .get("user:default:forgejo:shylock/forge-bot:issue:6")
         .unwrap();
     assert_eq!(session.runs.len(), 1);
     assert_eq!(session.runs[0].success, Some(true));

@@ -1262,14 +1262,14 @@ mod tests {
         poller.tick().await.unwrap();
         for _ in 0..200 {
             if sessions
-                .get("user:default:forgejo:o/r:pr:159")
+                .get("user:default:forgejo:o/r:issue:156")
                 .is_some_and(|s| s.runs.len() == 1 && s.runs[0].success == Some(true))
             {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let session = sessions.get("user:default:forgejo:o/r:pr:159").unwrap();
+        let session = sessions.get("user:default:forgejo:o/r:issue:156").unwrap();
         assert_eq!(session.runs.len(), 1);
         assert!(
             session.runs[0]
@@ -1295,7 +1295,7 @@ mod tests {
         restarted.tick().await.unwrap();
         assert_eq!(
             sessions
-                .get("user:default:forgejo:o/r:pr:159")
+                .get("user:default:forgejo:o/r:issue:156")
                 .unwrap()
                 .runs
                 .len(),
@@ -1313,7 +1313,7 @@ mod tests {
         restarted.tick().await.unwrap();
         for _ in 0..200 {
             if sessions
-                .get("user:default:forgejo:o/r:pr:159")
+                .get("user:default:forgejo:o/r:issue:156")
                 .unwrap()
                 .runs
                 .len()
@@ -1325,7 +1325,7 @@ mod tests {
         }
         assert_eq!(
             sessions
-                .get("user:default:forgejo:o/r:pr:159")
+                .get("user:default:forgejo:o/r:issue:156")
                 .unwrap()
                 .runs
                 .len(),

@@ -116,7 +116,12 @@ Implemented:
   reused across comments. Codex starts a new backend thread for a new forge
   conversation, even in the same workspace, and resumes that conversation's
   saved thread on later comments. A PR linked to an issue shares the issue's
-  conversation and session.
+  conversation and session, with one per-user queue and status row. Linked PRs
+  in the same repository also reuse the issue checkout; cross-repository PRs
+  keep a checkout of their own repository. Saved PR run history from older
+  versions is merged when a linked PR event (or recovered pending job) supplies
+  the issue link; idle historical rows without a new event remain until then
+  or until retention evicts them.
 - [x] Same-thread follow-ups: a second mention while a run is in flight is
   merged into that same run instead of waiting for it to settle and becoming
   the next turn. `pi-rpc` receives it as a `steer`, the default `codex`

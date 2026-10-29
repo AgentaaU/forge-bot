@@ -103,6 +103,36 @@ pub struct ForgeMessage {
 }
 
 impl ForgeMessage {
+    /// Canonical issue/PR used for scheduling and status. Keep the original
+    /// message on the job for prompts, credentials, and forge replies.
+    pub(crate) fn conversation_message(&self) -> Self {
+        let mut conversation = self.clone();
+        if self.is_pull_request
+            && let Some(issue) = &self.linked_issue
+        {
+            conversation.repository = issue
+                .repository
+                .clone()
+                .unwrap_or_else(|| self.repository.clone());
+            conversation.number = Some(issue.number);
+            conversation.is_pull_request = false;
+            let mut location = self.location.clone();
+            let separator = if self.forge == crate::location::ForgeKind::GitLab {
+                "/-/"
+            } else {
+                "/"
+            };
+            location.set_path(&format!(
+                "/{}{separator}issues/{}",
+                conversation.repository, issue.number
+            ));
+            location.set_fragment(None);
+            location.set_query(None);
+            conversation.location = location;
+        }
+        conversation
+    }
+
     /// Stable key identifying the conversation (thread) this message belongs
     /// to. Pull requests are folded onto their linked issue when one is known,
     /// so a pull request and the issue it closes share an agent/session. The

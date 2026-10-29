@@ -71,6 +71,18 @@ impl WorkspaceManager {
         }
     }
 
+    /// Checkout directory a run with this context will use. Follow-up steering
+    /// compares it with the live context so a linked PR cannot inherit another
+    /// repository's working copy.
+    pub(crate) fn path_for_run(
+        &self,
+        message: &ForgeMessage,
+        host_user: Option<&str>,
+        user_id: Option<&str>,
+    ) -> PathBuf {
+        self.dir_for(message, host_user, user_id)
+    }
+
     /// Ensure a checkout exists for `message` and return its path.
     pub async fn prepare(
         &self,
@@ -163,8 +175,21 @@ impl WorkspaceManager {
 fn workspace_dir_name(message: &ForgeMessage) -> String {
     let owner = sanitize(message.owner());
     let repo = sanitize(message.repo_name());
-    let suffix = message
-        .number
+    // Linked PRs in this repository continue in the issue's checkout. A
+    // cross-repository PR still needs its own repository's code and remote.
+    let number = message
+        .linked_issue
+        .as_ref()
+        .filter(|issue| {
+            message.is_pull_request
+                && issue
+                    .repository
+                    .as_deref()
+                    .is_none_or(|repo| repo == message.repository)
+        })
+        .map(|issue| issue.number)
+        .or(message.number);
+    let suffix = number
         .map(|n| format!("-{n}"))
         .unwrap_or_else(|| "-latest".to_owned());
     format!("{owner}__{repo}{suffix}")
@@ -365,6 +390,23 @@ mod tests {
             manager.path_for(&msg(), Some("reviewer")),
             PathBuf::from("/tmp/ws/reviewer/Org__My-Repo-3")
         );
+    }
+
+    #[test]
+    fn linked_pr_reuses_issue_checkout_only_in_the_same_repository() {
+        let issue = msg();
+        let mut pr = issue.clone();
+        pr.is_pull_request = true;
+        pr.number = Some(4);
+        pr.linked_issue = Some(crate::forge::IssueRef {
+            repository: None,
+            number: 3,
+        });
+        assert_eq!(workspace_dir_name(&issue), workspace_dir_name(&pr));
+        pr.linked_issue.as_mut().unwrap().repository = Some(issue.repository.clone());
+        assert_eq!(workspace_dir_name(&issue), workspace_dir_name(&pr));
+        pr.linked_issue.as_mut().unwrap().repository = Some("other/repo".into());
+        assert_eq!(workspace_dir_name(&pr), "Org__My-Repo-4");
     }
 
     #[test]

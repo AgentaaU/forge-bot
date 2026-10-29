@@ -186,6 +186,9 @@ impl SessionStore {
         // Close it now so the status page does not report a phantom running
         // thread after a restart (issue #110).
         store.interrupt_stale_runs();
+        for job in store.pending_jobs()? {
+            store.reconcile_linked_session(&job.message, job.user_id.as_deref())?;
+        }
         Ok(store)
     }
 
@@ -194,6 +197,12 @@ impl SessionStore {
     /// `user_id` namespaces the key so two accounts never share a session or
     /// job queue. `None` is only reachable from tests.
     pub fn key(message: &ForgeMessage, user_id: Option<&str>) -> String {
+        Self::object_key(&message.conversation_message(), user_id)
+    }
+
+    // The old, object-specific key is retained only to locate saved PR history
+    // and to serialize work that started before a PR link was known.
+    pub(crate) fn object_key(message: &ForgeMessage, user_id: Option<&str>) -> String {
         let base = format!(
             "{}:{}:{}:{}",
             message.forge,
@@ -211,21 +220,66 @@ impl SessionStore {
         }
     }
 
-    /// Keep execution/status keys separate, but share explicit choices with
-    /// the linked issue. Include the user and forge to isolate agent accounts.
     fn selection_key(message: &ForgeMessage, user_id: Option<&str>) -> String {
-        let mut conversation = message.clone();
-        if message.is_pull_request
-            && let Some(issue) = &message.linked_issue
-        {
-            conversation.repository = issue
-                .repository
-                .clone()
-                .unwrap_or_else(|| message.repository.clone());
-            conversation.number = Some(issue.number);
-            conversation.is_pull_request = false;
+        Self::key(message, user_id)
+    }
+
+    /// Fold old PR run history into its issue when an event supplies the link.
+    /// Old session files do not contain that link, so migration is lazy. Write
+    /// the merged history before deleting the old file and deduplicate job IDs
+    /// so a restart between those writes is safe.
+    pub fn reconcile_linked_session(
+        &self,
+        message: &ForgeMessage,
+        user_id: Option<&str>,
+    ) -> Result<()> {
+        let old_key = Self::object_key(message, user_id);
+        let key = Self::key(message, user_id);
+        if old_key == key {
+            return Ok(());
         }
-        Self::key(&conversation, user_id)
+        let mut sessions = self.sessions.lock().expect("session mutex poisoned");
+        let Some(old) = sessions.get(&old_key) else {
+            return Ok(());
+        };
+        // A PR newly linked while executing must finish under its original key.
+        // The next event can migrate it after that run settles.
+        if old.is_running() {
+            return Ok(());
+        }
+        let mut merged = sessions.get(&key).cloned().unwrap_or_else(|| {
+            let mut session = old.clone();
+            session.key = key.clone();
+            session.runs.clear();
+            session
+        });
+        let canonical = message.conversation_message();
+        merged.repository = canonical.repository;
+        merged.location = canonical.location.to_string();
+        merged.created_at = merged.created_at.min(old.created_at);
+        if old.updated_at > merged.updated_at && !merged.is_running() {
+            merged.agent = old.agent.clone();
+        }
+        merged.updated_at = merged.updated_at.max(old.updated_at);
+        let mut ids: HashSet<_> = merged.runs.iter().map(|run| run.job_id).collect();
+        merged.runs.extend(
+            old.runs
+                .iter()
+                .filter(|run| ids.insert(run.job_id))
+                .cloned(),
+        );
+        merged
+            .runs
+            .sort_by_key(|run| (run.finished_at.is_none(), run.started_at));
+        self.persist_locked(&merged)?;
+        sessions.insert(key, merged);
+        std::fs::remove_file(
+            self.dir
+                .join("sessions")
+                .join(format!("{}.json", file_key(&old_key))),
+        )?;
+        sessions.remove(&old_key);
+        Ok(())
     }
 
     pub fn conversation_selection(
@@ -287,13 +341,15 @@ impl SessionStore {
 
     /// Start (or continue) a session for a job.
     pub fn begin(&self, job: &Job) -> Result<Session> {
+        self.reconcile_linked_session(&job.message, job.user_id.as_deref())?;
+        let canonical = job.message.conversation_message();
         let key = job.session_key();
         let mut sessions = self.sessions.lock().expect("session mutex poisoned");
 
         let session = sessions.entry(key.clone()).or_insert_with(|| Session {
             key: key.clone(),
-            repository: job.message.repository.clone(),
-            location: job.message.location.to_string(),
+            repository: canonical.repository.clone(),
+            location: canonical.location.to_string(),
             agent: job.agent.clone(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -302,7 +358,7 @@ impl SessionStore {
 
         let now = Utc::now();
         session.agent = job.agent.clone();
-        session.location = job.message.location.to_string();
+        session.location = canonical.location.to_string();
         session.updated_at = now;
 
         // A session runs at most one job at a time, so any run still marked
@@ -805,6 +861,78 @@ mod tests {
         value.as_object_mut().unwrap().remove("model_agent");
         let legacy: Job = serde_json::from_value(value).unwrap();
         assert_eq!(legacy.model_agent, None);
+    }
+
+    #[test]
+    fn linked_keys_keep_unlinked_prs_and_other_users_separate() {
+        let issue = job();
+        let mut pr = issue.clone();
+        pr.message.is_pull_request = true;
+        assert_ne!(issue.session_key(), pr.session_key());
+        pr.message.number = Some(4);
+        pr.message.linked_issue = Some(crate::forge::IssueRef {
+            repository: None,
+            number: 2,
+        });
+        assert_eq!(issue.session_key(), pr.session_key());
+        assert_eq!(
+            SessionStore::key(&issue.message, Some("worker")),
+            SessionStore::key(&pr.message, Some("worker"))
+        );
+        assert_ne!(
+            SessionStore::key(&issue.message, Some("worker")),
+            SessionStore::key(&pr.message, Some("reviewer"))
+        );
+        pr.message.forge = ForgeKind::GitLab;
+        assert_ne!(issue.session_key(), pr.session_key());
+        assert_eq!(
+            pr.message.conversation_message().location.as_str(),
+            "http://forge.local/a/b/-/issues/2"
+        );
+    }
+
+    #[test]
+    fn linked_pr_history_migrates_without_duplicates_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let issue = job();
+        let mut pr = job();
+        pr.message.is_pull_request = true;
+        pr.message.number = Some(4);
+        pr.message.location = Url::parse("http://forge.local/a/b/pulls/4#issuecomment-9").unwrap();
+        store.begin(&issue).unwrap();
+        store.begin(&pr).unwrap();
+        // Reopening closes both old runs, as on upgrade from separate keys.
+        drop(store);
+        let store = SessionStore::open(dir.path()).unwrap();
+        let old = store.get(&pr.session_key()).unwrap();
+        pr.message.linked_issue = Some(crate::forge::IssueRef {
+            repository: None,
+            number: 2,
+        });
+        assert_eq!(pr.session_key(), issue.session_key());
+        store.reconcile_linked_session(&pr.message, None).unwrap();
+        let merged = store.get(&issue.session_key()).unwrap();
+        assert_eq!(merged.runs.len(), 2);
+        assert_eq!(merged.location, "http://forge.local/a/b/issues/2");
+        assert_eq!(store.list().len(), 1);
+        // Simulate a crash after the merged file was saved, before deletion.
+        store.persist_locked(&old).unwrap();
+        store.save_job(&pr).unwrap();
+        drop(store);
+        let store = SessionStore::open(dir.path()).unwrap();
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.get(&issue.session_key()).unwrap().runs.len(), 2);
+        assert_eq!(
+            store.pending_jobs().unwrap()[0].message.location,
+            pr.message.location
+        );
+        assert_ne!(
+            SessionStore::key(&pr.message, Some("other")),
+            pr.session_key()
+        );
+        pr.message.linked_issue.as_mut().unwrap().repository = Some("other/repo".into());
+        assert_eq!(pr.session_key(), "forgejo:other/repo:issue:2");
     }
 
     #[test]
