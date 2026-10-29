@@ -429,7 +429,7 @@ impl PiRpcClient {
         live_output: Option<&LiveOutput>,
     ) -> Result<(String, TokenUsage)> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        let request_id = self.next_request_id();
+        let mut request_id = self.next_request_id();
         self.send(&json!({
             "id": request_id,
             "type": "prompt",
@@ -441,6 +441,7 @@ impl PiRpcClient {
         let mut usage = TokenUsage::default();
         let mut streamed_usage = TokenUsage::default();
         let mut assistant_error = None;
+        let mut connection_retried = false;
         loop {
             let record = self.next_record_before(deadline).await?;
             match record["type"].as_str().unwrap_or_default() {
@@ -543,17 +544,65 @@ impl PiRpcClient {
                         });
                     }
                 }
-                "auto_retry_end" if record["success"] == false => {
-                    return Err(BotError::Agent {
-                        name: "pi-rpc".into(),
-                        reason: record["finalError"]
+                "auto_retry_end" => {
+                    if record["success"] == false {
+                        let error = record["finalError"]
                             .as_str()
                             .unwrap_or("pi retries exhausted")
-                            .to_owned(),
-                    });
+                            .to_owned();
+                        if crate::agent::capacity::is_capacity_limited(&error, &[]) {
+                            return Err(BotError::Agent {
+                                name: "pi-rpc".into(),
+                                reason: error,
+                            });
+                        }
+                        // Exhausting one retry sequence does not settle the
+                        // session: Pi can still recover through compaction,
+                        // extensions, or queued work. Keep consuming events
+                        // until agent_settled before failing this run.
+                        assistant_error = Some(error);
+                    } else if record["success"] == true {
+                        assistant_error = None;
+                    }
                 }
                 "agent_settled" => {
-                    if let Some(error) = assistant_error {
+                    if let Some(error) = assistant_error.take() {
+                        // Pi may exhaust its own retries during a temporary
+                        // outage. Give this session one chance to continue
+                        // before the queue falls back to a different adapter.
+                        if !connection_retried
+                            && !record["aborted"].as_bool().unwrap_or(false)
+                            && error.trim().eq_ignore_ascii_case("Connection error.")
+                        {
+                            connection_retried = true;
+                            append_live(
+                                live_output,
+                                "\n[connection error; retrying in the same session]\n",
+                            );
+                            tracing::warn!(%error, "retrying settled pi connection failure");
+                            let delay = Duration::from_secs(1);
+                            if let Some(deadline) = deadline {
+                                let remaining = deadline
+                                    .checked_duration_since(Instant::now())
+                                    .ok_or_else(|| self.timeout_error())?;
+                                if remaining <= delay {
+                                    tokio::time::sleep(remaining).await;
+                                    return Err(self.timeout_error());
+                                }
+                            }
+                            tokio::time::sleep(delay).await;
+                            request_id = self.next_request_id();
+                            self.send(&json!({
+                                "id": request_id,
+                                "type": "prompt",
+                                "message": "The previous assistant turn ended with a temporary connection error. Continue the existing task from the current session state, checking completed work before repeating any actions.",
+                                "streamingBehavior": "followUp",
+                            }))
+                            .await?;
+                            streamed.clear();
+                            streamed_usage = TokenUsage::default();
+                            continue;
+                        }
                         return Err(BotError::Agent {
                             name: "pi-rpc".into(),
                             reason: error,
@@ -2029,15 +2078,35 @@ mod tests {
     }
 
     async fn run_rpc_events(events: Value) -> (AgentOutcome, usize) {
+        run_rpc_events_with_timeout(events, 0).await
+    }
+
+    async fn run_rpc_events_with_timeout(
+        events: Value,
+        timeout_secs: u64,
+    ) -> (AgentOutcome, usize) {
+        let (outcome, live, _) = run_rpc_event_batches(json!([events]), timeout_secs).await;
+        (outcome, live)
+    }
+
+    async fn run_rpc_event_batches(
+        batches: Value,
+        timeout_secs: u64,
+    ) -> (AgentOutcome, usize, Vec<String>) {
         let dir = tempfile::tempdir().unwrap();
+        let session_log = dir.path().join("sessions.log");
         let mut config = PiRpcConfig {
             command: fake_pi_command(),
-            timeout_secs: 0,
+            timeout_secs,
             ..Default::default()
         };
         config
             .env
-            .insert("FAKE_PI_EVENTS".into(), events.to_string());
+            .insert("FAKE_PI_EVENT_BATCHES".into(), batches.to_string());
+        config.env.insert(
+            "FAKE_PI_SESSION_LOG".into(),
+            session_log.display().to_string(),
+        );
         let agent = PiPoolAgent::new(&config, store(), 1);
         let request = AgentRequest {
             location: url::Url::parse("http://forge.local/o/r/issues/1").unwrap(),
@@ -2055,7 +2124,72 @@ mod tests {
             .await
             .expect("RPC error must not wait indefinitely")
             .unwrap();
-        (outcome, agent.live_agents())
+        (outcome, agent.live_agents(), read_sessions(&session_log))
+    }
+
+    fn settled_connection_error() -> Value {
+        json!([
+            {"type": "message_end", "message": {
+                "role": "assistant", "stopReason": "error", "errorMessage": "Connection error."
+            }},
+            {"type": "auto_retry_end", "success": false, "finalError": "Connection error."},
+            {"type": "agent_settled"}
+        ])
+    }
+
+    #[tokio::test]
+    async fn settled_connection_failure_recovers_in_same_session() {
+        let (outcome, live, sessions) = run_rpc_event_batches(
+            json!([
+                settled_connection_error(),
+                [
+                    {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop"}},
+                    {"type": "agent_settled"}
+                ]
+            ]),
+            0,
+        )
+        .await;
+        assert!(outcome.success, "{}", outcome.summary);
+        assert_eq!(outcome.summary, "fake-result");
+        assert_eq!(live, 1);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0], sessions[1]);
+    }
+
+    #[tokio::test]
+    async fn settled_connection_recovery_is_bounded() {
+        let (outcome, live, sessions) =
+            run_rpc_event_batches(json!([settled_connection_error()]), 0).await;
+        assert!(!outcome.success);
+        assert!(outcome.summary.contains("Connection error."));
+        assert_eq!(live, 0);
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn connection_recovery_preserves_original_deadline() {
+        let (outcome, live, sessions) =
+            run_rpc_event_batches(json!([settled_connection_error()]), 1).await;
+        assert!(!outcome.success);
+        assert!(
+            outcome.summary.contains("pi timed out"),
+            "{}",
+            outcome.summary
+        );
+        assert_eq!(live, 0);
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn aborted_connection_failure_is_not_retried() {
+        let mut events = settled_connection_error();
+        events[2]["aborted"] = json!(true);
+        let (outcome, live, sessions) = run_rpc_event_batches(json!([events]), 0).await;
+        assert!(!outcome.success);
+        assert!(outcome.summary.contains("Connection error."));
+        assert_eq!(live, 0);
+        assert_eq!(sessions.len(), 1);
     }
 
     #[tokio::test]
@@ -2087,13 +2221,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_retries_without_settled_fail() {
-        let (outcome, _) = run_rpc_events(json!([{
-            "type": "auto_retry_end", "success": false, "finalError": "connection reset"
-        }]))
+    async fn exhausted_retries_fail_when_settled() {
+        let (outcome, live) = run_rpc_events(json!([
+            {"type": "auto_retry_end", "success": false, "finalError": "connection reset"},
+            {"type": "agent_settled"}
+        ]))
         .await;
         assert!(!outcome.success);
         assert!(outcome.summary.contains("connection reset"));
+        assert_eq!(live, 0);
+    }
+
+    #[tokio::test]
+    async fn retry_failure_can_recover_before_settling() {
+        let (outcome, live) = run_rpc_events(json!([
+            {"type": "message_end", "message": {
+                "role": "assistant", "stopReason": "error", "errorMessage": "connection reset"
+            }},
+            {"type": "auto_retry_end", "success": false, "finalError": "connection reset"},
+            {"type": "message_end", "message": {
+                "role": "assistant", "stopReason": "stop"
+            }},
+            {"type": "agent_settled"}
+        ]))
+        .await;
+        assert!(outcome.success, "{}", outcome.summary);
+        assert_eq!(outcome.summary, "fake-result");
+        assert_eq!(live, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_failure_without_settlement_still_obeys_timeout() {
+        let (outcome, live) = run_rpc_events_with_timeout(
+            json!([{
+                "type": "auto_retry_end", "success": false, "finalError": "connection reset"
+            }]),
+            1,
+        )
+        .await;
+        assert!(!outcome.success);
+        assert!(
+            outcome.summary.contains("pi timed out"),
+            "{}",
+            outcome.summary
+        );
+        assert_eq!(live, 0);
+    }
+
+    #[tokio::test]
+    async fn successful_retry_notice_clears_transient_error() {
+        let (outcome, live) = run_rpc_events(json!([
+            {"type": "auto_retry_end", "success": false, "finalError": "connection reset"},
+            {"type": "auto_retry_end", "success": true},
+            {"type": "agent_settled"}
+        ]))
+        .await;
+        assert!(outcome.success, "{}", outcome.summary);
+        assert_eq!(live, 1);
+    }
+
+    #[tokio::test]
+    async fn capacity_retry_failure_without_settled_fails() {
+        let (outcome, live) = run_rpc_events(json!([{
+            "type": "auto_retry_end", "success": false, "finalError": "429 Too Many Requests"
+        }]))
+        .await;
+        assert!(!outcome.success);
+        assert!(outcome.summary.contains("429 Too Many Requests"));
+        assert_eq!(live, 0);
     }
 
     #[tokio::test]

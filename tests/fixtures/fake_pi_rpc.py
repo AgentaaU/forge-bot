@@ -79,6 +79,8 @@ def emit_usage():
 
 
 waiting = False
+prompt_count = 0
+event_batches = json.loads(os.environ.get("FAKE_PI_EVENT_BATCHES", "null"))
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -101,7 +103,12 @@ for line in sys.stdin:
         )
         if stream_text:
             print(json.dumps({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": stream_text}}), flush=True)
-        if os.environ.get("FAKE_PI_EVENTS"):
+        if event_batches:
+            events = event_batches[min(prompt_count, len(event_batches) - 1)]
+            prompt_count += 1
+            for event in events:
+                print(json.dumps(event), flush=True)
+        elif os.environ.get("FAKE_PI_EVENTS"):
             for event in json.loads(os.environ["FAKE_PI_EVENTS"]):
                 print(json.dumps(event), flush=True)
         elif wait_for_steer:
