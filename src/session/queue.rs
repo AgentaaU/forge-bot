@@ -1532,7 +1532,14 @@ impl Inner {
         // capacity mark cannot silence the caller's choice; only automatic
         // fallbacks skip a known-unavailable agent. The list always contains at
         // least the requested agent, so it is never empty.
-        let candidates = self.candidate_agents(&job.agent);
+        let candidates = if job.mention.model.is_some() {
+            // An explicit (including inherited) model is bound to the selected
+            // adapter. Another adapter may interpret the same ID as a different
+            // model/provider, so fallback cannot honor this requirement.
+            vec![job.agent.clone()]
+        } else {
+            self.candidate_agents(&job.agent)
+        };
 
         let mut failures = Vec::new();
         let mut last_outcome: Option<AgentOutcome> = None;
@@ -1548,7 +1555,7 @@ impl Inner {
         for (index, name) in candidates.iter().enumerate() {
             context.explicit_model = job.mention.model.is_some();
             context.explicit_effort = job.mention.effort.is_some();
-            // Inline or inherited requirements apply to this invocation, including fallback.
+            // Inline or inherited model requirements pin this invocation to its adapter.
             context.model = job.mention.model.clone().or_else(|| {
                 (name == &model_agent)
                     .then(|| settings.model.clone())
@@ -1731,7 +1738,7 @@ impl Inner {
                 continue;
             }
 
-            if !outcome.success && self.config.capacity.fallback {
+            if !outcome.success && index + 1 < candidates.len() {
                 // The agent never processed the message (non-zero exit, spawn
                 // error, ...). Hand the job to the next candidate exactly like
                 // a capacity hit, so a broken adapter cannot leave the thread
@@ -1769,7 +1776,10 @@ impl Inner {
         // so say so explicitly instead of blaming one agent. With fallback
         // disabled the caller asked us not to look further, so report the run
         // itself.
-        if self.config.capacity.fallback && unavailable_hits == candidates.len() {
+        if self.config.capacity.fallback
+            && job.mention.model.is_none()
+            && unavailable_hits == candidates.len()
+        {
             self.finish_no_agent(&key, &job, &failures).await;
         } else {
             if !outcome.success && failures.len() > 1 {
@@ -4519,7 +4529,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_issue_choice_follows_linked_pr_review_after_fallback_and_restart() {
+    async fn explicit_model_failure_never_invokes_another_adapter() {
+        struct Probe {
+            name: &'static str,
+            failure: &'static str,
+            seen: Mutex<Vec<Option<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl Agent for Probe {
+            fn name(&self) -> &str {
+                self.name
+            }
+            async fn run(&self, _: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
+                self.seen.lock().unwrap().push(context.model.clone());
+                if self.failure == "startup" {
+                    return Err(BotError::Agent {
+                        name: self.name.into(),
+                        reason: "failed to spawn missing binary".into(),
+                    });
+                }
+                Ok(AgentOutcome::failure(self.failure, Duration::ZERO))
+            }
+        }
+        for failure in [
+            "modelNotFound: astra",
+            "rate limit exceeded (429)",
+            "startup",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = explicit_config(dir.path());
+            config.policy.allow_all = true;
+            config.capacity.fallback = true;
+            config.agent_sequence = vec!["codex".into(), "pi-rpc".into()];
+            let config = Arc::new(config);
+            let primary = Arc::new(Probe {
+                name: "codex",
+                failure,
+                seen: Mutex::new(Vec::new()),
+            });
+            let secondary = Arc::new(Probe {
+                name: "pi-rpc",
+                failure: "unexpected fallback",
+                seen: Mutex::new(Vec::new()),
+            });
+            let mut registry = AgentRegistry::from_config(&config);
+            registry.insert_for_test("codex", primary.clone());
+            registry.insert_for_test("pi-rpc", secondary.clone());
+            let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+            let dispatcher = Dispatcher::new(
+                config.clone(),
+                Arc::new(registry),
+                sessions.clone(),
+                Arc::new(NoopForgeApi),
+                Policy::new(&config.policy),
+            )
+            .unwrap();
+            let mut message = message("o/r");
+            message.body = "@shylock-bot --agent=codex --model=astra go".into();
+            let (mention, agent) = dispatcher.route(&message).unwrap().unwrap();
+            dispatcher.submit(message, mention, &agent).await.unwrap();
+            wait_for_drain(&sessions).await;
+            assert_eq!(*primary.seen.lock().unwrap(), vec![Some("astra".into())]);
+            assert!(secondary.seen.lock().unwrap().is_empty(), "{failure}");
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_issue_choice_follows_linked_pr_review_after_failure_and_restart() {
         struct ChoiceRecorder {
             name: &'static str,
             fail_once: std::sync::atomic::AtomicBool,
@@ -4579,7 +4655,10 @@ mod tests {
             *codex.seen.lock().unwrap(),
             vec![Some("gpt-6-astra".into())]
         );
-        assert_eq!(pi.seen.lock().unwrap().len(), 1, "first run fell back");
+        assert!(
+            pi.seen.lock().unwrap().is_empty(),
+            "explicit model forbids fallback"
+        );
 
         // Reproduce #555 -> inline review #556, including its non-closing link.
         let payload = serde_json::to_vec(&serde_json::json!({
@@ -4611,7 +4690,7 @@ mod tests {
         let (mention, agent) = restarted.route(&pr).unwrap().unwrap();
         assert_eq!(
             agent, "codex",
-            "fallback must not replace the explicit choice"
+            "failure must not replace the explicit choice"
         );
         assert_eq!(mention.model, None, "the new mention has no explicit model");
         restarted.submit(pr.clone(), mention, &agent).await.unwrap();
@@ -4620,7 +4699,7 @@ mod tests {
             *codex.seen.lock().unwrap(),
             vec![Some("gpt-6-astra".into()); 2]
         );
-        assert_eq!(pi.seen.lock().unwrap().len(), 1);
+        assert!(pi.seen.lock().unwrap().is_empty());
 
         // Both another bot on this PR and this bot on another issue use defaults.
         let mut reviewer = pr.clone();

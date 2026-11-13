@@ -691,7 +691,10 @@ survive restarts and are isolated by bot user and forge; unrelated issues and PR
 defaults. A new explicit choice updates the conversation. Switching adapters
 without specifying a model clears the previous adapter's model. Capacity fallbacks
 and agent-reported models never replace the saved choice. Effort remains specific
-to the invocation. Model requirements apply to fallback adapters as before.
+to the invocation. An explicit or remembered model pins execution to the selected
+adapter: failures and capacity limits do not try other adapters, which could
+interpret that model ID differently. Model IDs are not expanded from aliases;
+use the exact ID supported by the selected adapter and account.
 Selections made before this feature was installed must be specified once again;
 old run history does not distinguish explicit models from adapter defaults.
 Options end at the first instruction word or unknown, empty, or invalid option;
