@@ -4792,10 +4792,10 @@ mod tests {
                 Policy::new(&config.policy),
             )
             .unwrap();
-            let submit = |dispatcher: Arc<Dispatcher>| async move {
+            let submit = |dispatcher: Arc<Dispatcher>, number| async move {
                 dispatcher
                     .submit(
-                        message("o/r"),
+                        message_at("o/r", number),
                         Mention {
                             model: None,
                             effort: None,
@@ -4809,7 +4809,7 @@ mod tests {
             };
 
             // Without an override the configured model applies and no effort is set.
-            submit(dispatcher.clone()).await;
+            submit(dispatcher.clone(), 1).await;
             wait_for_drain(&sessions).await;
 
             dispatcher
@@ -4822,14 +4822,20 @@ mod tests {
                     },
                 )
                 .unwrap();
-            submit(dispatcher.clone()).await;
+            submit(dispatcher.clone(), 1).await;
             wait_for_drain(&sessions).await;
 
             dispatcher
                 .set_user_settings("default", UserAgentSettings::default())
                 .unwrap();
             dispatcher.set_user_agent("default", Some("alternate".into()));
-            submit(dispatcher.clone()).await;
+            // Existing conversations keep their initial adapter after defaults change.
+            submit(dispatcher.clone(), 1).await;
+            wait_for_drain(&sessions).await;
+            assert!(alternate.seen.lock().unwrap().is_empty());
+            assert_eq!(recorder.seen.lock().unwrap().len(), 3);
+            // A fresh conversation exercises the alternate adapter's defaults.
+            submit(dispatcher.clone(), 5).await;
             wait_for_drain(&sessions).await;
             assert_eq!(
                 *alternate.seen.lock().unwrap(),
@@ -4846,7 +4852,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            submit(dispatcher.clone()).await;
+            submit(dispatcher.clone(), 5).await;
             wait_for_drain(&sessions).await;
             assert_eq!(
                 alternate.seen.lock().unwrap()[1],
@@ -4886,7 +4892,7 @@ mod tests {
                     (Some("inline-model".into()), Some("xhigh".into()))
                 );
                 // The unrelated original issue still uses its admin settings.
-                submit(dispatcher.clone()).await;
+                submit(dispatcher.clone(), 5).await;
                 wait_for_drain(&sessions).await;
                 assert_eq!(
                     alternate.seen.lock().unwrap()[3],
@@ -4900,6 +4906,7 @@ mod tests {
                 vec![
                     (Some("configured-model".into()), None),
                     (Some("override-model".into()), Some("high".into())),
+                    (None, None),
                     (None, None),
                 ],
                 "supports_effort = {supports_effort}"
@@ -4917,7 +4924,7 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            submit(dispatcher.clone()).await;
+            submit(dispatcher.clone(), 5).await;
             wait_for_drain(&sessions).await;
             assert_eq!(
                 alternate.seen.lock().unwrap().last().unwrap(),
@@ -5014,14 +5021,14 @@ mod tests {
             );
             // Restart forgets the runtime adapter but retains its owned settings.
             assert_eq!(restarted.user_agent("default"), None);
-            submit(restarted.clone()).await;
+            submit(restarted.clone(), 1).await;
             wait_for_drain(&reopened).await;
             assert_eq!(
                 recorder.seen.lock().unwrap().last().unwrap(),
                 &(Some("configured-model".into()), None)
             );
             restarted.set_user_agent("default", Some("alternate".into()));
-            submit(restarted.clone()).await;
+            submit(restarted.clone(), 6).await;
             wait_for_drain(&reopened).await;
             assert_eq!(
                 alternate.seen.lock().unwrap().last().unwrap(),
@@ -5040,7 +5047,7 @@ mod tests {
                 )
                 .unwrap();
             restarted.set_user_agent("default", None);
-            submit(restarted).await;
+            submit(restarted, 7).await;
             wait_for_drain(&reopened).await;
             assert_eq!(
                 recorder.seen.lock().unwrap().last().unwrap(),

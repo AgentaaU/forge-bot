@@ -319,7 +319,7 @@ impl SessionStore {
                 .filter(|selection| selection.agent == agent)
                 .and_then(|selection| selection.model.clone())
         });
-        if explicit_agent.is_some() || job.mention.model.is_some() {
+        if previous.is_none() || explicit_agent.is_some() || job.mention.model.is_some() {
             let mut next = selections.clone();
             next.insert(
                 key,
@@ -734,6 +734,21 @@ mod tests {
             status_comment: None,
             waiting: false,
         }
+    }
+
+    #[test]
+    fn initial_agent_is_reused_when_defaults_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut initial = job();
+        store.select_conversation(&mut initial, |_| Ok(())).unwrap();
+        drop(store);
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut later = job();
+        later.agent = "claude".into();
+        store.select_conversation(&mut later, |_| Ok(())).unwrap();
+        assert_eq!(later.agent, initial.agent);
+        assert_eq!(later.mention.model, None);
     }
 
     #[test]
