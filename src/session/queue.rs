@@ -1566,6 +1566,14 @@ impl Inner {
                     .then(|| settings.effort.clone())
                     .flatten()
             });
+            if self.config.reply.ack {
+                notices.retain(|notice| !notice.starts_with("Model: "));
+                notices.push(execution_settings_notice(None, None));
+                if let Some(id) = &job.status_comment {
+                    self.sync_status(&job.message, id, name, &notices, job.user_id.as_deref())
+                        .await;
+                }
+            }
             used_agent = name.clone();
             running_agent = name.clone();
             *context.reported_model.lock().expect("model mutex poisoned") = None;
@@ -1669,7 +1677,39 @@ impl Inner {
                 outcome
             };
 
-            let mut outcome = match agent.run(&request, &context).await {
+            let run = agent.run(&request, &context);
+            tokio::pin!(run);
+            let mut refresh = tokio::time::interval(Duration::from_millis(100));
+            let mut last_settings = execution_settings_notice(None, None);
+            let result = loop {
+                let completed = tokio::select! {
+                    result = &mut run => Some(result),
+                    _ = refresh.tick() => None,
+                };
+                let model = context
+                    .reported_model
+                    .lock()
+                    .expect("model mutex poisoned")
+                    .clone();
+                let effort = context
+                    .reported_effort
+                    .lock()
+                    .expect("effort mutex poisoned")
+                    .clone();
+                let settings = execution_settings_notice(model.as_deref(), effort.as_deref());
+                if self.config.reply.ack && settings != last_settings {
+                    replace_settings_notice(&mut notices, settings.clone());
+                    last_settings = settings;
+                    if let Some(id) = &job.status_comment {
+                        self.sync_status(&job.message, id, name, &notices, job.user_id.as_deref())
+                            .await;
+                    }
+                }
+                if let Some(result) = completed {
+                    break result;
+                }
+            };
+            let mut outcome = match result {
                 Ok(outcome) => outcome,
                 Err(error) if error.is_agent_unavailable() => {
                     // The adapter cannot start at all (missing binary, wrong
@@ -2154,6 +2194,53 @@ fn permission_aware_failure(job: &Job, error: &BotError) -> AgentOutcome {
     } else {
         AgentOutcome::failure(error.to_string(), Default::default())
     }
+}
+
+fn replace_settings_notice(notices: &mut Vec<String>, settings: String) {
+    notices.retain(|notice| !notice.starts_with("Model: "));
+    notices.push(settings);
+}
+
+#[test]
+fn fallback_settings_replace_previous_adapter_values() {
+    let mut notices = vec![
+        execution_settings_notice(Some("first"), Some("high")),
+        "switching".into(),
+    ];
+    replace_settings_notice(&mut notices, execution_settings_notice(None, None));
+    assert!(!notices.join(" ").contains("first"));
+    replace_settings_notice(
+        &mut notices,
+        execution_settings_notice(Some("second"), Some("low")),
+    );
+    assert_eq!(
+        notices,
+        vec![
+            "switching".to_string(),
+            "Model: **second**; effort: **low**.".to_string()
+        ]
+    );
+}
+
+/// Adapter defaults remain unknown until the adapter reports them; never guess.
+fn execution_settings_notice(model: Option<&str>, effort: Option<&str>) -> String {
+    format!(
+        "Model: **{}**; effort: **{}**.",
+        model.unwrap_or("adapter default"),
+        effort.unwrap_or("adapter default"),
+    )
+}
+
+#[test]
+fn execution_settings_notice_displays_choices_without_inventing_defaults() {
+    assert_eq!(
+        execution_settings_notice(Some("custom-model"), Some("high")),
+        "Model: **custom-model**; effort: **high**."
+    );
+    assert_eq!(
+        execution_settings_notice(None, None),
+        "Model: **adapter default**; effort: **adapter default**."
+    );
 }
 
 /// Render the shared status comment: the "on it" headline naming the agent

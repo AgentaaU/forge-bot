@@ -745,7 +745,7 @@ impl Agent for CommandAgent {
                 self.env.get("KIMI_CODE_HOME"),
                 &workspace,
             ),
-            _ => None,
+            _ => model_arg(&args, true),
         };
         *context.reported_model.lock().expect("model mutex poisoned") = configured_model.clone();
 
@@ -1238,6 +1238,21 @@ mod tests {
             Some(0),
         );
         assert_eq!(args, ["--effort", "low", "--print"]);
+    }
+
+    #[test]
+    fn reported_settings_respect_operator_precedence() {
+        let mut args = vec![
+            "--model".into(),
+            "operator-model".into(),
+            "--effort".into(),
+            "low".into(),
+        ];
+        apply_model(&mut args, Some("user-model"), None);
+        let style = EffortStyle::Flag("--effort");
+        apply_effort(&mut args, Some("high"), Some(style), None);
+        assert_eq!(model_arg(&args, true).as_deref(), Some("operator-model"));
+        assert_eq!(style.value_in(&args).as_deref(), Some("low"));
     }
 
     #[test]
