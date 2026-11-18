@@ -389,6 +389,7 @@ pub fn render_html(threads: &[ThreadStatus], query: Option<&str>) -> String {
 
     format!(
         include_str!("../../web/status.html"),
+        table_scroll_script = include_str!("../../web/table-scroll.js"),
         query = search_value,
         summary = summary,
         clear = clear,

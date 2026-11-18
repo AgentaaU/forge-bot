@@ -79,7 +79,12 @@ jobs:
         run: |
           if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
             mkdir -p "$CARGO_HOME/bin"
-            curl -sSL https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz | tar -xz -C "$CARGO_HOME/bin"
+            archive="$RUNNER_TEMP/cargo-llvm-cov.tar.gz"
+            if curl -fsSL --connect-timeout 10 --max-time 60 --retry 1 -o "$archive" https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz; then
+              tar -xzf "$archive" -C "$CARGO_HOME/bin"
+            else
+              cargo install --locked cargo-llvm-cov
+            fi
             echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
           fi
       # `cargo llvm-cov` runs the whole suite under instrumentation, so it

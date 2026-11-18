@@ -11,19 +11,19 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="forge-bot">
 <title>forge-bot notifications</title>
-<style>
-body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 48rem; padding: 0 1rem; }}
-.row {{ display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }}
-select, button, .button {{ font: inherit; padding: .4rem .6rem; }}
-.button {{ border: 1px solid #767676; border-radius: 2px; background: #efefef; color: #000; text-decoration: none; }}
-#log {{ list-style: none; padding: 0; }}
-#log li {{ border: 1px solid #ddd; border-radius: .4rem; margin: .5rem 0; padding: .6rem; }}
-#log a {{ font-weight: 600; }}
-#diagnostics {{ background: #f6f8fa; border: 1px solid #ddd; border-radius: .4rem; padding: .6rem; white-space: pre-wrap; word-break: break-word; display: none; }}
-small {{ color: #666; }}
-</style>
+
+<link rel="stylesheet" href="/dashboard.css">
 </head>
 <body>
+<main>
+<nav class="sections" aria-label="Main navigation">
+  <a href="/">forge-bot</a>
+  <a href="/status">Status</a>
+  <a href="/statistics">Statistics</a>
+  <a href="/admin">Admin</a>
+  <a href="/notifications" aria-current="page">Notifications</a>
+</nav>
+
 <h1>forge-bot notifications</h1>
 <p>Pick your human account and enable browser notifications. Web push can deliver even when this page is closed; polling requires keeping it open.
 Desktop browsers use the page directly. Mobile browsers require HTTPS and a
@@ -58,5 +58,6 @@ diagnostics cannot read or change those system settings.</p>
 <script>
 {PAGE_SCRIPT}
 </script>
+</main>
 </body>
 </html>

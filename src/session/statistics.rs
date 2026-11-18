@@ -218,6 +218,7 @@ pub fn render_html(stats: &Statistics) -> String {
     };
     format!(
         include_str!("../../web/statistics.html"),
+        table_scroll_script = include_str!("../../web/table-scroll.js"),
         models = models,
         repositories = repositories,
         threads = threads,

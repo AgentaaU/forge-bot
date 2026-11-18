@@ -89,6 +89,15 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(admin)
         .route("/", get(root))
+        .route(
+            "/dashboard.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../web/dashboard.css"),
+                )
+            }),
+        )
         .route("/healthz", get(healthz))
         .route("/status", get(status_page))
         .route("/status/details", get(status_details))
@@ -209,7 +218,7 @@ async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response {
     for (path, description) in pages {
         let path = status::escape_html(path);
         links.push_str(&format!(
-            "<tr><td><a href=\"{path}\">{path}</a></td><td>{}</td></tr>",
+            "<li><a href=\"{path}\"><code>{path}</code><span>{}</span><b aria-hidden=\"true\">→</b></a></li>",
             status::escape_html(description)
         ));
     }

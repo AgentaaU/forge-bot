@@ -1,7 +1,17 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Repository settings recovery</title></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Repository settings recovery</title><link rel="stylesheet" href="/dashboard.css">
+</head>
 <body data-repository="{repository}">
-<nav><a href="/admin">Agent administration</a></nav>
+<main>
+<nav class="sections" aria-label="Main navigation">
+  <a href="/">forge-bot</a>
+  <a href="/status">Status</a>
+  <a href="/statistics">Statistics</a>
+  <a href="/admin">Admin</a>
+  <a href="/notifications">Notifications</a>
+</nav>
+
+
 <h1>Repository settings recovery</h1>
 <p role="alert">{error}</p>
 <p>Saved overrides exist for <strong>{repository}</strong>. You can remove them below. Editing and saving settings is unavailable until repository access can be verified.</p>
@@ -22,4 +32,5 @@ document.querySelectorAll('button[data-reset-user]').forEach(button => {{
         }} catch (error) {{ result.textContent = error.message; button.disabled = false; }}
     }});
 }});
-</script></body></html>
+</script></main>
+</body></html>
