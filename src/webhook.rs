@@ -14,7 +14,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 
-use crate::agent::{AgentRegistry, EFFORT_LEVELS, is_effort_level};
+use crate::agent::catalog::ModelCatalog;
+use crate::agent::{AgentRegistry, CODEX_EFFORT_LEVELS, EFFORT_LEVELS};
 use crate::auto_trigger::AutoTrigger;
 use crate::config::Config;
 use crate::error::BotError;
@@ -26,7 +27,7 @@ use crate::session::{Dispatcher, ThreadState, UserAgentSettings};
 
 type ModelCatalogCache = std::collections::HashMap<
     (String, String),
-    Arc<tokio::sync::Mutex<Option<(std::time::Instant, Option<Vec<String>>)>>>,
+    Arc<tokio::sync::Mutex<Option<(std::time::Instant, Option<ModelCatalog>)>>>,
 >;
 
 /// Shared state for the webhook server.
@@ -550,11 +551,11 @@ async fn agent_models(
         .or_default()
         .clone();
     let mut cached = cache.lock().await;
-    let models = if let Some((_, models)) = cached
+    let catalog = if let Some((_, catalog)) = cached
         .as_ref()
         .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(300))
     {
-        models.clone()
+        catalog.clone()
     } else {
         match crate::agent::catalog::available_models(
             &state.config,
@@ -564,13 +565,13 @@ async fn agent_models(
         )
         .await
         {
-            Ok(mut models) => {
-                if let Some(models) = &mut models {
-                    models.sort();
-                    models.dedup();
+            Ok(mut catalog) => {
+                if let Some(catalog) = &mut catalog {
+                    catalog.models.sort();
+                    catalog.models.dedup();
                 }
-                *cached = Some((std::time::Instant::now(), models.clone()));
-                models
+                *cached = Some((std::time::Instant::now(), catalog.clone()));
+                catalog
             }
             Err(error) => {
                 tracing::warn!(user = %request.user, agent = %name, %error, "model discovery failed");
@@ -582,8 +583,13 @@ async fn agent_models(
             }
         }
     };
-    Json(json!({"supported": models.is_some(), "models": models.unwrap_or_default()}))
-        .into_response()
+    let supported = catalog.is_some();
+    let catalog = catalog.unwrap_or_default();
+    let mut response = json!({"supported": supported, "models": catalog.models});
+    if !catalog.reasoning_efforts.is_empty() {
+        response["reasoning_efforts"] = json!(catalog.reasoning_efforts);
+    }
+    Json(response).into_response()
 }
 
 /// Longest model ID an operator may enter. Real identifiers are far shorter;
@@ -614,11 +620,7 @@ fn agent_user_rows(state: &AppState, repository: &str) -> String {
         } else {
             UserAgentSettings::default()
         };
-        let supported = state
-            .agents
-            .get(&agent)
-            .is_ok_and(|agent| agent.supports_effort());
-        let effort_options = effort_options(settings.effort.as_deref(), supported);
+        let levels = admin_effort_levels(&state.agents, &agent);
         rows.push_str(&format!(
             include_str!("../web/admin-user-row.html"),
             user = status::escape_html(id),
@@ -628,24 +630,21 @@ fn agent_user_rows(state: &AppState, repository: &str) -> String {
                 let bot_agent = state.dispatcher.user_agent(id);
                 let configured = if repository.is_empty() { user.agent.as_deref() } else { bot_agent.as_deref().or(user.agent.as_deref()) }.unwrap_or(&default_agent);
                 let mut options = format!(
-                    "<option value=\"\"{} data-supports-effort=\"{}\">Configured default ({})</option>",
+                    "<option value=\"\"{} data-effort-levels=\"{}\">Configured default ({})</option>",
                     if current.is_none() { " selected" } else { "" },
-                    state.agents.get(configured).is_ok_and(|agent| agent.supports_effort()),
+                    admin_effort_levels(&state.agents, configured).join(" "),
                     status::escape_html(configured)
                 );
                 for name in state.agents.names() {
                     options.push_str(&format!(
-                        "<option value=\"{}\"{} data-supports-effort=\"{}\">{}</option>",
+                        "<option value=\"{}\"{} data-effort-levels=\"{}\">{}</option>",
                         status::escape_html(&name),
                         if current.as_deref() == Some(&name) {
                             " selected"
                         } else {
                             ""
                         },
-                        state
-                            .agents
-                            .get(&name)
-                            .is_ok_and(|agent| agent.supports_effort()),
+                        admin_effort_levels(&state.agents, &name).join(" "),
                         status::escape_html(&name)
                     ));
                 }
@@ -674,8 +673,8 @@ fn agent_user_rows(state: &AppState, repository: &str) -> String {
                             .map(|(_, model)| model.clone())
                     ),
             ),
-            effort_disabled = if supported { "" } else { " disabled" },
-            effort_options = effort_options,
+            effort_disabled = if levels.is_empty() { " disabled" } else { "" },
+            effort_options = effort_options(settings.effort.as_deref(), levels),
         ));
     }
     rows
@@ -717,14 +716,25 @@ fn model_options(
     options
 }
 
+fn admin_effort_levels(agents: &AgentRegistry, name: &str) -> &'static [&'static str] {
+    if !agents.get(name).is_ok_and(|agent| agent.supports_effort()) {
+        return &[];
+    }
+    if name == "codex" {
+        CODEX_EFFORT_LEVELS
+    } else {
+        EFFORT_LEVELS
+    }
+}
+
 /// `<option>`s for the effort select. The empty choice keeps the agent's own
 /// default. An agent without effort support gets one disabled explanation.
-fn effort_options(current: Option<&str>, supported: bool) -> String {
-    if !supported {
+fn effort_options(current: Option<&str>, levels: &[&str]) -> String {
+    if levels.is_empty() {
         return "<option value=\"\">Not supported by this agent</option>".to_owned();
     }
     let mut options = String::from("<option value=\"\">Agent default</option>");
-    for level in EFFORT_LEVELS {
+    for &level in levels {
         let selected = if current == Some(level) {
             " selected"
         } else {
@@ -864,22 +874,18 @@ async fn save_agent_settings(
     }
     let effort = request.effort.trim();
     if !effort.is_empty() {
-        if !is_effort_level(effort) {
+        let levels = admin_effort_levels(&state.agents, &effective_agent);
+        if levels.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("effort must be one of {}\n", EFFORT_LEVELS.join(", ")),
+                format!("agent `{effective_agent}` does not support an effort level\n"),
             )
                 .into_response();
         }
-        let agent = &effective_agent;
-        if !state
-            .agents
-            .get(agent)
-            .is_ok_and(|agent| agent.supports_effort())
-        {
+        if !levels.contains(&effort) {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("agent `{agent}` does not support an effort level\n"),
+                format!("effort must be one of {}\n", levels.join(", ")),
             )
                 .into_response();
         }

@@ -85,7 +85,23 @@ document.querySelectorAll('button[data-key]').forEach(button => {{
 }});
 document.querySelectorAll('select[data-model]').forEach(select => {{
     const row = select.closest('tr');
+    const agent = row.querySelector('select[data-user-agent]');
+    const effort = row.querySelector('select[data-effort]');
     const catalogStatus = row.querySelector('[data-model-status]');
+    let reasoningEfforts = {{}};
+    const updateEfforts = (selected, preserve = false) => {{
+        const levels = (agent.selectedOptions[0].dataset.effortLevels || '').split(' ').filter(Boolean);
+        const advertised = Object.hasOwn(reasoningEfforts, select.value) ? reasoningEfforts[select.value] : levels;
+        const available = levels.filter(level => advertised.includes(level));
+        const choices = [new Option(levels.length ? 'Agent default' : 'Not supported by this agent', ''),
+            ...available.map(level => new Option(level, level))];
+        if (preserve && selected && !available.includes(selected)) {{
+            choices.push(new Option(selected + ' (unavailable for this model)', selected));
+        }}
+        effort.replaceChildren(...choices);
+        effort.value = choices.some(option => option.value === selected) ? selected : '';
+        effort.disabled = available.length === 0 && effort.value === '';
+    }};
     let options = Array.from(select.options);
     const search = document.createElement('input');
     search.type = 'search';
@@ -123,7 +139,7 @@ document.querySelectorAll('select[data-model]').forEach(select => {{
                 body: JSON.stringify({{
                     user: row.querySelector('button[data-user]').dataset.user,
                     repository: document.body.dataset.repository,
-                    agent: row.querySelector('select[data-user-agent]').value
+                    agent: agent.value
                 }})
             }});
             if (!response.ok) throw new Error(' Models unavailable; saved and custom choices remain usable.');
@@ -140,6 +156,8 @@ document.querySelectorAll('select[data-model]').forEach(select => {{
             select.replaceChildren(...options);
             select.value = selected;
             updateSearch();
+            reasoningEfforts = catalog.reasoning_efforts || {{}};
+            if (Object.hasOwn(reasoningEfforts, selected)) updateEfforts(effort.value, true);
             catalogStatus.textContent = catalog.supported ? '' : ' This agent does not expose a model catalog.';
         }} catch (error) {{
             if (current === discovery) catalogStatus.textContent = error.message;
@@ -147,12 +165,14 @@ document.querySelectorAll('select[data-model]').forEach(select => {{
     }};
     loadModels();
     let previous = select.value;
-    row.querySelector('select[data-user-agent]').addEventListener('change', () => {{
+    agent.addEventListener('change', () => {{
         select.innerHTML = '<option value="">Agent default</option><option data-custom-model>Custom model…</option>';
         options = Array.from(select.options);
         search.value = '';
         updateSearch();
         previous = '';
+        reasoningEfforts = {{}};
+        updateEfforts('');
         loadModels();
     }});
     select.addEventListener('change', () => {{
@@ -168,16 +188,9 @@ document.querySelectorAll('select[data-model]').forEach(select => {{
             select.replaceChildren(...options);
             select.value = value;
         }}
+        if (previous !== select.value) updateEfforts(effort.value);
         previous = select.value;
         updateSearch();
-    }});
-}});
-document.querySelectorAll('select[data-user-agent]').forEach(select => {{
-    const row = select.closest('tr');
-    const effort = row.querySelector('select[data-effort]');
-    select.addEventListener('change', () => {{
-        effort.innerHTML = '<option value="">Agent default</option>' + ['low', 'medium', 'high', 'xhigh'].map(value => '<option value="' + value + '">' + value + '</option>').join('');
-        effort.disabled = select.selectedOptions[0].dataset.supportsEffort !== 'true';
     }});
 }});
 const settingsForRow = row => ({{

@@ -2797,7 +2797,7 @@ async fn admin_sets_each_agent_users_model_and_effort() {
     let h = harness_with(dir.path(), |config| {
         // `claude` supports effort; `custom` does not. The default user runs
         // `claude`, the reviewer runs `custom`, and a human is not an agent.
-        config.agent_sequence = vec!["claude".into(), "custom".into()];
+        config.agent_sequence = vec!["claude".into(), "custom".into(), "codex".into()];
         config.agents.overrides.insert(
             "claude".into(),
             AgentConfig {
@@ -2901,6 +2901,26 @@ async fn admin_sets_each_agent_users_model_and_effort() {
         let response = post(h.app.clone(), Body::from(body.to_string()), true).await;
         assert_eq!(response.status(), expected, "{body}");
     }
+    for effort in ["max", "ultra"] {
+        let body = json!({"user": "reviewer", "agent": "codex", "effort": effort});
+        let response = post(h.app.clone(), Body::from(body.to_string()), true).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(
+            h.dispatcher.user_settings("reviewer").effort.as_deref(),
+            Some(effort)
+        );
+        let html = get_admin(h.app.clone()).await;
+        assert!(html.contains(&format!(
+            "<option value=\"{effort}\" selected>{effort}</option>"
+        )));
+    }
+    let body = json!({"user": "reviewer", "agent": "", "effort": ""});
+    assert_eq!(
+        post(h.app.clone(), Body::from(body.to_string()), true)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
     // Only the JSON body reaches the handler, so a cross-origin form cannot
     // change a model or effort.
     let response = post(
@@ -2972,7 +2992,7 @@ async fn admin_sets_each_agent_users_model_and_effort() {
     assert!(
         get_admin(h.app.clone())
             .await
-            .contains("value=\"claude\" selected data-supports-effort=\"true\"")
+            .contains("value=\"claude\" selected data-effort-levels=\"low medium high xhigh\"")
     );
     assert!(
         std::fs::read_to_string(dir.path().join("agent-settings.json"))
@@ -3124,9 +3144,7 @@ async fn ranking_refreshes_default_dependent_user_controls() {
     };
     let before = admin(h.app.clone()).await;
     assert!(
-        before.contains(
-            "selected data-supports-effort=\"false\">Configured default (custom)</option>"
-        )
+        before.contains("selected data-effort-levels=\"\">Configured default (custom)</option>")
     );
     assert!(before.contains("<select data-effort disabled>"));
     let default_row = before
@@ -3155,11 +3173,9 @@ async fn ranking_refreshes_default_dependent_user_controls() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let after = admin(h.app.clone()).await;
-    assert!(
-        after.contains(
-            "selected data-supports-effort=\"true\">Configured default (claude)</option>"
-        )
-    );
+    assert!(after.contains(
+        "selected data-effort-levels=\"low medium high xhigh\">Configured default (claude)</option>"
+    ));
     assert!(!after.contains("<select data-effort disabled>"));
     assert!(after.contains("window.location.reload()"));
     let default_row = after
@@ -3249,12 +3265,18 @@ async fn admin_discovers_and_caches_models_per_user_and_resolved_agent() {
             (status, body)
         }
     };
+    let codex_catalog = json!({
+        "supported": true,
+        "models": ["first", "second"],
+        "reasoning_efforts": {"first": ["max", "ultra"]},
+    });
+    let pi_catalog = json!({"supported": true, "models": ["test/pi-model"]});
     for user in ["default", "default", "reviewer"] {
         let (status, body) = query(user, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap(),
-            json!({"supported": true, "models": ["first", "second"]})
+            codex_catalog
         );
     }
     // Separate users do not share catalog cache entries.
@@ -3265,25 +3287,19 @@ async fn admin_discovers_and_caches_models_per_user_and_resolved_agent() {
     assert!(h.agents.set_ranking(vec!["pi-rpc".into(), "codex".into()]));
     let (status, body) = query("default", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&body).unwrap(),
-        json!({"supported": true, "models": ["test/pi-model"]})
-    );
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), pi_catalog);
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
     // Discovery follows runtime choices and can preview an unsaved adapter.
     h.dispatcher
         .set_user_agent("reviewer", Some("pi-rpc".into()));
-    for (agent, models) in [
-        (None, json!(["test/pi-model"])),
-        (Some(""), json!(["first", "second"])),
-        (Some("codex"), json!(["first", "second"])),
+    for (agent, catalog) in [
+        (None, &pi_catalog),
+        (Some(""), &codex_catalog),
+        (Some("codex"), &codex_catalog),
     ] {
         let (status, body) = query("reviewer", agent).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap(),
-            json!({"supported": true, "models": models})
-        );
+        assert_eq!(&serde_json::from_slice::<Value>(&body).unwrap(), catalog);
     }
     assert_eq!(
         query("reviewer", Some("missing")).await.0,

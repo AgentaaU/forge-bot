@@ -4,6 +4,47 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { chromium } = require('playwright');
 
+test('Codex effort choices follow the model and adapter', async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+        const page = await browser.newPage();
+        await page.route('**/admin/agent-models', route => route.fulfill({
+            json: {
+                supported: true,
+                models: ['sol', 'luna'],
+                reasoning_efforts: { sol: ['high', 'max', 'ultra'], luna: ['high', 'max'] }
+            }
+        }));
+        const row = fs.readFileSync('web/admin-user-row.html', 'utf8')
+            .replaceAll('{user}', 'alice')
+            .replace('{agent_options}', '<option value="claude" data-effort-levels="low medium high xhigh">Claude</option><option value="codex" data-effort-levels="low medium high xhigh max ultra">Codex</option>')
+            .replace('{model_options}', '<option value="">Agent default</option><option data-custom-model>Custom model…</option>')
+            .replace('{effort_disabled}', '').replace('{effort_options}', '<option value="">Agent default</option>');
+        const html = fs.readFileSync('web/admin.html', 'utf8')
+            .replace('{user_rows}', row).replaceAll('{repository}', '')
+            .replace('{rows}', '').replace('{thread_rows}', '').replace('{capacity}', '')
+            .replaceAll('{{', '{').replaceAll('}}', '}');
+        await page.route('**/admin', route => route.fulfill({ contentType: 'text/html', body: html }));
+        await page.goto('http://admin.test/admin');
+        const agent = page.locator('select[data-user-agent]');
+        const model = page.locator('select[data-model]');
+        const effort = page.locator('select[data-effort]');
+        await agent.selectOption('codex');
+        assert.deepEqual(await effort.locator('option').allTextContents(), ['Agent default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+        await model.selectOption('sol');
+        await effort.selectOption('ultra');
+        await model.selectOption('luna');
+        assert.deepEqual(await effort.locator('option').allTextContents(), ['Agent default', 'high', 'max']);
+        assert.equal(await effort.inputValue(), '');
+        await effort.selectOption('max');
+        await agent.selectOption('claude');
+        assert.deepEqual(await effort.locator('option').allTextContents(), ['Agent default', 'low', 'medium', 'high', 'xhigh']);
+        assert.equal(await effort.inputValue(), '');
+    } finally {
+        await browser.close();
+    }
+});
+
 test('admin model search preserves choices and follows catalog and agent changes', async () => {
     const browser = await chromium.launch({ headless: true });
     try {
@@ -87,7 +128,7 @@ test('admin saves report success without discarding other rows and warn about un
             loads++;
             const rows = ['alice', 'bob'].map(user => fs.readFileSync('web/admin-user-row.html', 'utf8')
                 .replaceAll('{user}', user)
-                .replace('{agent_options}', '<option value="pi-rpc">pi-rpc</option>')
+                .replace('{agent_options}', '<option value="pi-rpc" data-effort-levels="low medium high xhigh">pi-rpc</option>')
                 .replace('{model_options}', `<option value="">Agent default</option><option value="${model}"${saved[user]?.model === model ? ' selected' : ''}>${model}</option><option data-custom-model>Custom model…</option>`)
                 .replace('{effort_disabled}', '').replace('{effort_options}', '<option value="">Agent default</option><option value="high">high</option>')).join('');
             const html = fs.readFileSync('web/admin.html', 'utf8')
@@ -161,7 +202,7 @@ for (const editResetRow of [false, true]) {
                 loads++;
                 const rows = ['alice', 'bob'].map(user => fs.readFileSync('web/admin-user-row.html', 'utf8')
                     .replaceAll('{user}', user)
-                    .replace('{agent_options}', '<option value="pi-rpc">pi-rpc</option>')
+                    .replace('{agent_options}', '<option value="pi-rpc" data-effort-levels="low medium high xhigh">pi-rpc</option>')
                     .replace('{model_options}', `<option value="">Agent default</option><option value="old-model"${user === 'alice' && overridden ? ' selected' : ''}>old-model</option><option data-custom-model>Custom model…</option>`)
                     .replace('{effort_disabled}', '').replace('{effort_options}', '<option value="">Agent default</option><option value="high">high</option>')).join('');
                 const html = fs.readFileSync('web/admin.html', 'utf8')

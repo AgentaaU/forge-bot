@@ -462,12 +462,15 @@ recipients are omitted). For each user an operator can set:
   are preserved; arguments that cannot safely be translated (such as profiles
   or workspace changes) make discovery unsupported. Saved/configured/reported
   choices and **Custom model** remain usable if discovery fails or an adapter has no catalog protocol.
-* **Effort**: a reasoning effort of `low`, `medium`, `high` or `xhigh`. The
-  default leaves the choice to the agent. Only adapters that accept an effort
-  offer the control: `codex` (`-c model_reasoning_effort`, or `turn/start` on
-  the app-server path), `claude` (`--effort`), and `pi` / `pi-rpc`
-  (`--thinking`). The control is disabled for other agents. A request for an
-  effort the user's agent does not support returns 400.
+* **Effort** can be `low`, `medium`, `high` or `xhigh`, with
+  `max` and `ultra` also available for Codex. When a selected Codex model
+  supplies effort options in the catalog, the menu shows the supported choices.
+  For agent defaults, custom models, or unavailable catalog data, Codex checks
+  compatibility at run time. The default leaves the effort choice to the agent.
+  The control is available for `codex` (`-c model_reasoning_effort`, or
+  `turn/start` on the app-server path), `claude` (`--effort`), and `pi` /
+  `pi-rpc` (`--thinking`). A request for an effort level outside the adapter's
+  list returns 400.
 
 Each save is `POST /admin/agent-settings` with a JSON body such as
 `{"user":"forge-reviewer","agent":"codex","model":"gpt-fast","effort":"high"}`; an empty `model`

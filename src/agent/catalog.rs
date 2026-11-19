@@ -1,6 +1,7 @@
 //! Read-only model discovery using the agents' own catalogs, under the user's
 //! Linux account. No prompt, turn, or model override is sent.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -12,6 +13,12 @@ use super::wire::WireProcess;
 use crate::config::{Config, PiRpcConfig};
 use crate::error::{BotError, Result};
 use crate::executor::{ExecSpec, Executor};
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelCatalog {
+    pub models: Vec<String>,
+    pub reasoning_efforts: BTreeMap<String, Vec<String>>,
+}
 
 fn malformed(agent: &str) -> BotError {
     BotError::Agent {
@@ -113,7 +120,7 @@ pub async fn available_models(
     agent: &str,
     executor: &Executor,
     host_user: &str,
-) -> Result<Option<Vec<String>>> {
+) -> Result<Option<ModelCatalog>> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let home = executor
         .account(host_user)
@@ -149,7 +156,7 @@ pub async fn available_models(
                         Some(deadline),
                     )
                     .await?;
-                let mut models = Vec::new();
+                let mut catalog = ModelCatalog::default();
                 let mut cursor = None;
                 for _ in 0..100 {
                     let page = process
@@ -163,19 +170,27 @@ pub async fn available_models(
                         )
                         .await?;
                     for model in page["data"].as_array().ok_or_else(|| malformed("codex"))? {
-                        models.push(
-                            model["model"]
-                                .as_str()
-                                .filter(|s| !s.is_empty())
-                                .ok_or_else(|| malformed("codex"))?
-                                .to_owned(),
-                        );
+                        let id = model["model"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| malformed("codex"))?;
+                        catalog.models.push(id.to_owned());
+                        if let Some(efforts) = model["supportedReasoningEfforts"].as_array() {
+                            catalog.reasoning_efforts.insert(
+                                id.to_owned(),
+                                efforts
+                                    .iter()
+                                    .filter_map(|option| option["reasoningEffort"].as_str())
+                                    .map(str::to_owned)
+                                    .collect(),
+                            );
+                        }
                     }
                     match page["nextCursor"].as_str().filter(|s| !s.is_empty()) {
                         Some(next) if cursor.as_deref() != Some(next) => {
                             cursor = Some(next.to_owned())
                         }
-                        None => return Ok(Some(models)),
+                        None => return Ok(Some(catalog)),
                         _ => return Err(malformed("codex")),
                     }
                 }
@@ -211,7 +226,10 @@ pub async fn available_models(
                     Some(host_user),
                     LaunchSettings::default(),
                 )?;
-                Ok(Some(client.available_models().await?))
+                Ok(Some(ModelCatalog {
+                    models: client.available_models().await?,
+                    ..Default::default()
+                }))
             }
             _ => Ok(None),
         }
@@ -258,13 +276,17 @@ mod tests {
             available_models(&config, "codex", &executor, "agent")
                 .await
                 .unwrap(),
-            Some(vec!["first".into(), "second".into()])
+            Some(ModelCatalog {
+                models: vec!["first".into(), "second".into()],
+                reasoning_efforts: [("first".into(), vec!["max".into(), "ultra".into()])].into(),
+            })
         );
         for name in ["pi", "pi-rpc"] {
             assert_eq!(
                 available_models(&config, name, &executor, "agent")
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .map(|catalog| catalog.models),
                 Some(vec!["test/pi-model".into()])
             );
         }
@@ -368,7 +390,8 @@ mod tests {
         assert_eq!(
             available_models(&config, "codex", &executor, "agent")
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|catalog| catalog.models),
             Some(vec!["configured-catalog-model".into(), "second".into()])
         );
         let cfg = config.agents.overrides.get_mut("codex").unwrap();

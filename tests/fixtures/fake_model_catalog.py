@@ -28,8 +28,13 @@ for line in sys.stdin:
     elif method == 'model/list':
         assert request['params']['includeHidden'] is False
         cursor = request['params'].get('cursor')
-        result = {'data': [{'model': 'second' if cursor else ('configured-catalog-model' if os.environ.get('CATALOG_REQUIRE_CONFIG') else os.environ.get('CATALOG_ID', 'first'))}],
-                  'nextCursor': None if cursor else 'next'}
+        if cursor:
+            result = {'data': [{'model': 'second'}], 'nextCursor': None}
+        else:
+            model = 'configured-catalog-model' if os.environ.get('CATALOG_REQUIRE_CONFIG') else os.environ.get('CATALOG_ID', 'first')
+            result = {'data': [{'model': model, 'supportedReasoningEfforts': [
+                {'reasoningEffort': 'max'}, {'reasoningEffort': 'ultra'},
+            ]}], 'nextCursor': 'next'}
         print(json.dumps({'id': request['id'], 'result': result}), flush=True)
     elif method == 'get_available_models':
         assert '--no-session' in sys.argv

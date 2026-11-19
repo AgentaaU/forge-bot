@@ -934,19 +934,22 @@ mod tests {
         let agent = agent(config, Arc::clone(&sessions));
 
         let mut ctx = context(dir.path());
-        ctx.effort = Some("high".into());
-        let outcome = agent.run(&request(), &ctx).await.unwrap();
-        assert!(outcome.success);
-        assert_eq!(outcome.effort.as_deref(), Some("high"));
+        for effort in ["max", "ultra"] {
+            ctx.effort = Some(effort.into());
+            let outcome = agent.run(&request(), &ctx).await.unwrap();
+            assert!(outcome.success);
+            assert_eq!(outcome.effort.as_deref(), Some(effort));
+        }
         // Without an effort the turn sends the configured default explicitly.
         ctx.effort = None;
         assert!(agent.run(&request(), &ctx).await.unwrap().success);
 
         let turns = turn_params(&log);
-        assert_eq!(turns.len(), 2, "{turns:?}");
+        assert_eq!(turns.len(), 3, "{turns:?}");
         assert_eq!(ctx.reported_effort.lock().unwrap().as_deref(), Some("low"));
-        assert_eq!(turns[0]["effort"], "high");
-        assert_eq!(turns[1]["effort"], "low", "{turns:?}");
+        assert_eq!(turns[0]["effort"], "max");
+        assert_eq!(turns[1]["effort"], "ultra");
+        assert_eq!(turns[2]["effort"], "low", "{turns:?}");
     }
 
     #[tokio::test]

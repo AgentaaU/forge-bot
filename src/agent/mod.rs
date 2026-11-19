@@ -33,10 +33,9 @@ use crate::location::ForgeKind;
 
 pub use registry::{AgentRegistry, UnavailableReason};
 
-/// Reasoning effort levels the operator may choose in `/admin`. Every
-/// supported adapter (Claude `--effort`, Pi `--thinking`, Codex
-/// `model_reasoning_effort`) accepts all of them.
+/// Reasoning effort levels shared by the supported adapters.
 pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
+pub const CODEX_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 
 /// Whether `value` is one of [`EFFORT_LEVELS`].
 pub fn is_effort_level(value: &str) -> bool {
