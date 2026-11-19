@@ -391,11 +391,12 @@ impl Dispatcher {
 
         // Resolve and validate under the selection lock before saving a choice:
         // typos must not replace a working conversation preference.
-        if let Err(error) = self
-            .inner
-            .sessions
-            .select_conversation(&mut job, |name| self.inner.agents.get(name).map(|_| ()))
-        {
+        if let Err(error) = self.inner.sessions.select_conversation(&mut job, |name| {
+            self.inner
+                .agents
+                .get(name)
+                .map(|agent| agent.supports_effort())
+        }) {
             if let BotError::UnknownAgent(name) = &error {
                 self.inner
                     .reply(
@@ -4686,21 +4687,28 @@ mod tests {
         struct ChoiceRecorder {
             name: &'static str,
             fail_once: std::sync::atomic::AtomicBool,
-            seen: Mutex<Vec<Option<String>>>,
+            seen: Mutex<Vec<(Option<String>, Option<String>)>>,
         }
         #[async_trait::async_trait]
         impl Agent for ChoiceRecorder {
             fn name(&self) -> &str {
                 self.name
             }
+            fn supports_effort(&self) -> bool {
+                true
+            }
             async fn run(&self, _: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
-                self.seen.lock().unwrap().push(context.model.clone());
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((context.model.clone(), context.effort.clone()));
                 let mut outcome = if self.fail_once.swap(false, Ordering::SeqCst) {
                     AgentOutcome::failure("rate limit exceeded (429)", Duration::ZERO)
                 } else {
                     AgentOutcome::success("done", Duration::ZERO)
                 };
                 outcome.model = Some("reported-provider-default".into());
+                outcome.effort = Some("high".into());
                 Ok(outcome)
             }
         }
@@ -4734,18 +4742,25 @@ mod tests {
         )
         .unwrap();
         let mut issue = message_at("shylock/stock-analysis", 555);
-        issue.body = "@shylock-bot --agent=codex --model=gpt-6-astra Do it.".into();
+        issue.body = "@shylock-bot --agent=codex --model=gpt-6-astra --effort=xhigh Do it.".into();
         let (mention, agent) = dispatcher.route(&issue).unwrap().unwrap();
-        dispatcher.submit(issue, mention, &agent).await.unwrap();
+        dispatcher
+            .submit(issue.clone(), mention, &agent)
+            .await
+            .unwrap();
         wait_for_drain(&sessions).await;
-        assert_eq!(
-            *codex.seen.lock().unwrap(),
-            vec![Some("gpt-6-astra".into())]
-        );
+        let selection = (Some("gpt-6-astra".into()), Some("xhigh".into()));
+        assert_eq!(*codex.seen.lock().unwrap(), vec![selection.clone()]);
         assert!(
             pi.seen.lock().unwrap().is_empty(),
             "explicit model forbids fallback"
         );
+
+        issue.body = "@shylock-bot Fix it".into();
+        let (mention, agent) = dispatcher.route(&issue).unwrap().unwrap();
+        dispatcher.submit(issue, mention, &agent).await.unwrap();
+        wait_for_drain(&sessions).await;
+        assert_eq!(*codex.seen.lock().unwrap(), vec![selection.clone(); 2]);
 
         // Reproduce #555 -> inline review #556, including its non-closing link.
         let payload = serde_json::to_vec(&serde_json::json!({
@@ -4780,12 +4795,13 @@ mod tests {
             "failure must not replace the explicit choice"
         );
         assert_eq!(mention.model, None, "the new mention has no explicit model");
+        assert_eq!(
+            mention.effort, None,
+            "the new mention has no explicit effort"
+        );
         restarted.submit(pr.clone(), mention, &agent).await.unwrap();
         wait_for_drain(&reopened).await;
-        assert_eq!(
-            *codex.seen.lock().unwrap(),
-            vec![Some("gpt-6-astra".into()); 2]
-        );
+        assert_eq!(*codex.seen.lock().unwrap(), vec![selection; 3]);
         assert!(pi.seen.lock().unwrap().is_empty());
 
         // Both another bot on this PR and this bot on another issue use defaults.
@@ -4798,9 +4814,9 @@ mod tests {
         assert_eq!(agent, "pi-rpc");
         restarted.submit(unrelated, mention, &agent).await.unwrap();
         wait_for_drain(&reopened).await;
-        assert_eq!(pi.seen.lock().unwrap().last(), Some(&None));
+        assert_eq!(pi.seen.lock().unwrap().last(), Some(&(None, None)));
 
-        // A new explicit adapter clears the old provider's model for this thread.
+        // Switching adapters clears the old adapter's model and effort.
         let mut switched = pr.clone();
         switched.body = "@shylock-bot --agent=pi-rpc continue".into();
         let (mention, agent) = restarted.route(&switched).unwrap().unwrap();
@@ -4810,7 +4826,7 @@ mod tests {
         assert_eq!(agent, "pi-rpc");
         restarted.submit(pr, mention, &agent).await.unwrap();
         wait_for_drain(&reopened).await;
-        assert_eq!(pi.seen.lock().unwrap().last(), Some(&None));
+        assert_eq!(pi.seen.lock().unwrap().last(), Some(&(None, None)));
     }
 
     #[tokio::test]
@@ -4978,11 +4994,17 @@ mod tests {
                     alternate.seen.lock().unwrap()[2],
                     (Some("inline-model".into()), Some("xhigh".into()))
                 );
+                submit(dispatcher.clone(), 3).await;
+                wait_for_drain(&sessions).await;
+                assert_eq!(
+                    alternate.seen.lock().unwrap()[3],
+                    (Some("inline-model".into()), Some("xhigh".into()))
+                );
                 // The unrelated original issue still uses its admin settings.
                 submit(dispatcher.clone(), 5).await;
                 wait_for_drain(&sessions).await;
                 assert_eq!(
-                    alternate.seen.lock().unwrap()[3],
+                    alternate.seen.lock().unwrap()[4],
                     (Some("alternate-model".into()), Some("low".into()))
                 );
             }

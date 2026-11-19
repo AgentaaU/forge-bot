@@ -17,7 +17,7 @@ pub struct Mention {
     /// Explicit model; the dispatcher also snapshots an inherited conversation model here.
     #[serde(default)]
     pub model: Option<String>,
-    /// Explicit reasoning effort for this invocation.
+    /// Explicit effort; the dispatcher also snapshots an inherited conversation effort here.
     #[serde(default)]
     pub effort: Option<String>,
     /// The instruction left after removing the trigger.

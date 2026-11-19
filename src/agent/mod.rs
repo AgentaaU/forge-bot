@@ -101,13 +101,13 @@ pub struct AgentContext {
     /// Model ID to pass to the agent, from the addressed user's `agent_model`
     /// or its `/admin` override, unless the caller selects one inline.
     pub model: Option<String>,
-    /// The caller explicitly selected the model in this invocation.
+    /// The caller selected this model in the current or an earlier mention.
     pub explicit_model: bool,
-    /// The caller explicitly selected effort in this invocation.
+    /// The caller selected this effort in the current or an earlier mention.
     pub explicit_effort: bool,
-    /// Reasoning effort requested inline or through `/admin`. `None` leaves
-    /// the agent's own default. Only adapters reporting
-    /// [`Agent::supports_effort`] receive it.
+    /// Reasoning effort from a mention, the saved conversation choice, or `/admin`.
+    /// `None` leaves the agent's own default. Only adapters reporting
+    /// [`Agent::supports_effort`] apply it.
     pub effort: Option<String>,
 }
 

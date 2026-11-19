@@ -427,9 +427,9 @@ reset-only recovery page lets operators remove them without allowing new saves.
 Choose a repository (`owner/repo`) in **Agent models and effort** to edit settings
 for each bot in that repository. Leave the repository blank for bot-wide settings.
 Repository overrides take precedence over bot-wide settings. Saved conversation
-agent/model choices take precedence over those defaults; explicit mention options
-update the conversation choice (effort applies only to that invocation). Each
-repository save captures the selected adapter, model and effort as a complete override.
+choices for agent, model, and effort take precedence over those defaults. Explicit
+mention options update the conversation choice. Each repository save captures
+the selected adapter, model and effort as a complete override.
 Choose **Save settings** on the edited user row to apply a selection. Each row
 shows unsaved changes, save errors, or confirmation of the saved scope. Saving
 one row preserves edits in other rows; leaving with unsaved changes prompts
@@ -687,19 +687,19 @@ mention. Colon selector forms are no longer accepted.
 Leading `--agent=`, `--model=`, and `--effort=` options may appear in any
 order. The last repeated option wins. Model IDs are passed through exactly;
 effort must be one of `low`, `medium`, `high`, or `xhigh`.
-An explicit agent/model choice overrides configured and admin defaults and is
-remembered for later calls to the same bot in that conversation, including a PR
-whose description closes/fixes/resolves or addresses the issue. These choices
-survive restarts and are isolated by bot user and forge; unrelated issues and PRs keep their own
-defaults. A new explicit choice updates the conversation. Switching adapters
-without specifying a model clears the previous adapter's model. Capacity fallbacks
-and agent-reported models never replace the saved choice. Effort remains specific
-to the invocation. An explicit or remembered model pins execution to the selected
+Explicit agent, model, and effort choices override configured and admin defaults
+and are remembered for later calls to the same bot in that conversation,
+including a PR whose description closes/fixes/resolves or addresses the issue.
+These choices survive restarts and are isolated by bot user and forge. Unrelated
+issues and PRs keep their own defaults. A new explicit choice updates the
+conversation. Switching adapters clears the previous adapter's model and effort.
+Capacity fallbacks and agent-reported settings never replace the saved choice.
+An explicit or remembered model pins execution to the selected
 adapter: failures and capacity limits do not try other adapters, which could
 interpret that model ID differently. Model IDs are not expanded from aliases;
 use the exact ID supported by the selected adapter and account.
-Selections made before this feature was installed must be specified once again;
-old run history does not distinguish explicit models from adapter defaults.
+Repeat explicit selections that the bot did not yet save, including `--effort`
+choices made before effort inheritance was added.
 Options end at the first instruction word or unknown, empty, or invalid option;
 that text remains part of the instruction. Options on subsequent lines are
 instruction text. Model and effort are passed through the agent's CLI or RPC

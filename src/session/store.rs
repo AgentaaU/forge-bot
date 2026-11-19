@@ -106,12 +106,14 @@ impl UserAgentSettings {
     }
 }
 
-/// Explicit adapter/model choice shared by an issue and its linked PRs.
-/// Reported models and capacity fallbacks never change this preference.
+/// Adapter and explicit model/effort choices shared by an issue and its linked PRs.
+/// Reported settings and capacity fallbacks never change these preferences.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationSelection {
     pub agent: String,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 const CONVERSATION_SELECTIONS_FILE: &str = "conversation-selections.json";
@@ -296,11 +298,11 @@ impl SessionStore {
 
     /// Apply the last explicit choice and save any new one before enqueueing.
     /// The job receives a snapshot, so queued/recovered work cannot accidentally
-    /// pick up a later mention's settings. Effort remains invocation-only.
+    /// pick up a later mention's settings.
     pub fn select_conversation(
         &self,
         job: &mut Job,
-        validate_agent: impl FnOnce(&str) -> Result<()>,
+        agent_supports_effort: impl FnOnce(&str) -> Result<bool>,
     ) -> Result<()> {
         let key = Self::selection_key(&job.message, job.user_id.as_deref());
         let mut selections = self
@@ -313,29 +315,37 @@ impl SessionStore {
             .map(str::to_owned)
             .or_else(|| previous.map(|selection| selection.agent.clone()))
             .unwrap_or_else(|| job.agent.clone());
-        validate_agent(&agent)?;
-        let model = job.mention.model.clone().or_else(|| {
-            previous
-                .filter(|selection| selection.agent == agent)
-                .and_then(|selection| selection.model.clone())
-        });
-        if previous.is_none() || explicit_agent.is_some() || job.mention.model.is_some() {
+        let supports_effort = agent_supports_effort(&agent)?;
+        let previous_for_agent = previous.filter(|selection| selection.agent == agent);
+        // An unsupported explicit request still fails for this job, but it
+        // cannot replace the saved effort used by subsequent mentions.
+        let selection = ConversationSelection {
+            agent,
+            model: job
+                .mention
+                .model
+                .clone()
+                .or_else(|| previous_for_agent.and_then(|selection| selection.model.clone())),
+            effort: job
+                .mention
+                .effort
+                .as_ref()
+                .filter(|_| supports_effort)
+                .cloned()
+                .or_else(|| previous_for_agent.and_then(|selection| selection.effort.clone())),
+        };
+        if previous != Some(&selection) {
             let mut next = selections.clone();
-            next.insert(
-                key,
-                ConversationSelection {
-                    agent: agent.clone(),
-                    model: model.clone(),
-                },
-            );
+            next.insert(key, selection.clone());
             let path = self.dir.join(CONVERSATION_SELECTIONS_FILE);
             let tmp = path.with_extension("json.tmp");
             std::fs::write(&tmp, serde_json::to_vec_pretty(&next)?)?;
             std::fs::rename(tmp, path)?;
             *selections = next;
         }
-        job.agent = agent;
-        job.mention.model = model;
+        job.agent = selection.agent;
+        job.mention.model = selection.model;
+        job.mention.effort = job.mention.effort.take().or(selection.effort);
         Ok(())
     }
 
@@ -741,14 +751,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::open(dir.path()).unwrap();
         let mut initial = job();
-        store.select_conversation(&mut initial, |_| Ok(())).unwrap();
+        store
+            .select_conversation(&mut initial, |_| Ok(true))
+            .unwrap();
         drop(store);
         let store = SessionStore::open(dir.path()).unwrap();
         let mut later = job();
         later.agent = "claude".into();
-        store.select_conversation(&mut later, |_| Ok(())).unwrap();
+        store.select_conversation(&mut later, |_| Ok(true)).unwrap();
         assert_eq!(later.agent, initial.agent);
         assert_eq!(later.mention.model, None);
+        assert_eq!(later.mention.effort, None);
     }
 
     #[test]
@@ -761,7 +774,7 @@ mod tests {
         original.mention.model = Some("gpt-6-astra".into());
         original.mention.effort = Some("high".into());
         store
-            .select_conversation(&mut original, |_| Ok(()))
+            .select_conversation(&mut original, |_| Ok(true))
             .unwrap();
         drop(store);
         let store = SessionStore::open(dir.path()).unwrap();
@@ -776,23 +789,27 @@ mod tests {
         });
         let fresh = follow_up.clone();
         store
-            .select_conversation(&mut follow_up, |_| Ok(()))
+            .select_conversation(&mut follow_up, |_| Ok(true))
             .unwrap();
         assert_eq!(follow_up.agent, "codex");
         assert_eq!(follow_up.mention.model.as_deref(), Some("gpt-6-astra"));
-        assert_eq!(follow_up.mention.effort, None);
+        assert_eq!(follow_up.mention.effort.as_deref(), Some("high"));
         // Recovery retains the accepted snapshot even after another selection.
         store.save_job(&follow_up).unwrap();
         let mut changed = fresh.clone();
         changed.mention.agent = Some("claude".into());
-        store.select_conversation(&mut changed, |_| Ok(())).unwrap();
+        store
+            .select_conversation(&mut changed, |_| Ok(true))
+            .unwrap();
         assert_eq!(changed.mention.model, None);
+        assert_eq!(changed.mention.effort, None);
         let recovered = store.pending_jobs().unwrap();
         assert_eq!(recovered[0].agent, "codex");
         assert_eq!(recovered[0].mention.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(recovered[0].mention.effort.as_deref(), Some("high"));
         let mut issue = job();
         issue.user_id = Some("bot".into());
-        store.select_conversation(&mut issue, |_| Ok(())).unwrap();
+        store.select_conversation(&mut issue, |_| Ok(true)).unwrap();
         assert_eq!(issue.agent, "claude", "PR updates the shared issue choice");
 
         for variant in 0..5 {
@@ -804,15 +821,16 @@ mod tests {
                 3 => other.message.linked_issue = None,
                 _ => other.message.linked_issue.as_mut().unwrap().number = 9,
             }
-            store.select_conversation(&mut other, |_| Ok(())).unwrap();
+            store.select_conversation(&mut other, |_| Ok(true)).unwrap();
             assert_eq!(other.agent, "pi-rpc", "variant {variant}");
             assert_eq!(other.mention.model, None);
+            assert_eq!(other.mention.effort, None);
         }
         let mut cross_repo = fresh;
         cross_repo.message.repository = "other/repo".into();
         cross_repo.message.linked_issue.as_mut().unwrap().repository = Some("a/b".into());
         store
-            .select_conversation(&mut cross_repo, |_| Ok(()))
+            .select_conversation(&mut cross_repo, |_| Ok(true))
             .unwrap();
         assert_eq!(cross_repo.agent, "claude");
     }
@@ -823,21 +841,31 @@ mod tests {
         let store = SessionStore::open(dir.path()).unwrap();
         let mut original = job();
         original.mention.model = Some("model-one".into());
+        original.mention.effort = Some("xhigh".into());
         store
-            .select_conversation(&mut original, |_| Ok(()))
+            .select_conversation(&mut original, |_| Ok(true))
             .unwrap();
         let mut same = job();
         same.mention.agent = Some("codex".into());
-        store.select_conversation(&mut same, |_| Ok(())).unwrap();
+        store.select_conversation(&mut same, |_| Ok(true)).unwrap();
         assert_eq!(same.mention.model.as_deref(), Some("model-one"));
+        assert_eq!(same.mention.effort.as_deref(), Some("xhigh"));
         let mut change_model = job();
         change_model.agent = "pi-rpc".into();
         change_model.mention.model = Some("model-two".into());
         store
-            .select_conversation(&mut change_model, |_| Ok(()))
+            .select_conversation(&mut change_model, |_| Ok(true))
             .unwrap();
         assert_eq!(change_model.agent, "codex");
         assert_eq!(change_model.mention.model.as_deref(), Some("model-two"));
+        assert_eq!(change_model.mention.effort.as_deref(), Some("xhigh"));
+
+        let mut change_effort = job();
+        change_effort.mention.effort = Some("medium".into());
+        store
+            .select_conversation(&mut change_effort, |_| Ok(true))
+            .unwrap();
+        assert_eq!(change_effort.mention.model.as_deref(), Some("model-two"));
 
         let mut invalid = job();
         invalid.mention.agent = Some("typo".into());
@@ -854,16 +882,40 @@ mod tests {
             .join(CONVERSATION_SELECTIONS_FILE)
             .with_extension("json.tmp");
         std::fs::create_dir(&tmp).unwrap();
-        assert!(store.select_conversation(&mut invalid, |_| Ok(())).is_err());
+        let mut failed_update = job();
+        failed_update.mention.effort = Some("low".into());
+        assert!(
+            store
+                .select_conversation(&mut failed_update, |_| Ok(true))
+                .is_err()
+        );
         std::fs::remove_dir(tmp).unwrap();
         let reopened = SessionStore::open(dir.path()).unwrap();
         for store in [&store, &reopened] {
             let mut plain = job();
             plain.agent = "pi-rpc".into();
-            store.select_conversation(&mut plain, |_| Ok(())).unwrap();
+            store.select_conversation(&mut plain, |_| Ok(true)).unwrap();
             assert_eq!(plain.agent, "codex");
             assert_eq!(plain.mention.model.as_deref(), Some("model-two"));
+            assert_eq!(plain.mention.effort.as_deref(), Some("medium"));
         }
+    }
+
+    #[test]
+    fn unsupported_effort_is_kept_only_for_the_request_that_selected_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut explicit = job();
+        explicit.mention.effort = Some("high".into());
+        store
+            .select_conversation(&mut explicit, |_| Ok(false))
+            .unwrap();
+        assert_eq!(explicit.mention.effort.as_deref(), Some("high"));
+        let mut plain = job();
+        store
+            .select_conversation(&mut plain, |_| Ok(false))
+            .unwrap();
+        assert_eq!(plain.mention.effort, None);
     }
 
     #[test]
