@@ -1365,6 +1365,7 @@ impl Inner {
                     &job,
                     &job.agent,
                     &AgentOutcome::failure(error.to_string(), Default::default()),
+                    None,
                 )
                 .await;
                 return;
@@ -1450,6 +1451,7 @@ impl Inner {
                     &job,
                     &job.agent,
                     &permission_aware_failure(&job, &error),
+                    None,
                 )
                 .await;
                 return;
@@ -1472,6 +1474,7 @@ impl Inner {
                 &job,
                 &job.agent,
                 &AgentOutcome::failure(error.to_string(), Default::default()),
+                None,
             )
             .await;
             return;
@@ -1546,9 +1549,7 @@ impl Inner {
         let mut last_outcome: Option<AgentOutcome> = None;
         let mut used_agent = candidates[0].clone();
         let mut unavailable_hits = 0usize;
-        // Why the previous candidate stopped, so the "switching" notice can
-        // name the right reason. `None` means it failed for an ordinary,
-        // unclassified reason.
+        // Why the last candidate stopped, for a fallback or terminal reply.
         let mut previous_reason: Option<UnavailableReason> = None;
 
         let settings = self.run_settings(&job, &user);
@@ -1587,6 +1588,7 @@ impl Inner {
             // is exactly `job.agent` and needs no "instead" notice. Later
             // candidates are fallbacks: name every agent passed over with the
             // reason it left rotation (issues #77, #94).
+            let stopped_reason = previous_reason.take();
             if self.config.reply.ack && index > 0 {
                 let previous = &candidates[index - 1];
                 let skipped = self.skipped_agents(previous, name);
@@ -1596,7 +1598,7 @@ impl Inner {
                 // passed over on the way to `name`, each with its own reason.
                 let mut stopped = vec![(
                     previous.clone(),
-                    previous_reason.clone().unwrap_or(UnavailableReason::Failed),
+                    stopped_reason.unwrap_or(UnavailableReason::Failed),
                 )];
                 stopped.extend(skipped.into_iter().filter(|(agent, _)| agent != previous));
                 let notice = format!(
@@ -1786,7 +1788,6 @@ impl Inner {
                 // unanswered while a working agent is available.
                 tracing::warn!(job = %job.id, agent = %name, "agent failed; trying the next candidate");
                 last_outcome = Some(outcome);
-                previous_reason = None;
                 continue;
             }
 
@@ -1826,7 +1827,8 @@ impl Inner {
             if !outcome.success && failures.len() > 1 {
                 outcome.summary = truncate(&failures.join("\n\n"), 5500);
             }
-            self.finish(&key, &job, &used_agent, &outcome).await;
+            self.finish(&key, &job, &used_agent, &outcome, previous_reason)
+                .await;
         }
     }
 
@@ -1949,7 +1951,14 @@ impl Inner {
         }
     }
 
-    async fn finish(&self, key: &str, job: &Job, agent: &str, outcome: &AgentOutcome) {
+    async fn finish(
+        &self,
+        key: &str,
+        job: &Job,
+        agent: &str,
+        outcome: &AgentOutcome,
+        reason: Option<UnavailableReason>,
+    ) {
         if !self.claim_outcome(job) {
             return;
         }
@@ -1972,7 +1981,16 @@ impl Inner {
         let summary = if outcome.success {
             truncate(&outcome.summary, 6000)
         } else {
-            "Please try again later. Failure details are recorded in the server logs and run history.".into()
+            let cause = match reason {
+                Some(UnavailableReason::CapacityLimit) => "The agent reached a capacity limit. ",
+                Some(UnavailableReason::ProviderOverloaded) => {
+                    "The selected model is at capacity or its provider is overloaded. "
+                }
+                _ => "",
+            };
+            format!(
+                "{cause}Please try again later. Failure details are recorded in the server logs and run history."
+            )
         };
         let body = if summary.trim().is_empty() {
             format!("🤖 Agent **{agent}** {status} in {:?}.", outcome.duration)
@@ -4639,10 +4657,14 @@ mod tests {
                 Ok(AgentOutcome::failure(self.failure, Duration::ZERO))
             }
         }
-        for failure in [
-            "modelNotFound: astra",
-            "rate limit exceeded (429)",
-            "startup",
+        for (failure, reason) in [
+            ("modelNotFound: astra", None),
+            ("rate limit exceeded (429)", Some("capacity limit")),
+            (
+                "Selected model is at capacity. Please try a different model.",
+                Some("provider is overloaded"),
+            ),
+            ("startup", None),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut config = explicit_config(dir.path());
@@ -4664,11 +4686,12 @@ mod tests {
             registry.insert_for_test("codex", primary.clone());
             registry.insert_for_test("pi-rpc", secondary.clone());
             let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+            let api = Arc::new(RecordingApi::default());
             let dispatcher = Dispatcher::new(
                 config.clone(),
                 Arc::new(registry),
                 sessions.clone(),
-                Arc::new(NoopForgeApi),
+                api.clone(),
                 Policy::new(&config.policy),
             )
             .unwrap();
@@ -4679,6 +4702,19 @@ mod tests {
             wait_for_drain(&sessions).await;
             assert_eq!(*primary.seen.lock().unwrap(), vec![Some("astra".into())]);
             assert!(secondary.seen.lock().unwrap().is_empty(), "{failure}");
+            let comments = api.comments();
+            let reply = comments
+                .iter()
+                .find(|body| body.contains("Agent **codex** ❌ failed"))
+                .unwrap_or_else(|| panic!("missing terminal reply: {comments:?}"));
+            if let Some(reason) = reason {
+                assert!(reply.to_ascii_lowercase().contains(reason), "{reply}");
+            } else {
+                assert!(reply.contains("Please try again later."), "{reply}");
+                assert!(!reply.contains("capacity limit"), "{reply}");
+                assert!(!reply.contains("provider is overloaded"), "{reply}");
+            }
+            assert!(!reply.contains(failure), "{reply}");
         }
     }
 
@@ -5450,6 +5486,14 @@ mod tests {
                 "overloaded_error"
             };
             let comments = api.comments();
+            if names[1] == "broken-agent" {
+                let reply = comments
+                    .iter()
+                    .find(|body| body.contains("Agent **broken-agent** ❌ failed"))
+                    .unwrap_or_else(|| panic!("missing terminal reply: {comments:?}"));
+                assert!(reply.contains("Please try again later."), "{reply}");
+                assert!(!reply.contains("capacity limit"), "{reply}");
+            }
             assert!(
                 comments
                     .iter()

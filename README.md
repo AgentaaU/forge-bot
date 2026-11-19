@@ -676,6 +676,9 @@ times without a timezone use the bot host's local timezone. Otherwise,
 `[capacity] cooldown_secs` is used for quota/rate limits (default five hours).
 Explicit model/server overload uses `overload_cooldown_secs` (default 60 seconds),
 so temporary model contention does not disable the adapter for five hours.
+When a capacity-limited run ends without a fallback, the failure reply says
+whether it hit a capacity limit or the model/provider was overloaded. Raw
+provider errors stay in the server logs and run history.
 
 The example config sets `agent_sequence = ["codex", "agy", "pi-rpc", "claude"]`
 at the top level. Use registered adapter names; `agy` is Antigravity
