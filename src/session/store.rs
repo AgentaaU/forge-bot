@@ -115,6 +115,16 @@ pub struct ConversationSelection {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Effort recovered from an older run record whose source is unknown.
+    /// It is kept separate from `effort`: an admin setting overrides it, while
+    /// a known explicit choice does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_effort: Option<String>,
+    /// Whether the effort for this conversation has already been resolved.
+    /// Older selections predate effort inheritance, so a missing effort is
+    /// seeded once from the last run in the same conversation.
+    #[serde(default)]
+    pub effort_checked: bool,
 }
 
 const CONVERSATION_SELECTIONS_FILE: &str = "conversation-selections.json";
@@ -301,6 +311,24 @@ impl SessionStore {
             .cloned()
     }
 
+    /// Effort recorded by the newest run of `agent` in this conversation.
+    ///
+    /// Used only to migrate a conversation whose saved selection predates
+    /// effort inheritance. Runs from another adapter are ignored so switching
+    /// adapters still clears the old adapter's effort.
+    fn last_run_effort(&self, key: &str, agent: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .expect("session mutex poisoned")
+            .get(key)?
+            .runs
+            .iter()
+            .rev()
+            .find(|run| run.agent == agent)?
+            .effort
+            .clone()
+    }
+
     /// Apply the last explicit choice and save any new one before enqueueing.
     /// The job receives a snapshot, so queued/recovered work cannot accidentally
     /// pick up a later mention's settings.
@@ -322,8 +350,36 @@ impl SessionStore {
             .unwrap_or_else(|| job.agent.clone());
         let supports_effort = agent_supports_effort(&agent)?;
         let previous_for_agent = previous.filter(|selection| selection.agent == agent);
+        let switched_agent = previous.is_some_and(|selection| selection.agent != agent);
+        // Only selections written before effort inheritance was introduced
+        // recover their effort from run history. A new conversation starts
+        // resolved so it cannot turn a run's admin/default effort into a saved
+        // preference.
+        let legacy_selection =
+            previous_for_agent.is_some_and(|selection| !selection.effort_checked);
         // An unsupported explicit request still fails for this job, but it
         // cannot replace the saved effort used by subsequent mentions.
+        let effort = job
+            .mention
+            .effort
+            .as_ref()
+            .filter(|_| supports_effort)
+            .cloned()
+            .or_else(|| previous_for_agent.and_then(|selection| selection.effort.clone()));
+        // A recovered value has unknown provenance: use it only as a fallback
+        // behind an admin setting, never as an explicit preference. Consume the
+        // migration even when the matching history has no effort.
+        let recovered_effort = if switched_agent || effort.is_some() {
+            None
+        } else {
+            previous_for_agent
+                .and_then(|selection| selection.recovered_effort.clone())
+                .or_else(|| {
+                    legacy_selection
+                        .then(|| self.last_run_effort(&key, &agent))
+                        .flatten()
+                })
+        };
         let selection = ConversationSelection {
             agent,
             model: job
@@ -331,13 +387,9 @@ impl SessionStore {
                 .model
                 .clone()
                 .or_else(|| previous_for_agent.and_then(|selection| selection.model.clone())),
-            effort: job
-                .mention
-                .effort
-                .as_ref()
-                .filter(|_| supports_effort)
-                .cloned()
-                .or_else(|| previous_for_agent.and_then(|selection| selection.effort.clone())),
+            effort,
+            recovered_effort,
+            effort_checked: true,
         };
         if previous != Some(&selection) {
             let mut next = selections.clone();
@@ -351,6 +403,7 @@ impl SessionStore {
         job.agent = selection.agent;
         job.mention.model = selection.model;
         job.mention.effort = job.mention.effort.take().or(selection.effort);
+        job.recovered_effort = selection.recovered_effort;
         Ok(())
     }
 
@@ -714,6 +767,7 @@ mod tests {
 
     fn job() -> Job {
         Job {
+            recovered_effort: None,
             model_agent: None,
             configured_model_agent: None,
             id: Uuid::new_v4(),
@@ -899,6 +953,189 @@ mod tests {
             assert_eq!(plain.mention.model.as_deref(), Some("model-two"));
             assert_eq!(plain.mention.effort.as_deref(), Some("medium"));
         }
+    }
+
+    #[test]
+    fn legacy_selection_recovers_effort_from_the_latest_run_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut original = job();
+        original.mention.model = Some("gpt-6-astra".into());
+        store.begin(&original).unwrap();
+        let mut outcome = AgentOutcome::success("done", Duration::ZERO);
+        outcome.effort = Some("xhigh".into());
+        store
+            .finish(&original.session_key(), original.id, "codex", &outcome)
+            .unwrap();
+        // Old selections saved before effort inheritance have no effort and no
+        // `effort_checked` marker.
+        let key = SessionStore::selection_key(&original.message, None);
+        let selections = BTreeMap::from([(
+            key,
+            ConversationSelection {
+                agent: "codex".into(),
+                model: Some("gpt-6-astra".into()),
+                effort: None,
+                recovered_effort: None,
+                effort_checked: false,
+            },
+        )]);
+        std::fs::write(
+            dir.path().join(CONVERSATION_SELECTIONS_FILE),
+            serde_json::to_vec_pretty(&selections).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut follow_up = job();
+        follow_up.agent = "pi-rpc".into();
+        store
+            .select_conversation(&mut follow_up, |_| Ok(true))
+            .unwrap();
+        assert_eq!(follow_up.agent, "codex");
+        assert_eq!(follow_up.mention.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(follow_up.mention.effort, None);
+        assert_eq!(
+            store
+                .conversation_selection(&follow_up.message, None)
+                .unwrap()
+                .recovered_effort
+                .as_deref(),
+            Some("xhigh")
+        );
+
+        // The recovered effort is persisted with the conversation.
+        drop(store);
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut later = job();
+        later.agent = "claude".into();
+        store.select_conversation(&mut later, |_| Ok(true)).unwrap();
+        assert_eq!(
+            store
+                .conversation_selection(&later.message, None)
+                .unwrap()
+                .recovered_effort
+                .as_deref(),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn new_selection_does_not_recover_effort_from_a_later_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut original = job();
+        original.mention.agent = Some("codex".into());
+        original.mention.model = Some("gpt-6-astra".into());
+        store
+            .select_conversation(&mut original, |_| Ok(true))
+            .unwrap();
+        assert_eq!(original.mention.effort, None);
+
+        store.begin(&original).unwrap();
+        let mut outcome = AgentOutcome::success("done", Duration::ZERO);
+        outcome.effort = Some("xhigh".into());
+        store
+            .finish(&original.session_key(), original.id, "codex", &outcome)
+            .unwrap();
+
+        let mut follow_up = job();
+        store
+            .select_conversation(&mut follow_up, |_| Ok(true))
+            .unwrap();
+        assert_eq!(follow_up.mention.effort, None);
+        assert_eq!(
+            store
+                .conversation_selection(&follow_up.message, None)
+                .unwrap()
+                .recovered_effort,
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_effort_is_not_recovered_from_another_agent_or_after_it_was_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let original = job();
+        store.begin(&original).unwrap();
+        let mut outcome = AgentOutcome::success("done", Duration::ZERO);
+        outcome.effort = Some("xhigh".into());
+        store
+            .finish(&original.session_key(), original.id, "codex", &outcome)
+            .unwrap();
+
+        let key = SessionStore::selection_key(&original.message, None);
+        // Seed an unchecked Pi selection alongside the matching Codex run. The
+        // migration must not borrow Codex's effort for the Pi conversation.
+        let selections = BTreeMap::from([(
+            key.clone(),
+            ConversationSelection {
+                agent: "pi-rpc".into(),
+                model: None,
+                effort: None,
+                recovered_effort: None,
+                effort_checked: false,
+            },
+        )]);
+        std::fs::write(
+            dir.path().join(CONVERSATION_SELECTIONS_FILE),
+            serde_json::to_vec_pretty(&selections).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut other_agent = job();
+        other_agent.agent = "pi-rpc".into();
+        store
+            .select_conversation(&mut other_agent, |_| Ok(true))
+            .unwrap();
+        assert_eq!(other_agent.agent, "pi-rpc");
+        assert_eq!(other_agent.mention.effort, None);
+        assert_eq!(
+            store
+                .conversation_selection(&other_agent.message, None)
+                .unwrap()
+                .recovered_effort,
+            None
+        );
+
+        // Once resolved, a missing effort stays missing so a later admin
+        // default is not frozen behind historical run history.
+        let selections = BTreeMap::from([(
+            key,
+            ConversationSelection {
+                agent: "codex".into(),
+                model: None,
+                effort: None,
+                recovered_effort: None,
+                effort_checked: true,
+            },
+        )]);
+        std::fs::write(
+            dir.path().join(CONVERSATION_SELECTIONS_FILE),
+            serde_json::to_vec_pretty(&selections).unwrap(),
+        )
+        .unwrap();
+        // Reopen so the checked Codex fixture is actually read instead of the
+        // in-memory Pi selection written above.
+        drop(store);
+        let store = SessionStore::open(dir.path()).unwrap();
+        let mut checked = job();
+        checked.agent = "pi-rpc".into();
+        store
+            .select_conversation(&mut checked, |_| Ok(true))
+            .unwrap();
+        assert_eq!(checked.agent, "codex");
+        assert_eq!(checked.mention.effort, None);
+        assert_eq!(
+            store
+                .conversation_selection(&checked.message, None)
+                .unwrap()
+                .recovered_effort,
+            None
+        );
     }
 
     #[test]

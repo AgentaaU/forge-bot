@@ -105,9 +105,9 @@ pub struct AgentContext {
     pub explicit_model: bool,
     /// The caller selected this effort in the current or an earlier mention.
     pub explicit_effort: bool,
-    /// Reasoning effort from a mention, the saved conversation choice, or `/admin`.
-    /// `None` leaves the agent's own default. Only adapters reporting
-    /// [`Agent::supports_effort`] apply it.
+    /// Reasoning effort from a mention, the saved conversation choice, `/admin`,
+    /// or recovered history behind those choices. `None` leaves the agent's own
+    /// default. Only adapters reporting [`Agent::supports_effort`] apply it.
     pub effort: Option<String>,
 }
 

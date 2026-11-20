@@ -351,6 +351,7 @@ impl Dispatcher {
             .clone()
             .unwrap_or_else(|| self.inner.agents.default_name());
         let mut job = Job {
+            recovered_effort: None,
             configured_model_agent: Some(configured_agent),
             model_agent: Some(
                 override_agent
@@ -1234,6 +1235,41 @@ impl Inner {
         }
     }
 
+    /// Effective model and effort for launching `name`.
+    ///
+    /// Explicit values belong to the requested adapter. Admin settings belong
+    /// to `settings.agent`, and recovered history belongs to the conversation's
+    /// adapter. Steering uses the same calculation so a follow-up joins the
+    /// run only when its launch settings match.
+    fn launch_settings(
+        &self,
+        job: &Job,
+        settings: &UserAgentSettings,
+        name: &str,
+    ) -> (Option<String>, Option<String>) {
+        let owns_admin_settings = settings.agent.as_deref() == Some(name);
+        let model = job.mention.model.clone().or_else(|| {
+            owns_admin_settings
+                .then(|| settings.model.clone())
+                .flatten()
+        });
+        let effort = job
+            .mention
+            .effort
+            .clone()
+            .or_else(|| {
+                owns_admin_settings
+                    .then(|| settings.effort.clone())
+                    .flatten()
+            })
+            .or_else(|| {
+                (job.agent == name)
+                    .then(|| job.recovered_effort.clone())
+                    .flatten()
+            });
+        (model, effort)
+    }
+
     /// Try to deliver `job` into the run already in flight for its
     /// conversation.
     ///
@@ -1281,11 +1317,7 @@ impl Inner {
             return false;
         };
         let settings = self.run_settings(job, &user);
-        let (model, effort) = if settings.agent.as_deref() == Some(name.as_str()) {
-            (settings.model, settings.effort)
-        } else {
-            (None, None)
-        };
+        let (model, effort) = self.launch_settings(job, &settings, &name);
         // A live process cannot adopt another adapter or launch settings.
         // Queue this mention so the next run uses the saved admin choices.
         // An implicit follow-up may join the fallback chosen for the same
@@ -1420,16 +1452,6 @@ impl Inner {
             .config
             .credentials_for(job.message.forge, token.as_deref());
         let host_user = (!user.host_user.is_empty()).then(|| user.host_user.clone());
-        // A user's model belongs to its configured adapter (or the registry
-        // default captured when enqueued, when omitted). Older records without
-        // a stored binding use the startup default, never the explicit execution
-        // adapter or a newly ranked default. Provider-specific IDs must not be
-        // injected into alternate adapters or automatic fallbacks.
-        let model_agent = job
-            .model_agent
-            .clone()
-            .or_else(|| user.agent.clone())
-            .unwrap_or_else(|| self.agents.configured_default_name().to_owned());
         let workspace = match self
             .workspaces
             .prepare(
@@ -1563,16 +1585,7 @@ impl Inner {
             context.explicit_model = job.mention.model.is_some();
             context.explicit_effort = job.mention.effort.is_some();
             // Inline or inherited model requirements pin this invocation to its adapter.
-            context.model = job.mention.model.clone().or_else(|| {
-                (name == &model_agent)
-                    .then(|| settings.model.clone())
-                    .flatten()
-            });
-            context.effort = job.mention.effort.clone().or_else(|| {
-                (name == &model_agent)
-                    .then(|| settings.effort.clone())
-                    .flatten()
-            });
+            (context.model, context.effort) = self.launch_settings(&job, &settings, name);
             if self.config.reply.ack {
                 notices.retain(|notice| !notice.starts_with("Model: "));
                 notices.push(execution_settings_notice(None, None));
@@ -2428,6 +2441,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dispatcher = dispatcher_for(test_config(dir.path()), dir.path());
         let job = Job {
+            recovered_effort: None,
             id: Uuid::new_v4(),
             message: message("o/r"),
             mention: Mention {
@@ -2743,6 +2757,7 @@ mod tests {
         // earlier human mention with `--agent=custom` would have.
         let user = dispatcher.inner.recipient_for(&auto);
         let job = Job {
+            recovered_effort: None,
             model_agent: None,
             configured_model_agent: None,
             id: Uuid::new_v4(),
@@ -2769,6 +2784,7 @@ mod tests {
         removed.number = Some(2);
         let user = dispatcher.inner.recipient_for(&removed);
         let job = Job {
+            recovered_effort: None,
             model_agent: None,
             configured_model_agent: None,
             id: Uuid::new_v4(),
@@ -3106,6 +3122,7 @@ mod tests {
     #[test]
     fn permission_failure_is_user_facing() {
         let job = Job {
+            recovered_effort: None,
             model_agent: None,
             configured_model_agent: None,
             id: Uuid::new_v4(),
@@ -3481,6 +3498,7 @@ mod tests {
         assert_eq!(steering.runs(), 1);
 
         let mut settings_job = Job {
+            recovered_effort: None,
             model_agent: Some("steering".into()),
             configured_model_agent: Some("steering".into()),
             id: Uuid::new_v4(),
@@ -3582,6 +3600,103 @@ mod tests {
                 == "forge-bot: 📎 Merged into the current run. Follow-up from @other-bot."),
             "the thread should show the merge notice and its author: {comments:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_effort_steers_a_running_non_default_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.policy.allow_all = true;
+        config.agent_sequence = vec!["steering".into()];
+        // The settings owner stays Codex even though the conversation selects
+        // the non-default steering adapter.
+        config.users.get_mut("default").unwrap().agent = Some("codex".into());
+        let config = Arc::new(config);
+
+        let first_message = message("o/r");
+        let key = SessionStore::key(&first_message, Some("default"));
+        let selections = std::collections::BTreeMap::from([(
+            key,
+            serde_json::json!({
+                "agent": "steering",
+                "recovered_effort": "high",
+                "effort_checked": true
+            }),
+        )]);
+        std::fs::write(
+            dir.path().join("conversation-selections.json"),
+            serde_json::to_vec_pretty(&selections).unwrap(),
+        )
+        .unwrap();
+
+        let steering = Arc::new(SteeringAgent::new());
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test("steering", steering.clone());
+        for name in registry.names() {
+            if name != "steering" {
+                registry.mark_unavailable(&name, Duration::from_secs(3600));
+            }
+        }
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(registry),
+            sessions.clone(),
+            Arc::new(RecordingForgeApi::new()),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        dispatcher
+            .submit(
+                first_message,
+                Mention {
+                    model: None,
+                    effort: None,
+                    agent: None,
+                    message: "first".into(),
+                },
+                "steering",
+            )
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            if steering.runs() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(steering.runs(), 1);
+        let pending = sessions.pending_jobs().unwrap();
+        assert_eq!(
+            pending[0].model_agent.as_deref(),
+            Some("codex"),
+            "the first job's settings owner must remain Codex"
+        );
+
+        // Codex owns the admin settings, but steering owns the recovered effort.
+        // A plain follow-up must compare against the same effective launch
+        // settings and steer instead of queueing behind the running turn.
+        dispatcher
+            .submit(
+                message("o/r"),
+                Mention {
+                    model: None,
+                    effort: None,
+                    agent: None,
+                    message: "second".into(),
+                },
+                "steering",
+            )
+            .await
+            .unwrap();
+        wait_for_drain(&sessions).await;
+        assert_eq!(
+            steering.runs(),
+            1,
+            "the follow-up must not start a second run"
+        );
+        assert_eq!(steering.steers(), vec!["second".to_owned()]);
     }
 
     /// An automatic trigger merged into a live run names its origin, so the
@@ -3715,6 +3830,7 @@ mod tests {
     #[test]
     fn merged_notice_names_the_trigger() {
         let auto_job = |event: &str| Job {
+            recovered_effort: None,
             model_agent: None,
             configured_model_agent: None,
             id: Uuid::new_v4(),
@@ -3793,6 +3909,7 @@ mod tests {
         .unwrap();
 
         let job = Job {
+            recovered_effort: None,
             model_agent: None,
             configured_model_agent: None,
             id: Uuid::new_v4(),
@@ -4434,6 +4551,7 @@ mod tests {
                 }
                 for (number, agent) in [(1, "secondary"), (2, "primary")] {
                     let pending = Job {
+                        recovered_effort: None,
                         id: Uuid::new_v4(),
                         message: message_at("o/r", number),
                         mention: Mention {
@@ -4497,6 +4615,135 @@ mod tests {
                 assert_eq!(*primary.seen.lock().unwrap(), vec![expected]);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn replayed_jobs_keep_their_snapshotted_recovered_effort() {
+        struct Probe {
+            seen: Mutex<Vec<(Option<String>, Option<String>)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Agent for Probe {
+            fn name(&self) -> &str {
+                "recorder"
+            }
+
+            fn supports_effort(&self) -> bool {
+                true
+            }
+
+            async fn run(&self, _: &AgentRequest, context: &AgentContext) -> Result<AgentOutcome> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((context.model.clone(), context.effort.clone()));
+                Ok(AgentOutcome::success("done", Duration::ZERO))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.session.recover = true;
+        config.agent_sequence = vec!["recorder".into()];
+        let config = Arc::new(config);
+
+        // Leave a completed high-effort run behind, then write a selection in
+        // the shape produced before effort inheritance had a source marker.
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let seed = Job {
+            recovered_effort: None,
+            model_agent: Some("recorder".into()),
+            configured_model_agent: Some("recorder".into()),
+            id: Uuid::new_v4(),
+            message: message_at("o/r", 1),
+            mention: Mention {
+                model: None,
+                effort: None,
+                agent: Some("recorder".into()),
+                message: "seed".into(),
+            },
+            agent: "recorder".into(),
+            user_id: Some("default".into()),
+            created_at: Utc::now(),
+            status_comment: None,
+            waiting: false,
+        };
+        sessions.begin(&seed).unwrap();
+        let mut outcome = AgentOutcome::success("done", Duration::ZERO);
+        outcome.effort = Some("high".into());
+        sessions
+            .finish(&seed.session_key(), seed.id, "recorder", &outcome)
+            .unwrap();
+        let key = SessionStore::key(&seed.message, Some("default"));
+        drop(sessions);
+        let selections =
+            std::collections::BTreeMap::from([(key, serde_json::json!({"agent": "recorder"}))]);
+        std::fs::write(
+            dir.path().join("conversation-selections.json"),
+            serde_json::to_vec_pretty(&selections).unwrap(),
+        )
+        .unwrap();
+
+        // Accept the plain job first, then a later explicit-low mention. The
+        // explicit mention clears the shared recovered value, but it must not
+        // change the first job's persisted snapshot.
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let mut first = seed.clone();
+        first.id = Uuid::new_v4();
+        first.message = message_at("o/r", 1);
+        first.mention = Mention {
+            model: None,
+            effort: None,
+            agent: None,
+            message: "first".into(),
+        };
+        first.created_at = Utc::now();
+        first.waiting = false;
+        first.status_comment = None;
+        sessions
+            .select_conversation(&mut first, |_| Ok(true))
+            .unwrap();
+        assert_eq!(first.recovered_effort.as_deref(), Some("high"));
+        sessions.save_job(&first).unwrap();
+
+        let mut second = first.clone();
+        second.id = Uuid::new_v4();
+        second.message = message_at("o/r", 1);
+        second.mention = Mention {
+            model: None,
+            effort: Some("low".into()),
+            agent: None,
+            message: "second".into(),
+        };
+        second.created_at = first.created_at + chrono::Duration::seconds(1);
+        sessions
+            .select_conversation(&mut second, |_| Ok(true))
+            .unwrap();
+        assert_eq!(second.recovered_effort, None);
+        sessions.save_job(&second).unwrap();
+        drop(sessions);
+
+        let recorder = Arc::new(Probe {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test("recorder", recorder.clone());
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let _dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(registry),
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+        wait_for_drain(&sessions).await;
+        assert_eq!(
+            *recorder.seen.lock().unwrap(),
+            vec![(None, Some("high".into())), (None, Some("low".into()))],
+            "each replayed job must launch with its own accepted settings"
+        );
     }
 
     #[tokio::test]
@@ -4904,7 +5151,9 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((context.model.clone(), context.effort.clone()));
-                Ok(crate::agent::AgentOutcome::success("done", Duration::ZERO))
+                let mut outcome = crate::agent::AgentOutcome::success("done", Duration::ZERO);
+                outcome.effort = context.effort.clone();
+                Ok(outcome)
             }
         }
 
@@ -5127,6 +5376,7 @@ mod tests {
                 .set_user_settings("default", UserAgentSettings::default())
                 .unwrap();
             let pending = Job {
+                recovered_effort: None,
                 id: Uuid::new_v4(),
                 message: message("o/r"),
                 mention: Mention {
@@ -5211,6 +5461,140 @@ mod tests {
                 &(Some("configured-model".into()), None)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn upgraded_selection_does_not_pin_the_previous_admin_effort() {
+        /// Records launch settings and reports the effective effort like a real
+        /// adapter, so a recovered value cannot masquerade as an explicit one.
+        struct Recorder {
+            seen: Mutex<Vec<(Option<String>, Option<String>)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::agent::Agent for Recorder {
+            fn name(&self) -> &str {
+                "recorder"
+            }
+
+            fn supports_effort(&self) -> bool {
+                true
+            }
+
+            async fn run(
+                &self,
+                _request: &crate::agent::AgentRequest,
+                context: &AgentContext,
+            ) -> Result<crate::agent::AgentOutcome> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((context.model.clone(), context.effort.clone()));
+                let mut outcome = crate::agent::AgentOutcome::success("done", Duration::ZERO);
+                outcome.effort = context.effort.clone();
+                Ok(outcome)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.policy.allow_all = true;
+        config.agent_sequence = vec!["recorder".into()];
+        let user = config.users.get_mut("default").unwrap();
+        user.agent = Some("recorder".into());
+        user.agent_model = Some("configured-model".into());
+        let config = Arc::new(config);
+        let recorder = Arc::new(Recorder {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut registry = AgentRegistry::from_config(&config);
+        registry.insert_for_test("recorder", recorder.clone());
+        let registry = Arc::new(registry);
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let dispatcher = Dispatcher::new(
+            config.clone(),
+            registry.clone(),
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+        let submit = |dispatcher: Arc<Dispatcher>, message: crate::forge::ForgeMessage| async move {
+            dispatcher
+                .submit(
+                    message,
+                    Mention {
+                        model: None,
+                        effort: None,
+                        agent: None,
+                        message: "go".into(),
+                    },
+                    "recorder",
+                )
+                .await
+                .unwrap();
+        };
+
+        dispatcher
+            .set_user_settings(
+                "default",
+                UserAgentSettings {
+                    agent: None,
+                    model: None,
+                    effort: Some("high".into()),
+                },
+            )
+            .unwrap();
+        let issue = message_at("o/r", 1);
+        submit(dispatcher.clone(), issue.clone()).await;
+        wait_for_drain(&sessions).await;
+        assert_eq!(
+            recorder.seen.lock().unwrap().last().unwrap(),
+            &(Some("configured-model".into()), Some("high".into()))
+        );
+
+        // Simulate a selection file written by current main: no effort and no
+        // migration marker. The next admin change must still take effect.
+        let path = dir.path().join("conversation-selections.json");
+        let mut selections: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for selection in selections.values_mut() {
+            let selection = selection.as_object_mut().unwrap();
+            selection.remove("effort");
+            selection.remove("recovered_effort");
+            selection.remove("effort_checked");
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&selections).unwrap()).unwrap();
+        drop(dispatcher);
+        drop(sessions);
+
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let restarted_config = config.clone();
+        let dispatcher = Dispatcher::new(
+            config,
+            registry,
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&restarted_config.policy),
+        )
+        .unwrap();
+        dispatcher
+            .set_user_settings(
+                "default",
+                UserAgentSettings {
+                    agent: None,
+                    model: None,
+                    effort: Some("low".into()),
+                },
+            )
+            .unwrap();
+        submit(dispatcher, issue).await;
+        wait_for_drain(&sessions).await;
+        assert_eq!(
+            recorder.seen.lock().unwrap().last().unwrap(),
+            &(Some("configured-model".into()), Some("low".into())),
+            "a recovered history value must not override the new admin effort"
+        );
     }
 
     #[tokio::test]
@@ -7177,6 +7561,7 @@ echo "end:$token" >> "$AGENT_LOG"
 
         for (number, token) in [(1, "TOKEN_A"), (2, "TOKEN_B"), (3, "TOKEN_C")] {
             let job = Job {
+                recovered_effort: None,
                 model_agent: None,
                 configured_model_agent: None,
                 id: Uuid::new_v4(),
@@ -7755,6 +8140,7 @@ echo "end:$token" >> "$AGENT_LOG"
         // restart with a job still in flight would.
         for (index, token) in ["TOKEN_A", "TOKEN_B"].into_iter().enumerate() {
             let mut job = Job {
+                recovered_effort: None,
                 model_agent: None,
                 configured_model_agent: None,
                 id: Uuid::new_v4(),

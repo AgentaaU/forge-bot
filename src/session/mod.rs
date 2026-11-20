@@ -43,6 +43,11 @@ pub struct Job {
     /// same account instead of re-deriving it from the message.
     #[serde(default)]
     pub user_id: Option<String>,
+    /// History-derived effort captured with the selection that accepted this
+    /// job. Kept separate from `mention.effort` so admin settings can override
+    /// it, and snapshotted so later mentions cannot change queued work.
+    #[serde(default)]
+    pub recovered_effort: Option<String>,
     pub created_at: DateTime<Utc>,
     /// Forge comment id of the status comment, when the forge supports editing
     /// it. `submit` posts the acknowledgement and records the id so the worker

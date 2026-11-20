@@ -637,6 +637,7 @@ mod tests {
     fn job(number: u64, is_pr: bool, agent: &str) -> Job {
         let path = if is_pr { "pulls" } else { "issues" };
         Job {
+            recovered_effort: None,
             model_agent: None,
             configured_model_agent: None,
             id: uuid::Uuid::new_v4(),

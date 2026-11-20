@@ -2920,6 +2920,7 @@ async fn admin_reported_models_follow_the_reporting_adapter_not_the_queued_adapt
         );
     });
     let mut job = Job {
+        recovered_effort: None,
         model_agent: None,
         configured_model_agent: None,
         id: uuid::Uuid::new_v4(),

@@ -710,12 +710,14 @@ These choices survive restarts and are isolated by bot user and forge. Unrelated
 issues and PRs keep their own defaults. A new explicit choice updates the
 conversation. Switching adapters clears the previous adapter's model and effort.
 Capacity fallbacks and agent-reported settings never replace the saved choice.
+A conversation saved before effort inheritance existed recovers the effort of
+its most recent run from the same adapter once. That recovered value is a
+lower-priority fallback: admin settings override it, a known explicit choice
+still wins, and it never borrows an effort from a different adapter.
 An explicit or remembered model pins execution to the selected
 adapter: failures and capacity limits do not try other adapters, which could
 interpret that model ID differently. Model IDs are not expanded from aliases;
 use the exact ID supported by the selected adapter and account.
-Repeat explicit selections that the bot did not yet save, including `--effort`
-choices made before effort inheritance was added.
 Options end at the first instruction word or unknown, empty, or invalid option;
 that text remains part of the instruction. Options on subsequent lines are
 instruction text. Model and effort are passed through the agent's CLI or RPC
