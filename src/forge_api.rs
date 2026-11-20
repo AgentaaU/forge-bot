@@ -288,7 +288,30 @@ impl HttpForgeApi {
         send(req).await
     }
 
-    async fn post_gitlab(&self, loc: &ForgeLocation, body: &str) -> Result<()> {
+    async fn post_at(&self, loc: &ForgeLocation, body: &str) -> Result<()> {
+        match loc.forge {
+            ForgeKind::Forgejo | ForgeKind::Gitea => self.post_forgejo(loc, body).await,
+            ForgeKind::GitHub => self.post_github(loc, body).await,
+            ForgeKind::GitLab => {
+                self.post_gitlab(
+                    &loc.repository(),
+                    loc.number,
+                    loc.kind == crate::location::LocationKind::PullRequest,
+                    body,
+                )
+                .await
+            }
+            ForgeKind::Unknown => Err(BotError::UnsupportedForge(loc.forge.to_string())),
+        }
+    }
+
+    async fn post_gitlab(
+        &self,
+        repository: &str,
+        number: Option<u64>,
+        is_merge_request: bool,
+        body: &str,
+    ) -> Result<()> {
         let cfg = self
             .config
             .forges
@@ -300,13 +323,13 @@ impl HttpForgeApi {
         } else {
             cfg.base_url.trim_end_matches('/').to_owned()
         };
-        let number = loc
-            .number
-            .ok_or_else(|| BotError::ForgeApi("location has no issue number".into()))?;
-        let project = urlencoding(&format!("{}/{}", loc.owner, loc.repo));
-        let resource = match loc.kind {
-            crate::location::LocationKind::PullRequest => "merge_requests",
-            _ => "issues",
+        let number =
+            number.ok_or_else(|| BotError::ForgeApi("location has no issue number".into()))?;
+        let project = urlencoding(repository);
+        let resource = if is_merge_request {
+            "merge_requests"
+        } else {
+            "issues"
         };
         let url = format!("{base}/api/v4/projects/{project}/{resource}/{number}/notes");
         let mut req = self
@@ -415,28 +438,33 @@ impl ForgeApi for HttpForgeApi {
 
     async fn post_comment(&self, location: &Url, body: &str) -> Result<()> {
         let loc = ForgeLocation::parse(location)?;
-        match loc.forge {
-            ForgeKind::Forgejo | ForgeKind::Gitea => self.post_forgejo(&loc, body).await,
-            ForgeKind::GitHub => self.post_github(&loc, body).await,
-            ForgeKind::GitLab => self.post_gitlab(&loc, body).await,
-            ForgeKind::Unknown => Err(BotError::UnsupportedForge(loc.forge.to_string())),
-        }
+        self.post_at(&loc, body).await
     }
 
     async fn reply(&self, message: &ForgeMessage, body: &str) -> Result<()> {
+        if message.forge == ForgeKind::GitLab {
+            return self
+                .post_gitlab(
+                    &message.repository,
+                    message.number,
+                    message.is_pull_request,
+                    body,
+                )
+                .await;
+        }
+        let loc = ForgeLocation::parse_for(&message.location, message.forge)?;
         if let ReplyTarget::ReviewComment(target) = &message.reply_target {
-            let loc = ForgeLocation::parse(&message.location)?;
             // Without a line the review endpoint cannot anchor the comment, so
             // fall back to a normal conversation reply.
             if target.line != 0 && matches!(loc.forge, ForgeKind::Forgejo | ForgeKind::Gitea) {
                 return self.post_forgejo_review(&loc, target, body).await;
             }
         }
-        self.post_comment(&message.location, body).await
+        self.post_at(&loc, body).await
     }
 
     async fn reply_tracked(&self, message: &ForgeMessage, body: &str) -> Result<Option<String>> {
-        let loc = ForgeLocation::parse(&message.location)?;
+        let loc = ForgeLocation::parse_for(&message.location, message.forge)?;
         if let ReplyTarget::ReviewComment(target) = &message.reply_target
             && target.line != 0
             && matches!(loc.forge, ForgeKind::Forgejo | ForgeKind::Gitea)
@@ -458,7 +486,7 @@ impl ForgeApi for HttpForgeApi {
         comment_id: &str,
         body: &str,
     ) -> Result<()> {
-        let loc = ForgeLocation::parse(&message.location)?;
+        let loc = ForgeLocation::parse_for(&message.location, message.forge)?;
         match loc.forge {
             ForgeKind::Forgejo | ForgeKind::Gitea => {
                 self.update_forgejo(&loc, comment_id, body).await
@@ -572,6 +600,7 @@ mod tests {
             author: "shylock".into(),
             repository: "a/b".into(),
             comment_id: Some(9039),
+            review_id: None,
             number: Some(22),
             is_pull_request: true,
             linked_issue: None,
@@ -868,16 +897,25 @@ mod tests {
             None,
             None,
             Some(crate::config::GitlabConfig {
-                base_url: base,
+                base_url: format!("{base}/gitlab"),
                 ..Default::default()
             }),
         );
         let api = HttpForgeApi::new(config).unwrap();
-        let location = Url::parse("https://gitlab.com/a/b/merge_requests/7").unwrap();
-        api.post_comment(&location, "hello").await.unwrap();
+        let mut message = review_message();
+        message.forge = ForgeKind::GitLab;
+        message.repository = "a/b/c/d".into();
+        message.number = Some(7);
+        message.location =
+            Url::parse("https://code.example/gitlab/a/b/c/d/-/merge_requests/7#note_5").unwrap();
+        message.reply_target = ReplyTarget::Conversation;
+        api.reply(&message, "hello").await.unwrap();
 
         let request = server.await.unwrap();
-        assert!(request.starts_with("POST /api/v4/projects/a%2Fb/merge_requests/7/notes "));
+        assert!(
+            request
+                .starts_with("POST /gitlab/api/v4/projects/a%2Fb%2Fc%2Fd/merge_requests/7/notes ")
+        );
     }
 
     #[tokio::test]
@@ -960,6 +998,7 @@ mod tests {
             author: "shylock".into(),
             repository: "a/b".into(),
             comment_id: Some(9039),
+            review_id: None,
             number: Some(22),
             is_pull_request: false,
             linked_issue: None,

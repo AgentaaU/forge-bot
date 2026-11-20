@@ -372,6 +372,19 @@ Quick repository hook: **Settings → Webhooks → Add webhook → Forgejo**, ta
 The endpoint also accepts GitHub (`/webhooks/github`) and GitLab
 (`/webhooks/gitlab`) webhooks, selected by URL path.
 
+When polling and webhooks run together, the dispatcher remembers the last
+1,024 accepted mention deliveries in memory. It acknowledges a mention only
+after saving the job. A queue storage error leaves the webhook retryable and
+the poller retries from its previous position. This is not a permanent
+exactly-once guarantee: completed deliveries can be replayed after a restart
+or after they leave the cache.
+
+On upgrade, saved thread histories are renamed using their stored keys;
+histories already overwritten by an older version cannot be reconstructed.
+GitLab issues and merge requests start with distinct backend sessions and
+checkouts because their numbers can overlap. Old ambiguous checkouts are
+left untouched. A linked merge request still shares its issue's conversation.
+
 ## Index page
 
 `GET /` opens an index page in browsers (requests with `Accept: text/html`)

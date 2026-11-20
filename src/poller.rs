@@ -289,7 +289,7 @@ impl Poller {
                     .and_then(crate::forge::linked_issue_ref);
                 message.title = pull["title"].as_str().map(str::to_owned);
             }
-            self.dispatch_message(message).await;
+            self.dispatch_message(message).await?;
             // A later PR lookup can fail; do not replay earlier accepted work.
             self.set_cursor(repo, cursor.clone());
         }
@@ -298,7 +298,7 @@ impl Poller {
         Ok(())
     }
 
-    async fn dispatch_message(&self, message: ForgeMessage) {
+    async fn dispatch_message(&self, message: ForgeMessage) -> Result<()> {
         let repo = message.repository.clone();
         // Record human mentions before the routing ignore rules: a polled
         // agent comment that mentions a human must reach `/notifications`
@@ -306,28 +306,30 @@ impl Poller {
         // recorder dedupes a comment also seen by the webhook ingester.
         self.dispatcher.record_human_notifications(&message);
         if self.dispatcher.policy().is_ignored(&message.author) {
-            return;
+            return Ok(());
         }
         let (mention, agent_name) = match self.dispatcher.route(&message) {
             Ok(Some(routed)) => routed,
-            Ok(None) => return,
+            Ok(None) => return Ok(()),
             Err(BotError::Unauthorized(reason)) => {
                 tracing::info!(%reason, repo, "ignored unroutable polled trigger");
-                return;
+                return Ok(());
             }
-            Err(error) => {
-                tracing::warn!(%error, repo, "failed to route polled trigger");
-                return;
-            }
+            Err(error) => return Err(error),
         };
 
         match self.dispatcher.submit(message, mention, &agent_name).await {
-            Ok(job_id) => tracing::info!(%job_id, repo, "accepted polled trigger"),
+            Ok(Some(job_id)) => tracing::info!(%job_id, repo, "accepted polled trigger"),
+            Ok(None) => tracing::debug!(repo, "ignored duplicate polled trigger"),
             Err(BotError::Unauthorized(reason)) => {
                 tracing::info!(%reason, repo, "ignored unauthorized trigger");
             }
-            Err(error) => tracing::warn!(%error, repo, "failed to enqueue polled trigger"),
+            Err(BotError::UnknownAgent(agent)) => {
+                tracing::warn!(%agent, repo, "unknown polled agent")
+            }
+            Err(error) => return Err(error),
         }
+        Ok(())
     }
 
     /// Review bodies are deliberately absent from Forgejo's issue-comments API.
@@ -378,13 +380,9 @@ impl Poller {
                 // Thread replies are absent from the issue-comment API and may
                 // arrive without changing the parent review timestamp. Always
                 // inspect submitted reviews, even when their body was seen.
-                let comments_url = format!("{url}/{id}/comments");
-                let comments = self
-                    .fetch_pages(&comments_url, token, &[])
-                    .await?
-                    .ok_or_else(|| {
-                        BotError::ForgeApi("review comments query is inaccessible".into())
-                    })?;
+                let comments =
+                    crate::forge::forgejo::fetch_review_comments(&self.client, &url, id, token)
+                        .await?;
                 for comment in comments {
                     let (Some(comment_id), Some(created)) =
                         (comment["id"].as_i64(), comment["created_at"].as_str())
@@ -401,7 +399,7 @@ impl Poller {
                     if let Some(message) =
                         message_from_review_comment(repo, &pull, &review, &comment)
                     {
-                        self.dispatch_message(message).await;
+                        self.dispatch_message(message).await?;
                     }
                     cursor.seen_review_comments.insert(comment_id, visible_at);
                     self.set_cursor(&key, cursor.clone());
@@ -417,7 +415,7 @@ impl Poller {
                     continue;
                 }
                 if let Some(message) = message_from_review(repo, &pull, &review) {
-                    self.dispatch_message(message).await;
+                    self.dispatch_message(message).await?;
                 }
                 cursor.seen_reviews.insert(id, updated);
                 self.set_cursor(&key, cursor.clone());
@@ -485,11 +483,16 @@ impl Poller {
 
     /// The `since` query value for a repository.
     fn since_for(&self, repo: &str) -> String {
-        if let Some(time) = self.cursor(repo).last_time {
-            return time;
-        }
-        let lookback = chrono::Duration::seconds(self.config.poller.lookback_secs as i64);
-        (Utc::now() - lookback).to_rfc3339_opts(SecondsFormat::Secs, true)
+        let mut cursors = self.cursors.lock().expect("poller mutex poisoned");
+        cursors
+            .entry(repo.to_owned())
+            .or_default()
+            .last_time
+            .get_or_insert_with(|| {
+                let lookback = chrono::Duration::seconds(self.config.poller.lookback_secs as i64);
+                (Utc::now() - lookback).to_rfc3339_opts(SecondsFormat::Secs, true)
+            })
+            .clone()
     }
 
     fn persist(&self) {
@@ -576,6 +579,7 @@ fn message_from_comment(repo: &str, comment: &Value) -> Option<ForgeMessage> {
         author,
         repository: repo.to_owned(),
         comment_id,
+        review_id: None,
         number,
         is_pull_request,
         linked_issue: None,
@@ -597,6 +601,7 @@ fn message_from_review_comment(
     message.author = comment["user"]["login"].as_str()?.to_owned();
     message.location = Url::parse(comment["html_url"].as_str()?).ok()?;
     message.comment_id = Some(comment["id"].as_i64()?);
+    message.review_id = None;
     message.event = "issue_comment".into();
     message.reply_target =
         crate::forge::forgejo::review_reply_target_with_id(comment, review["id"].as_i64())?;
@@ -605,12 +610,7 @@ fn message_from_review_comment(
 
 /// Reviews have their own IDs; do not use them as issue-comment IDs.
 fn message_from_review(repo: &str, pull: &Value, review: &Value) -> Option<ForgeMessage> {
-    let event = match review["state"].as_str()? {
-        "APPROVED" => "pull_request_approved",
-        "REQUEST_CHANGES" => "pull_request_rejected",
-        "COMMENT" => "pull_request_comment",
-        _ => return None,
-    };
+    let event = crate::forge::forgejo::review_event(&review["state"])?;
     Some(ForgeMessage {
         forge: ForgeKind::Forgejo,
         location: Url::parse(review["html_url"].as_str()?).ok()?,
@@ -618,6 +618,7 @@ fn message_from_review(repo: &str, pull: &Value, review: &Value) -> Option<Forge
         author: review["user"]["login"].as_str()?.to_owned(),
         repository: repo.to_owned(),
         comment_id: None,
+        review_id: Some(review["id"].as_i64()?),
         number: pull["number"].as_u64(),
         is_pull_request: true,
         linked_issue: pull["body"]
@@ -802,7 +803,9 @@ mod tests {
                 .and_then(|query| query.split('&').find_map(|pair| pair.strip_prefix("page=")))
                 .unwrap_or("1")
         );
-        if let Some(reply) = state.pages.lock().unwrap().get(&page_key).cloned() {
+        let inline_comments = path.contains("/reviews/") && path.ends_with("/comments");
+        let key = if inline_comments { &path } else { &page_key };
+        if let Some(reply) = state.pages.lock().unwrap().get(key).cloned() {
             return match reply {
                 MockReply::Json(value) => axum::response::Json(value).into_response(),
                 MockReply::Status(code) => axum::http::StatusCode::from_u16(code)
@@ -810,10 +813,7 @@ mod tests {
                     .into_response(),
             };
         }
-        if path.ends_with("/issues")
-            || path.ends_with("/reviews")
-            || path.ends_with("/comments") && path.contains("/reviews/")
-        {
+        if path.ends_with("/issues") || path.ends_with("/reviews") || inline_comments {
             return axum::response::Json(json!([])).into_response();
         }
 
@@ -970,7 +970,7 @@ mod tests {
                 "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
                 MockReply::Json(json!([parent])),
             ),
-            (format!("{review_url}?page=1"), MockReply::Json(json!([]))),
+            (review_url.into(), MockReply::Json(json!([]))),
         ]);
         let base = start_mock(state.clone()).await;
         let mut config = test_config(dir.path(), &base);
@@ -1001,10 +1001,11 @@ mod tests {
             matches!(message.reply_target, crate::forge::ReplyTarget::ReviewComment(target)
             if target.review_id == 1111 && target.path == "src/lib.rs" && target.line == 44)
         );
-        state.pages.lock().unwrap().insert(
-            format!("{review_url}?page=1"),
-            MockReply::Json(json!([inline])),
-        );
+        state
+            .pages
+            .lock()
+            .unwrap()
+            .insert(review_url.into(), MockReply::Json(json!([inline])));
         poller.tick().await.unwrap();
         for _ in 0..200 {
             if sessions
@@ -1025,13 +1026,15 @@ mod tests {
                 .unwrap()
                 .contains("review the current head")
         );
-        assert!(
+        assert_eq!(
             state
                 .requests
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|r| r.contains("/reviews/1111/comments?limit=1&page=2"))
+                .filter(|request| request.contains(review_url))
+                .count(),
+            2
         );
         let restarted = Poller::new(Arc::new(config), poller.dispatcher.clone()).unwrap();
         restarted.tick().await.unwrap();
@@ -1065,7 +1068,7 @@ mod tests {
                 "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
                 MockReply::Json(json!([parent.clone()])),
             ),
-            (format!("{review_url}?page=1"), MockReply::Json(json!([]))),
+            (review_url.into(), MockReply::Json(json!([]))),
         ]);
         let base = start_mock(state.clone()).await;
         let mut config = test_config(dir.path(), &base);
@@ -1079,10 +1082,11 @@ mod tests {
             "html_url":"http://forge.local/o/r/pulls/159#issuecomment-20724",
             "path":"src/lib.rs", "position":44, "pull_request_review_id":1111
         });
-        state.pages.lock().unwrap().insert(
-            format!("{review_url}?page=1"),
-            MockReply::Json(json!([inline])),
-        );
+        state
+            .pages
+            .lock()
+            .unwrap()
+            .insert(review_url.into(), MockReply::Json(json!([inline])));
         poller.tick().await.unwrap();
         assert!(sessions.get("user:default:forgejo:o/r:pr:159").is_none());
         assert!(poller.cursor("o/r:reviews").last_time.is_some());
@@ -1119,13 +1123,15 @@ mod tests {
                 .unwrap()
                 .contains("review the current head")
         );
-        assert!(
+        assert_eq!(
             state
                 .requests
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|r| r.contains("/reviews/1111/comments?limit=1&page=2"))
+                .filter(|request| request.contains(review_url))
+                .count(),
+            1
         );
         poller.tick().await.unwrap();
         let restarted = Poller::new(Arc::new(config), poller.dispatcher.clone()).unwrap();
@@ -1160,7 +1166,7 @@ mod tests {
                 "/api/v1/repos/o/r/pulls/159/reviews?page=1".into(),
                 MockReply::Json(json!([parent.clone()])),
             ),
-            (format!("{review_url}?page=1"), MockReply::Json(json!([]))),
+            (review_url.into(), MockReply::Json(json!([]))),
         ]);
         let base = start_mock(state.clone()).await;
         let mut config = test_config(dir.path(), &base);
@@ -1174,10 +1180,11 @@ mod tests {
             "html_url":"http://forge.local/o/r/pulls/159#issuecomment-20724",
             "path":"src/lib.rs", "position":44, "pull_request_review_id":1111
         });
-        state.pages.lock().unwrap().insert(
-            format!("{review_url}?page=1"),
-            MockReply::Json(json!([inline])),
-        );
+        state
+            .pages
+            .lock()
+            .unwrap()
+            .insert(review_url.into(), MockReply::Json(json!([inline])));
         poller.tick().await.unwrap();
         for _ in 0..200 {
             if sessions
@@ -1198,13 +1205,15 @@ mod tests {
                 .unwrap()
                 .contains("review the current head")
         );
-        assert!(
+        assert_eq!(
             state
                 .requests
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|r| r.contains("/reviews/1111/comments?limit=1&page=2"))
+                .filter(|request| request.contains(review_url))
+                .count(),
+            1
         );
         // The comment is older than the overlap. Its ID must survive
         // pruning and restart before a dismissal changes the parent timestamp.
@@ -1426,13 +1435,14 @@ mod tests {
         ]);
         let base = start_mock(state).await;
         let (poller, _) = build_poller(test_config(dir.path(), &base));
+        let initial = poller.since_for("o/r:reviews");
         assert!(
             poller
                 .poll_reviews(&base, Some("tok"), "o/r")
                 .await
                 .is_err()
         );
-        assert!(poller.cursor("o/r:reviews").last_time.is_none());
+        assert_eq!(poller.since_for("o/r:reviews"), initial);
     }
 
     #[tokio::test]
@@ -1450,19 +1460,20 @@ mod tests {
                 MockReply::Json(json!([review(1111, "COMMENT", &now)])),
             ),
             (
-                "/api/v1/repos/o/r/pulls/159/reviews/1111/comments?page=1".into(),
+                "/api/v1/repos/o/r/pulls/159/reviews/1111/comments".into(),
                 MockReply::Status(500),
             ),
         ]);
         let base = start_mock(state).await;
         let (poller, _) = build_poller(test_config(dir.path(), &base));
+        let initial = poller.since_for("o/r:reviews");
         assert!(
             poller
                 .poll_reviews(&base, Some("tok"), "o/r")
                 .await
                 .is_err()
         );
-        assert!(poller.cursor("o/r:reviews").last_time.is_none());
+        assert_eq!(poller.since_for("o/r:reviews"), initial);
     }
 
     #[tokio::test]
@@ -1648,6 +1659,7 @@ mod tests {
             assert_eq!(message.author, "shylock-reviewer");
             assert_eq!(message.number, Some(159));
             assert_eq!(message.comment_id, None);
+            assert_eq!(message.review_id, Some(398));
             assert_eq!(message.event, event);
             assert_eq!(message.title.as_deref(), Some("test"));
             assert_eq!(message.linked_issue.unwrap().number, 156);
@@ -1688,6 +1700,32 @@ mod tests {
             cursors["o/r"].last_time.as_deref(),
             Some("2026-09-24T12:49:34Z")
         );
+    }
+
+    #[tokio::test]
+    async fn retry_comment_after_queue_storage_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(MockState::default());
+        state.comments.lock().unwrap().insert(
+            "o/r".into(),
+            MockReply::Json(json!([comment(42, "@shylock-bot go", "alice")])),
+        );
+        let base = start_mock(state).await;
+        let (poller, sessions) = build_poller(test_config(dir.path(), &base));
+        let jobs = dir.path().join("jobs");
+        std::fs::remove_dir(&jobs).unwrap();
+        assert!(poller.poll_repo(&base, None, "o/r").await.is_err());
+        assert_eq!(poller.cursor("o/r").last_id, 0);
+        std::fs::create_dir(jobs).unwrap();
+        poller.poll_repo(&base, None, "o/r").await.unwrap();
+        assert_eq!(poller.cursor("o/r").last_id, 42);
+        for _ in 0..400 {
+            if sessions.pending_jobs().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(sessions.list()[0].runs.len(), 1);
     }
 
     #[tokio::test]

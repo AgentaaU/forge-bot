@@ -61,9 +61,19 @@ pub fn build_adapters(config: &Config) -> HashMap<String, Arc<dyn ForgeAdapter>>
     let mut adapters: HashMap<String, Arc<dyn ForgeAdapter>> = HashMap::new();
 
     if let Some(forgejo) = &config.forges.forgejo {
-        adapters.insert("forgejo".into(), Arc::new(ForgejoAdapter::new(forgejo)));
+        let mut adapter = ForgejoAdapter::new(forgejo);
+        if let Some(token) = config
+            .users
+            .values()
+            .find(|user| user.role == crate::config::UserRole::Default)
+            .and_then(|user| user.token.as_ref())
+        {
+            adapter.token = Some(token.clone());
+        }
+        let adapter: Arc<dyn ForgeAdapter> = Arc::new(adapter);
+        adapters.insert("forgejo".into(), adapter.clone());
         // Gitea shares the Forgejo wire format.
-        adapters.insert("gitea".into(), Arc::new(ForgejoAdapter::new(forgejo)));
+        adapters.insert("gitea".into(), adapter);
     }
     if let Some(github) = &config.forges.github {
         adapters.insert("github".into(), Arc::new(GithubAdapter::new(github)));

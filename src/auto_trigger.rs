@@ -527,6 +527,7 @@ fn auto_message(
         author: AUTO_TRIGGER_AUTHOR.into(),
         repository: repo.to_owned(),
         comment_id: None,
+        review_id: None,
         number: Some(number),
         is_pull_request: true,
         linked_issue: linked_issue_ref(body),

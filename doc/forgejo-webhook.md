@@ -196,10 +196,13 @@ A submitted review is delivered under one of the three
 `pull_request_rejected`. Subscribe to all three so a mention in any review is
 delivered; forge-bot handles each name.
 
-Forgejo's review payload only carries the review body; it does not inline the
-individual review comments. When the bot sees a review it fetches the newest
-review's comments through the API to find mentions in them, so the token needs
-read access to the repository.
+Forgejo's review payload does not inline individual review comments. If it also
+omits the review ID, the bot looks up the submitted review by author, verdict,
+body and PR update time before fetching that review's comments. This requires
+API read access. If the lookup cannot identify the review, the webhook returns
+`502` rather than treating identical text as proof of redelivery. Review IDs
+and comment IDs are tracked separately: submitting
+the same text in two different reviews is not a redelivery.
 
 A mention in an inline review comment is answered **in the same thread**: the
 bot posts the acknowledgement and the agent's summary back as review comments
@@ -321,7 +324,7 @@ curl -X DELETE -H "Authorization: token $TOKEN" \
 
 ## Webhook vs poller
 
-Run **one** delivery path per repository:
+Choose a delivery path based on coverage and latency:
 
 * Webhooks are push-based (near real-time, no polling load) but need a hook
   with the right scope.
@@ -330,8 +333,8 @@ Run **one** delivery path per repository:
 
 Once a webhook covers a repository, set `[poller] enabled = false` in the bot
 config (or restrict `[poller] repositories` to the ones still not covered).
-Running both paths would deliver the same comment twice, because the webhook
-dedupe and the poller cursor are independent.
+This avoids unnecessary API requests. When both paths are enabled in the same
+bot instance, they share a delivery cache for reviews and comments.
 
 ## Agent handoffs from inline review threads
 

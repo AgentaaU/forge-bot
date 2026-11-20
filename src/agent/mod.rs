@@ -179,28 +179,13 @@ pub fn conversation_key(context: &AgentContext) -> String {
     let base = if context.repository.is_empty() {
         context.workspace.to_string_lossy().into_owned()
     } else {
-        // A pull request folds onto the issue it closes. When that issue is in
-        // another repository, use its owner/repo so the two threads share a key.
-        let (repository, number) = if context.is_pull_request {
-            match &context.linked_issue {
-                Some(linked) => (
-                    linked.repository.as_deref().unwrap_or(&context.repository),
-                    Some(linked.number),
-                ),
-                None => (context.repository.as_str(), context.issue_number),
-            }
-        } else {
-            (context.repository.as_str(), context.issue_number)
-        };
-        match context.forge {
-            Some(forge) => format!(
-                "{}:{}:{}",
-                forge.as_str(),
-                repository,
-                number.unwrap_or_default()
-            ),
-            None => format!("{repository}:{}", number.unwrap_or_default()),
-        }
+        crate::forge::backend_conversation_key(
+            context.forge,
+            &context.repository,
+            context.issue_number,
+            context.is_pull_request,
+            context.linked_issue.as_ref(),
+        )
     };
     // Every user gets its own key so two accounts never share a session.
     match &context.user_id {

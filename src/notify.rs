@@ -236,23 +236,30 @@ impl RecentComments {
         }
         false
     }
+
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.set.contains(key)
+    }
 }
 
 /// Stable key used to dedupe notifications for the same delivery. Comments use
 /// their id; description events use the issue number plus a hash of the body,
 /// so an edited description is a new delivery but a re-delivery is not.
 pub(crate) fn delivery_key(message: &ForgeMessage) -> String {
-    match message.comment_id {
-        Some(id) => format!("{}:{}:c{id}", message.forge, message.repository),
-        None => {
+    match (message.comment_id, message.review_id) {
+        (Some(id), _) => format!("{}:{}:c{id}", message.forge, message.repository),
+        (None, Some(id)) => format!("{}:{}:r{id}", message.forge, message.repository),
+        (None, None) => {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(message.body.as_bytes());
             let digest = hex::encode(hasher.finalize());
             format!(
-                "{}:{}:d{}:{digest}",
+                "{}:{}:{}:{}:d{}:{digest}",
                 message.forge,
                 message.repository,
+                message.event,
+                message.author,
                 message.number.unwrap_or_default()
             )
         }

@@ -20,7 +20,6 @@ use crate::auto_trigger::AutoTrigger;
 use crate::config::Config;
 use crate::error::BotError;
 use crate::forge::ForgeAdapter;
-use crate::notify::{RecentComments, delivery_key};
 use crate::session::statistics;
 use crate::session::status;
 use crate::session::{Dispatcher, ThreadState, UserAgentSettings};
@@ -37,7 +36,6 @@ pub struct AppState {
     pub adapters: Arc<std::collections::HashMap<String, Arc<dyn ForgeAdapter>>>,
     pub agents: Arc<AgentRegistry>,
     pub dispatcher: Arc<Dispatcher>,
-    dedupe: Arc<Mutex<RecentComments>>,
     /// Latest client diagnostic report uploaded from `/notifications`. The
     /// Android notification path depends on OS/browser state the server cannot
     /// see, so the page uploads its self-test here for the operator to read.
@@ -59,18 +57,10 @@ impl AppState {
             adapters: Arc::new(adapters),
             agents,
             dispatcher,
-            dedupe: Arc::new(Mutex::new(RecentComments::new(1024))),
             diagnostics: Arc::new(Mutex::new(None)),
             auto,
             model_catalogs: Arc::new(Mutex::new(ModelCatalogCache::new())),
         }
-    }
-
-    fn seen(&self, key: &str) -> bool {
-        self.dedupe
-            .lock()
-            .expect("dedupe mutex poisoned")
-            .insert(key)
     }
 }
 
@@ -1275,6 +1265,7 @@ async fn receive(
     }
 
     let mut accepted = 0usize;
+    let mut handled_mention = false;
     let extracted = messages.len();
     tracing::info!(messages = extracted, "webhook messages extracted");
     for message in messages {
@@ -1315,17 +1306,13 @@ async fn receive(
             }
         };
 
-        let dedupe_key = delivery_key(&message);
-        if state.seen(&dedupe_key) {
-            tracing::info!(%dedupe_key, reason = "duplicate", "webhook message skipped");
-            continue;
-        }
-
         match state.dispatcher.submit(message, mention, &agent_name).await {
-            Ok(job_id) => {
+            Ok(Some(job_id)) => {
+                handled_mention = true;
                 accepted += 1;
                 tracing::info!(%job_id, agent = %agent_name, "accepted trigger");
             }
+            Ok(None) => handled_mention = true,
             Err(BotError::Unauthorized(reason)) => {
                 tracing::info!(%reason, "ignored unauthorized trigger");
             }
@@ -1343,7 +1330,7 @@ async fn receive(
     }
 
     // A mentioned PR description already started a job for this delivery.
-    if forge == "forgejo" && accepted == 0 {
+    if forge == "forgejo" && !handled_mention {
         match state
             .auto
             .handle(
@@ -1430,6 +1417,7 @@ async fn push_unsubscribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notify::{RecentComments, delivery_key};
 
     #[test]
     fn model_choices_preserve_defaults_and_escape_and_deduplicate_ids() {
@@ -1513,6 +1501,7 @@ mod tests {
             author: "u".into(),
             repository: "a/b".into(),
             comment_id,
+            review_id: None,
             number: Some(3),
             is_pull_request: false,
             linked_issue: None,

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::agent::{AgentOutcome, LiveOutput, TokenUsage};
@@ -159,6 +160,10 @@ impl SessionStore {
                 .and_then(|raw| serde_json::from_str::<Session>(&raw).map_err(Into::into))
             {
                 Ok(session) => {
+                    let canonical = path.with_file_name(format!("{}.json", file_key(&session.key)));
+                    if path != canonical {
+                        std::fs::rename(&path, canonical)?;
+                    }
                     sessions.insert(session.key.clone(), session);
                 }
                 Err(error) => {
@@ -655,7 +660,9 @@ impl SessionStore {
     /// Persist a pending job.
     pub fn save_job(&self, job: &Job) -> Result<()> {
         let path = self.dir.join("jobs").join(format!("{}.json", job.id));
-        std::fs::write(path, serde_json::to_vec_pretty(job)?)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(job)?)?;
+        std::fs::rename(tmp, path)?;
         Ok(())
     }
 
@@ -694,15 +701,7 @@ impl SessionStore {
 
 /// Turn a session key into something safe for a filename.
 fn file_key(key: &str) -> String {
-    key.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    hex::encode(Sha256::digest(key.as_bytes()))
 }
 
 #[cfg(test)]
@@ -725,6 +724,7 @@ mod tests {
                 author: "u".into(),
                 repository: "a/b".into(),
                 comment_id: Some(1),
+                review_id: None,
                 number: Some(2),
                 is_pull_request: false,
                 linked_issue: None,
@@ -1110,6 +1110,36 @@ mod tests {
                 .is_some()
         );
         assert_eq!(store.list().len(), 1);
+    }
+
+    #[test]
+    fn migrates_legacy_history_without_overwriting_a_colliding_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut original = job();
+        original.message.repository = "org/core.api".into();
+        let mut other = job();
+        other.message.repository = "org/core_api".into();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let session = store.begin(&original).unwrap();
+        let sessions = dir.path().join("sessions");
+        let legacy = sessions.join("forgejo_org_core_api_issue_2.json");
+        std::fs::rename(
+            sessions.join(format!("{}.json", file_key(&session.key))),
+            &legacy,
+        )
+        .unwrap();
+        drop(store);
+        let store = SessionStore::open(dir.path()).unwrap();
+        assert!(!legacy.exists());
+        store.begin(&other).unwrap();
+        drop(store);
+        let store = SessionStore::open(dir.path()).unwrap();
+        for job in [original, other] {
+            assert_eq!(
+                store.get(&job.session_key()).unwrap().runs[0].job_id,
+                job.id
+            );
+        }
     }
 
     #[test]

@@ -160,6 +160,7 @@ mod tests {
             author: author.into(),
             repository: repo.into(),
             comment_id: None,
+            review_id: None,
             number: Some(1),
             is_pull_request: false,
             linked_issue: None,

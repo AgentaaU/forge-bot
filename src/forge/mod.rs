@@ -82,6 +82,8 @@ pub struct ForgeMessage {
     pub repository: String,
     /// Id of the comment, when available.
     pub comment_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<i64>,
     /// Issue / pull request number, when available.
     pub number: Option<u64>,
     /// True when the comment belongs to a pull request.
@@ -138,25 +140,12 @@ impl ForgeMessage {
     /// so a pull request and the issue it closes share an agent/session. The
     /// key never leaves the gateway.
     pub fn conversation_key(&self) -> String {
-        // A pull request folds onto the issue it closes; when that issue lives
-        // in another repository, use *its* owner/repo so both threads share a
-        // key instead of colliding with a same-numbered issue here.
-        let (repository, number) = if self.is_pull_request {
-            match &self.linked_issue {
-                Some(linked) => (
-                    linked.repository.as_deref().unwrap_or(&self.repository),
-                    Some(linked.number),
-                ),
-                None => (self.repository.as_str(), self.number),
-            }
-        } else {
-            (self.repository.as_str(), self.number)
-        };
-        format!(
-            "{}:{}:{}",
-            self.forge,
-            repository,
-            number.unwrap_or_default()
+        backend_conversation_key(
+            Some(self.forge),
+            &self.repository,
+            self.number,
+            self.is_pull_request,
+            self.linked_issue.as_ref(),
         )
     }
 
@@ -174,6 +163,35 @@ impl ForgeMessage {
             .split_once('/')
             .map(|(o, _)| o)
             .unwrap_or_default()
+    }
+}
+
+pub(crate) fn backend_conversation_key(
+    forge: Option<ForgeKind>,
+    repository: &str,
+    number: Option<u64>,
+    is_pull_request: bool,
+    linked_issue: Option<&IssueRef>,
+) -> String {
+    let linked = linked_issue.filter(|_| is_pull_request);
+    let repository = linked
+        .and_then(|issue| issue.repository.as_deref())
+        .unwrap_or(repository);
+    let number = linked
+        .map(|issue| issue.number)
+        .or(number)
+        .unwrap_or_default();
+    match forge {
+        Some(ForgeKind::GitLab) => {
+            let kind = if is_pull_request && linked.is_none() {
+                "mr"
+            } else {
+                "issue"
+            };
+            format!("gitlab:{repository}:{kind}:{number}")
+        }
+        Some(forge) => format!("{forge}:{repository}:{number}"),
+        None => format!("{repository}:{number}"),
     }
 }
 
@@ -340,6 +358,7 @@ pub(crate) fn parse_comment_payload(
         author,
         repository: full_name.to_owned(),
         comment_id,
+        review_id: None,
         number,
         is_pull_request,
         linked_issue,
@@ -432,6 +451,7 @@ pub(crate) fn parse_description_payload(
         author,
         repository: full_name.to_owned(),
         comment_id: None,
+        review_id: None,
         number,
         is_pull_request,
         linked_issue,
@@ -727,6 +747,7 @@ mod tests {
             author: "u".into(),
             repository: "a/b".into(),
             comment_id: None,
+            review_id: None,
             number: Some(12),
             is_pull_request: true,
             linked_issue: Some(IssueRef {

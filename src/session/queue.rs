@@ -60,6 +60,7 @@ struct Inner {
     /// Bounded set of delivery keys already notified, so a comment seen by both
     /// ingesters (or redelivered) notifies a human only once.
     notified: Mutex<RecentComments>,
+    accepted: Mutex<RecentComments>,
     /// Runtime-only adapter choices; restarting restores configuration.
     user_agents: Mutex<HashMap<String, String>>,
     tx: mpsc::Sender<Job>,
@@ -78,38 +79,6 @@ struct Inner {
     /// awaiting follow-up delivery. Updated at each hand-off, so it stays
     /// accurate while the scheduler is blocked on a follow-up.
     waiting_jobs: AtomicUsize,
-}
-
-/// Holds one [`Inner::waiting_jobs`] slot while a job is handed to the
-/// scheduler. Releases it on drop unless the hand-off succeeded, so a cancelled
-/// or failed send cannot leave the count inflated.
-struct WaitingJob<'a> {
-    waiting: &'a AtomicUsize,
-    armed: bool,
-}
-
-impl<'a> WaitingJob<'a> {
-    fn begin(waiting: &'a AtomicUsize) -> Self {
-        waiting.fetch_add(1, Ordering::SeqCst);
-        Self {
-            waiting,
-            armed: true,
-        }
-    }
-
-    /// The job reached the scheduler's input; it now counts until it starts or
-    /// is merged.
-    fn delivered(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for WaitingJob<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.waiting.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
 }
 
 /// A snapshot of worker-pool occupancy for the admin page.
@@ -244,6 +213,7 @@ impl Dispatcher {
             notifier: Notifier::new(),
             push: crate::web_push::PushService::new(&config)?,
             notified: Mutex::new(RecentComments::new(1024)),
+            accepted: Mutex::new(RecentComments::new(1024)),
             user_agents: Mutex::new(HashMap::new()),
             tx,
             running: Mutex::new(HashMap::new()),
@@ -259,6 +229,12 @@ impl Dispatcher {
         if config.session.recover {
             match inner.sessions.pending_jobs() {
                 Ok(jobs) if !jobs.is_empty() => {
+                    {
+                        let mut accepted = inner.accepted.lock().expect("delivery mutex poisoned");
+                        for job in jobs.iter().filter(|job| !is_auto_trigger(&job.message)) {
+                            accepted.insert(&delivery_key(&job.message));
+                        }
+                    }
                     tracing::info!(count = jobs.len(), "recovering pending jobs");
                     // Count the entire backlog immediately, including jobs waiting
                     // for channel capacity in the recovery producer.
@@ -293,13 +269,13 @@ impl Dispatcher {
         Ok(Arc::new(Self { inner }))
     }
 
-    /// Authorize and enqueue a trigger.
+    /// Authorize and enqueue a delivery. A recently accepted duplicate returns `None`.
     pub async fn submit(
         &self,
         message: ForgeMessage,
         mention: Mention,
         agent_name: &str,
-    ) -> Result<Uuid> {
+    ) -> Result<Option<Uuid>> {
         let author = (message.forge == crate::location::ForgeKind::Forgejo)
             .then(|| self.inner.identities.by_login(&message.author))
             .flatten();
@@ -318,7 +294,8 @@ impl Dispatcher {
         self.inner
             .policy
             .authorize_with_agent(&message, author_is_agent)?;
-        self.enqueue(message, mention, agent_name).await
+        let key = delivery_key(&message);
+        self.enqueue(message, mention, agent_name, Some(key)).await
     }
 
     pub(crate) fn auto_authorized(&self, repo: &str, pr_author: &str) -> bool {
@@ -332,11 +309,12 @@ impl Dispatcher {
         mention: Mention,
         agent_name: &str,
         pr_author: &str,
-    ) -> Result<Uuid> {
+    ) -> Result<()> {
         self.inner
             .policy
             .authorize_auto(&message.repository, pr_author)?;
-        self.enqueue(message, mention, agent_name).await
+        self.enqueue(message, mention, agent_name, None).await?;
+        Ok(())
     }
 
     async fn enqueue(
@@ -344,7 +322,8 @@ impl Dispatcher {
         message: ForgeMessage,
         mention: Mention,
         agent_name: &str,
-    ) -> Result<Uuid> {
+        delivery: Option<String>,
+    ) -> Result<Option<Uuid>> {
         let user = self.inner.recipient_for(&message);
         let override_agent = self.repository_agent(&message.repository, &user.id);
         let agent_name = if mention.agent.as_deref().is_none_or(str::is_empty)
@@ -391,12 +370,36 @@ impl Dispatcher {
 
         // Resolve and validate under the selection lock before saving a choice:
         // typos must not replace a working conversation preference.
-        if let Err(error) = self.inner.sessions.select_conversation(&mut job, |name| {
-            self.inner
-                .agents
-                .get(name)
-                .map(|agent| agent.supports_effort())
-        }) {
+        let permit = self
+            .inner
+            .tx
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| BotError::Other(anyhow::anyhow!("job queue is closed")))?;
+        let saved = {
+            let mut accepted = self.inner.accepted.lock().expect("delivery mutex poisoned");
+            if delivery.as_ref().is_some_and(|key| accepted.contains(key)) {
+                return Ok(None);
+            }
+            let saved = self
+                .inner
+                .sessions
+                .select_conversation(&mut job, |name| {
+                    self.inner
+                        .agents
+                        .get(name)
+                        .map(|agent| agent.supports_effort())
+                })
+                .and_then(|()| self.inner.sessions.save_job(&job));
+            if saved.is_ok()
+                && let Some(key) = delivery
+            {
+                accepted.insert(&key);
+            }
+            saved
+        };
+        if let Err(error) = saved {
             if let BotError::UnknownAgent(name) = &error {
                 self.inner
                     .reply(
@@ -413,34 +416,17 @@ impl Dispatcher {
         // the comment, remember its id so each fallback notice can be appended
         // to the same comment (issue #77). Otherwise the worker buffers the
         // notices and posts them together.
-        if self.inner.config.reply.ack {
-            // An automatic trigger acknowledges at reception even when the
-            // conversation is busy: the point is to say why the bot is there.
-            // A human mention that has to wait keeps the plain waiting text.
-            let ack = if waiting && !is_auto_trigger(&job.message) {
-                WAITING_ACK.to_owned()
-            } else {
-                running_headline(&job.message, &job.agent)
-            };
-            job.status_comment = self
-                .inner
-                .reply_tracked(&job.message, &ack, job.user_id.as_deref())
-                .await;
-        }
-
-        self.inner.sessions.save_job(&job)?;
-        // Counted from acceptance, not from the scheduler's receive, so a job
-        // buffered in the channel while the scheduler is blocked still shows.
-        let handoff = WaitingJob::begin(&self.inner.waiting_jobs);
-        self.inner
-            .tx
-            .send(job.clone())
-            .await
-            .map_err(|_| BotError::Other(anyhow::anyhow!("job queue is closed")))?;
-        handoff.delivered();
-
-        tracing::info!(job = %job.id, agent = %job.agent, repo = %job.message.repository, "job queued");
-        Ok(job.id)
+        let id = job.id;
+        let inner = self.inner.clone();
+        inner.waiting_jobs.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            inner.acknowledge(&mut job).await;
+            tracing::info!(job = %id, agent = %job.agent, repo = %job.message.repository, "job queued");
+            permit.send(job);
+        })
+        .await
+        .map_err(|error| BotError::Other(error.into()))?;
+        Ok(Some(id))
     }
 
     /// Access to the policy (used by tests and the HTTP layer).
@@ -1134,6 +1120,25 @@ impl Drop for DoneGuard {
 }
 
 impl Inner {
+    async fn acknowledge(&self, job: &mut Job) {
+        if !self.config.reply.ack {
+            return;
+        }
+        let ack = if job.waiting && !is_auto_trigger(&job.message) {
+            WAITING_ACK.to_owned()
+        } else {
+            running_headline(&job.message, &job.agent)
+        };
+        job.status_comment = self
+            .reply_tracked(&job.message, &ack, job.user_id.as_deref())
+            .await;
+        if job.status_comment.is_some()
+            && let Err(error) = self.sessions.save_job(job)
+        {
+            tracing::warn!(%error, job = %job.id, "could not persist acknowledgement id");
+        }
+    }
+
     /// API client for `user_id`. Callers that must not fall back resolve the
     /// user first; `user_apis` is populated for every configured user.
     fn api_for(&self, user_id: Option<&str>) -> &Arc<dyn ForgeApi> {
@@ -2494,13 +2499,16 @@ mod tests {
     }
 
     fn message(repo: &str) -> ForgeMessage {
+        static COMMENT_ID: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(100_000);
         ForgeMessage {
             forge: ForgeKind::Forgejo,
             location: Url::parse("http://forge.local/o/r/issues/1").unwrap(),
             body: "@agent --agent=custom go".into(),
             author: "alice".into(),
             repository: repo.into(),
-            comment_id: Some(1),
+            comment_id: Some(COMMENT_ID.fetch_add(1, Ordering::Relaxed)),
+            review_id: None,
             number: Some(1),
             is_pull_request: false,
             linked_issue: None,
@@ -3013,7 +3021,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!id.is_nil());
+        assert!(!id.unwrap().is_nil());
 
         // Wait for the worker to finish.
         for _ in 0..100 {
@@ -3717,6 +3725,7 @@ mod tests {
                 author: crate::auto_trigger::AUTO_TRIGGER_AUTHOR.into(),
                 repository: "o/r".into(),
                 comment_id: None,
+                review_id: None,
                 number: Some(1),
                 is_pull_request: true,
                 linked_issue: None,
@@ -4793,6 +4802,7 @@ mod tests {
         );
 
         issue.body = "@shylock-bot Fix it".into();
+        issue.comment_id = Some(55501);
         let (mention, agent) = dispatcher.route(&issue).unwrap().unwrap();
         dispatcher.submit(issue, mention, &agent).await.unwrap();
         wait_for_drain(&sessions).await;
@@ -4807,7 +4817,7 @@ mod tests {
                 "user": {"login": "shylock"}},
             "repository": {"full_name": "shylock/stock-analysis"}
         })).unwrap();
-        let pr = crate::forge::parse_comment_payload(
+        let mut pr = crate::forge::parse_comment_payload(
             ForgeKind::Forgejo,
             "http://forge.local",
             &payload,
@@ -4854,10 +4864,12 @@ mod tests {
 
         // Switching adapters clears the old adapter's model and effort.
         let mut switched = pr.clone();
+        switched.comment_id = Some(55602);
         switched.body = "@shylock-bot --agent=pi-rpc continue".into();
         let (mention, agent) = restarted.route(&switched).unwrap().unwrap();
         restarted.submit(switched, mention, &agent).await.unwrap();
         wait_for_drain(&reopened).await;
+        pr.comment_id = Some(55603);
         let (mention, agent) = restarted.route(&pr).unwrap().unwrap();
         assert_eq!(agent, "pi-rpc");
         restarted.submit(pr, mention, &agent).await.unwrap();
@@ -6224,7 +6236,6 @@ mod tests {
     fn message_at(repo: &str, number: u64) -> ForgeMessage {
         let mut message = message(repo);
         message.number = Some(number);
-        message.comment_id = Some(number as i64);
         message.location =
             Url::parse(&format!("http://forge.local/{repo}/issues/{number}")).unwrap();
         message
@@ -6728,6 +6739,7 @@ echo "end:$token" >> "$AGENT_LOG"
 
         // This mention still sees the unlinked PR, so it queues behind A under
         // the old PR key.
+        pr.comment_id = Some(42);
         dispatcher
             .submit(pr.clone(), mention("TOKEN_B"), "gate")
             .await
@@ -6736,6 +6748,7 @@ echo "end:$token" >> "$AGENT_LOG"
         // The link is added while A runs. This mention already uses the issue
         // key, but must still wait for both A and the queued B.
         let mut linked = pr;
+        linked.comment_id = Some(43);
         linked.linked_issue = Some(crate::forge::IssueRef {
             repository: None,
             number: 3,
@@ -6807,6 +6820,7 @@ echo "end:$token" >> "$AGENT_LOG"
         wait_for_log(&log, "start:TOKEN_X").await;
 
         let mut linked = pr;
+        linked.comment_id = Some(43);
         linked.linked_issue = Some(crate::forge::IssueRef {
             repository: None,
             number: 3,
@@ -6895,6 +6909,7 @@ echo "end:$token" >> "$AGENT_LOG"
         wait_for_counter(&steering.runs, 2).await;
 
         let mut linked = pr;
+        linked.comment_id = Some(43);
         linked.linked_issue = Some(crate::forge::IssueRef {
             repository: None,
             number: 3,

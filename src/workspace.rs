@@ -177,22 +177,29 @@ fn workspace_dir_name(message: &ForgeMessage) -> String {
     let repo = sanitize(message.repo_name());
     // Linked PRs in this repository continue in the issue's checkout. A
     // cross-repository PR still needs its own repository's code and remote.
-    let number = message
-        .linked_issue
-        .as_ref()
-        .filter(|issue| {
-            message.is_pull_request
-                && issue
-                    .repository
-                    .as_deref()
-                    .is_none_or(|repo| repo == message.repository)
-        })
-        .map(|issue| issue.number)
-        .or(message.number);
+    let local_issue = message.linked_issue.as_ref().filter(|issue| {
+        message.is_pull_request
+            && issue
+                .repository
+                .as_deref()
+                .is_none_or(|repo| repo == message.repository)
+    });
+    let number = local_issue.map(|issue| issue.number).or(message.number);
     let suffix = number
         .map(|n| format!("-{n}"))
         .unwrap_or_else(|| "-latest".to_owned());
-    format!("{owner}__{repo}{suffix}")
+    if message.forge == ForgeKind::GitLab {
+        use sha2::{Digest, Sha256};
+        let project = hex::encode(Sha256::digest(message.repository.as_bytes()));
+        let kind = if message.is_pull_request && local_issue.is_none() {
+            "mr"
+        } else {
+            "issue"
+        };
+        format!("gitlab/{project}/{kind}{suffix}")
+    } else {
+        format!("{owner}__{repo}{suffix}")
+    }
 }
 
 /// Clone URL without credentials.
@@ -367,6 +374,7 @@ mod tests {
             author: "u".into(),
             repository: "Org/My-Repo".into(),
             comment_id: None,
+            review_id: None,
             number: Some(3),
             is_pull_request: false,
             linked_issue: None,
@@ -390,6 +398,49 @@ mod tests {
             manager.path_for(&msg(), Some("reviewer")),
             PathBuf::from("/tmp/ws/reviewer/Org__My-Repo-3")
         );
+    }
+
+    #[test]
+    fn gitlab_merge_requests_share_issue_identity_only_when_linked() {
+        use crate::agent::{AgentContext, conversation_key};
+        let mut issue = msg();
+        issue.forge = ForgeKind::GitLab;
+        let mut merge_request = issue.clone();
+        merge_request.is_pull_request = true;
+        let backend = |message: &ForgeMessage| {
+            let key = conversation_key(&AgentContext {
+                forge: Some(message.forge),
+                repository: message.repository.clone(),
+                is_pull_request: message.is_pull_request,
+                issue_number: message.number,
+                linked_issue: message.linked_issue.clone(),
+                ..Default::default()
+            });
+            assert_eq!(key, message.conversation_key());
+            key
+        };
+        assert_ne!(
+            workspace_dir_name(&issue),
+            workspace_dir_name(&merge_request)
+        );
+        assert_ne!(backend(&issue), backend(&merge_request));
+        merge_request.number = Some(7);
+        merge_request.linked_issue = Some(crate::forge::IssueRef {
+            repository: None,
+            number: 3,
+        });
+        assert_eq!(
+            workspace_dir_name(&issue),
+            workspace_dir_name(&merge_request)
+        );
+        assert_eq!(backend(&issue), backend(&merge_request));
+        merge_request.repository = "other/repo".into();
+        merge_request.linked_issue.as_mut().unwrap().repository = Some(issue.repository.clone());
+        assert_ne!(
+            workspace_dir_name(&issue),
+            workspace_dir_name(&merge_request)
+        );
+        assert_eq!(backend(&issue), backend(&merge_request));
     }
 
     #[test]

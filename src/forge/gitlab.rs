@@ -196,6 +196,7 @@ impl ForgeAdapter for GitlabAdapter {
             author,
             repository: full_name.to_owned(),
             comment_id,
+            review_id: None,
             number,
             is_pull_request,
             linked_issue,

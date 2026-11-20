@@ -101,6 +101,13 @@ impl ForgeLocation {
     /// Parse a location URL. Never fails on an unknown forge; instead the forge
     /// is reported as [`ForgeKind::Unknown`] so callers can decide.
     pub fn parse(url: &Url) -> Result<Self> {
+        Self::parse_for(
+            url,
+            ForgeKind::from_host(url.host_str().unwrap_or_default()),
+        )
+    }
+
+    pub(crate) fn parse_for(url: &Url, forge: ForgeKind) -> Result<Self> {
         let segments: Vec<String> = url
             .path_segments()
             .map(|s| s.filter(|p| !p.is_empty()).map(str::to_owned).collect())
@@ -113,23 +120,23 @@ impl ForgeLocation {
             });
         }
 
-        let forge = ForgeKind::from_host(url.host_str().unwrap_or_default());
-        let owner = segments[0].clone();
-        let repo = segments[1].clone();
+        let separator = segments
+            .iter()
+            .position(|segment| segment == "-")
+            .filter(|index| forge == ForgeKind::GitLab && *index >= 2);
+        let project_end = separator.unwrap_or(2);
+        let owner = segments[..project_end - 1].join("/");
+        let repo = &segments[project_end - 1];
 
         // Strip a trailing `.git` for clone URLs.
-        let repo = repo.strip_suffix(".git").unwrap_or(&repo).to_owned();
+        let repo = repo.strip_suffix(".git").unwrap_or(repo).to_owned();
 
         let mut kind = LocationKind::Repository;
         let mut number = None;
 
         // GitLab puts a `-` separator before its resource segments, e.g.
         // `/org/repo/-/issues/1`. Skip it when looking for the resource.
-        let resource = segments
-            .iter()
-            .position(|s| s == "-")
-            .map(|i| i + 1)
-            .unwrap_or(2);
+        let resource = separator.map_or(2, |index| index + 1);
 
         match segments.get(resource).map(String::as_str) {
             Some("issues") => {
@@ -248,10 +255,11 @@ mod tests {
     #[test]
     fn parses_gitlab_merge_request_note() {
         let loc = ForgeLocation::parse(&u(
-            "https://gitlab.example.com/group/proj/-/merge_requests/9#note_42",
+            "https://gitlab.example.com/group/subgroup/proj/-/merge_requests/9#note_42",
         ))
         .unwrap();
         assert_eq!(loc.forge, ForgeKind::GitLab);
+        assert_eq!(loc.repository(), "group/subgroup/proj");
         assert_eq!(loc.kind, LocationKind::PullRequest);
         assert_eq!(loc.number, Some(9));
         assert_eq!(loc.comment_id, Some(42));

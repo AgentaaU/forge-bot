@@ -177,24 +177,7 @@ impl ForgeAdapter for ForgejoAdapter {
             return Ok(());
         }
 
-        // The review body can itself carry a mention.
-        if let Some(content) = review.get("content").and_then(Value::as_str)
-            && !content.trim().is_empty()
-            && let Some(message) = review_message(&payload, None, content)
-        {
-            messages.push(message);
-        } else {
-            tracing::info!(
-                reason = "empty_body_or_missing_coordinates",
-                "review webhook produced no review body"
-            );
-        }
-
-        // Inline comments are absent from the payload; look them up.
-        let Some(token) = self.token.as_deref() else {
-            return Ok(());
-        };
-        let Some(full_name) = payload
+        let Some(repository) = payload
             .pointer("/repository/full_name")
             .and_then(Value::as_str)
         else {
@@ -206,14 +189,65 @@ impl ForgeAdapter for ForgejoAdapter {
         else {
             return Ok(());
         };
-
-        match self
-            .fetch_review_comments(&payload, full_name, number, token)
-            .await
-        {
-            Ok(comments) => messages.extend(comments),
-            Err(error) => {
-                tracing::warn!(%full_name, number, %error, "failed to fetch review comments")
+        let Some(author) = payload.pointer("/sender/login").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let content = review["content"].as_str().unwrap_or_default();
+        let event = self.event(headers);
+        let url = format!(
+            "{}/api/v1/repos/{repository}/pulls/{number}/reviews",
+            self.base_url
+        );
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        let reviews = if let Some(id) = review["id"].as_i64() {
+            vec![(id, None, self.token.is_some())]
+        } else {
+            let rows = self.review_pages(&client, &url).await?;
+            let snapshot = payload
+                .pointer("/pull_request/updated_at")
+                .and_then(review_time);
+            let candidates = matching_reviews(&rows, author, content, &event, snapshot);
+            if candidates.is_empty() {
+                return Err(BotError::ForgeApi(format!(
+                    "cannot identify submitted review for {repository}#{number} from the review API"
+                )));
+            }
+            candidates
+                .into_iter()
+                .map(|(id, row)| {
+                    (
+                        id,
+                        row["html_url"]
+                            .as_str()
+                            .and_then(|url| Url::parse(url).ok()),
+                        row["comments_count"].as_u64() != Some(0),
+                    )
+                })
+                .collect()
+        };
+        for (id, location, has_comments) in reviews {
+            if !content.trim().is_empty()
+                && let Some(mut message) = review_message(&payload, None, content)
+            {
+                message.review_id = Some(id);
+                message.event.clone_from(&event);
+                if let Some(location) = location {
+                    message.location = location;
+                }
+                messages.push(message);
+            }
+            if has_comments {
+                for comment in
+                    fetch_review_comments(&client, &url, id, self.token.as_deref()).await?
+                {
+                    if let Some(body) = comment["body"].as_str()
+                        && let Some(message) = review_message(&payload, Some(&comment), body)
+                    {
+                        messages.push(message);
+                    }
+                }
             }
         }
         Ok(())
@@ -253,25 +287,13 @@ impl ForgejoAdapter {
                 let Some(review_id) = review.get("id").and_then(Value::as_i64) else {
                     continue;
                 };
-                let comments_url = format!("{base}/{review_id}/comments");
-                for comment_page in 1.. {
-                    let comments: Vec<Value> = client
-                        .get(&comments_url)
-                        .query(&[("limit", 100), ("page", comment_page)])
-                        .header("Authorization", &auth)
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .json()
-                        .await?;
-                    if let Some(comment) = comments.iter().find(|comment| {
-                        comment.get("id").and_then(Value::as_i64) == Some(comment_id)
-                    }) {
-                        return Ok(review_reply_target_with_id(comment, Some(review_id)));
-                    }
-                    if comments.len() < 100 {
-                        break;
-                    }
+                let comments =
+                    fetch_review_comments(&client, &base, review_id, Some(token)).await?;
+                if let Some(comment) = comments
+                    .iter()
+                    .find(|comment| comment.get("id").and_then(Value::as_i64) == Some(comment_id))
+                {
+                    return Ok(review_reply_target_with_id(comment, Some(review_id)));
                 }
             }
             if reviews.len() < 100 {
@@ -281,66 +303,91 @@ impl ForgejoAdapter {
         Ok(None)
     }
 
-    /// Fetch the inline comments of the newest review on a pull request. The
-    /// review is selected from the API because Forgejo's webhook payload does
-    /// not identify it.
-    async fn fetch_review_comments(
-        &self,
-        payload: &Value,
-        full_name: &str,
-        number: u64,
-        token: &str,
-    ) -> Result<Vec<ForgeMessage>> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()?;
-        let auth = format!("token {token}");
+    async fn review_pages(&self, client: &reqwest::Client, url: &str) -> Result<Vec<Value>> {
+        let mut items = Vec::new();
+        for page in 1.. {
+            let mut request = client.get(url).query(&[("limit", 50), ("page", page)]);
+            if let Some(token) = &self.token {
+                request = request.header("Authorization", format!("token {token}"));
+            }
+            let response = request.send().await?.error_for_status()?;
+            let next = response
+                .headers()
+                .get("link")
+                .and_then(|link| link.to_str().ok())
+                .is_some_and(|link| link.contains("rel=\"next\""));
+            let batch: Vec<Value> = response.json().await?;
+            let done = batch.is_empty() || (!next && batch.len() < 50);
+            items.extend(batch);
+            if done {
+                break;
+            }
+        }
+        Ok(items)
+    }
+}
 
-        let reviews_url = format!(
-            "{}/api/v1/repos/{full_name}/pulls/{number}/reviews",
-            self.base_url
-        );
-        let reviews: Value = client
-            .get(&reviews_url)
-            .header("Authorization", &auth)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+pub(crate) async fn fetch_review_comments(
+    client: &reqwest::Client,
+    reviews_url: &str,
+    review_id: i64,
+    token: Option<&str>,
+) -> Result<Vec<Value>> {
+    let mut request = client.get(format!("{reviews_url}/{review_id}/comments"));
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("token {token}"));
+    }
+    Ok(request.send().await?.error_for_status()?.json().await?)
+}
 
-        let Some(review_id) = reviews.as_array().and_then(|reviews| {
-            reviews
-                .iter()
-                .filter_map(|review| review.get("id").and_then(Value::as_u64))
-                .max()
-        }) else {
-            return Ok(Vec::new());
-        };
+fn review_time(value: &Value) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value.as_str()?)
+        .ok()
+        .map(|time| time.timestamp())
+}
 
-        let comments_url = format!(
-            "{}/api/v1/repos/{full_name}/pulls/{number}/reviews/{review_id}/comments",
-            self.base_url
-        );
-        let comments: Value = client
-            .get(&comments_url)
-            .header("Authorization", &auth)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+fn matching_reviews<'a>(
+    rows: &'a [Value],
+    author: &str,
+    content: &str,
+    event: &str,
+    snapshot: Option<i64>,
+) -> Vec<(i64, &'a Value)> {
+    let mut candidates: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.pointer("/user/login").and_then(Value::as_str) == Some(author)
+                && row["body"].as_str() == Some(content)
+                && review_event(&row["state"]) == Some(event)
+        })
+        .filter_map(|row| {
+            let id = row["id"].as_i64()?;
+            let time =
+                review_time(&row["updated_at"]).or_else(|| review_time(&row["submitted_at"]));
+            if matches!((snapshot, time), (Some(end), Some(time)) if time > end) {
+                return None;
+            }
+            Some((time, (id, row)))
+        })
+        .collect();
+    if candidates.len() > 1 {
+        let newest = candidates.iter().filter_map(|(time, _)| *time).max();
+        if newest.is_none()
+            || (snapshot.is_none() && candidates.iter().any(|(time, _)| *time != newest))
+        {
+            return Vec::new();
+        }
+        candidates.retain(|(time, _)| *time == newest);
+    }
+    candidates.into_iter().map(|(_, review)| review).collect()
+}
 
-        Ok(comments
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|comment| {
-                let body = comment.get("body").and_then(Value::as_str)?;
-                review_message(payload, Some(comment), body)
-            })
-            .collect())
+pub(crate) fn review_event(state: &Value) -> Option<&'static str> {
+    match state.as_str()? {
+        "APPROVED" => Some("pull_request_approved"),
+        "REQUEST_CHANGES" => Some("pull_request_rejected"),
+        "COMMENT" => Some("pull_request_comment"),
+        _ => None,
     }
 }
 
@@ -390,6 +437,7 @@ fn review_message(payload: &Value, comment: Option<&Value>, body: &str) -> Optio
         author,
         repository: repository.to_owned(),
         comment_id,
+        review_id: None,
         number,
         is_pull_request: true,
         linked_issue,
@@ -775,7 +823,7 @@ mod tests {
                 "body": "This fixes #5.",
                 "html_url": "http://forge.local:3000/a/b/pulls/16"
             },
-            "review": {"type": kind, "content": content},
+            "review": {"id": 103, "type": kind, "content": content},
             "repository": {"full_name": "a/b"},
             "sender": {"login": "shylock"}
         }))
@@ -993,6 +1041,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn matches_both_review_ids_at_the_same_snapshot() {
+        let row = serde_json::json!({"id":1111,"user":{"login":"shylock"},"state":"COMMENT","body":"same","submitted_at":"2026-01-02T10:00:00Z"});
+        let snapshot = review_time(&row["submitted_at"]);
+        let mut second = row.clone();
+        second["id"] = 1112.into();
+        let mut later = row.clone();
+        later["id"] = 1113.into();
+        later["submitted_at"] = "2026-01-02T10:00:01Z".into();
+        let rows = [later, row, second];
+        let ids: Vec<_> =
+            matching_reviews(&rows, "shylock", "same", "pull_request_comment", snapshot)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+        assert_eq!(ids, [1111, 1112]);
+        assert!(
+            matching_reviews(&rows, "shylock", "same", "pull_request_comment", None).is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn fetches_inline_review_comments_from_the_api() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1007,10 +1076,10 @@ mod tests {
                 let mut buffer = [0u8; 4096];
                 let read = socket.read(&mut buffer).await.unwrap();
                 let request = String::from_utf8_lossy(&buffer[..read]);
-                let body = if request.contains("/comments") {
+                let body = if request.contains("/reviews/103/comments") {
                     r#"[{"id":8991,"body":"@agent inline","html_url":"http://forge.local/a/b/pulls/16#issuecomment-8991","user":{"login":"shylock"},"pull_request_review_id":103,"path":"src/main.rs","position":30,"original_position":0}]"#
                 } else if request.contains("/pulls/16/reviews") {
-                    r#"[{"id":100,"comments_count":1},{"id":102,"comments_count":1}]"#
+                    r#"[{"id":103,"user":{"login":"shylock"},"body":"","state":"COMMENT","comments_count":1},{"id":104,"user":{"login":"other"},"body":"","state":"COMMENT","comments_count":1}]"#
                 } else {
                     "[]"
                 };
@@ -1030,7 +1099,9 @@ mod tests {
             bot_username: None,
             ..Default::default()
         });
-        let body = review_payload("");
+        let mut payload: Value = serde_json::from_slice(&review_payload("")).unwrap();
+        payload["review"].as_object_mut().unwrap().remove("id");
+        let body = serde_json::to_vec(&payload).unwrap();
         let mut messages = Vec::new();
         a.enrich(&mut messages, &review_headers(), &body)
             .await
@@ -1063,13 +1134,19 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            let full_collection = serde_json::to_string(
+                &(1..=100)
+                    .map(|id| serde_json::json!({"id":id}))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
             for _ in 0..3 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buffer = [0u8; 4096];
                 let read = socket.read(&mut buffer).await.unwrap();
                 let request = String::from_utf8_lossy(&buffer[..read]);
                 let body = if request.contains("/reviews/121/comments") {
-                    "[]"
+                    full_collection.as_str()
                 } else if request.contains("/reviews/120/comments") {
                     r#"[{"id":9528,"path":"src/agent/command.rs","position":301,"original_position":0}]"#
                 } else {

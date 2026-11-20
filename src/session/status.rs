@@ -648,6 +648,7 @@ mod tests {
                 author: "alice".into(),
                 repository: "owner/repo".into(),
                 comment_id: Some(1),
+                review_id: None,
                 number: Some(number),
                 is_pull_request: is_pr,
                 linked_issue: None,

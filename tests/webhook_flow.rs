@@ -843,7 +843,7 @@ const REVIEW_PAYLOAD: &str = r#"{
         "body": "This closes #5.",
         "html_url": "http://forge.local:3000/shylock/forge-bot/pulls/16"
     },
-    "review": {"type": "pull_request_review_comment", "content": "@shylock-bot --agent=custom review this please"},
+    "review": {"id": 103, "type": "pull_request_review_comment", "content": "@shylock-bot --agent=custom review this please"},
     "repository": {"full_name": "shylock/forge-bot"},
     "sender": {"login": "shylock"}
 }"#;
@@ -860,7 +860,7 @@ const REJECTED_REVIEW_PAYLOAD: &str = r#"{
         "body": "This closes #6.",
         "html_url": "http://forge.local:3000/shylock/forge-bot/pulls/17"
     },
-    "review": {"type": "pull_request_review_rejected", "content": "@shylock-bot --agent=custom fix the review finding"},
+    "review": {"id": 104, "type": "pull_request_review_rejected", "content": "@shylock-bot --agent=custom fix the review finding"},
     "repository": {"full_name": "shylock/forge-bot"},
     "sender": {"login": "shylock"}
 }"#;
@@ -898,6 +898,55 @@ async fn handles_pull_request_review_events() {
             .unwrap()
             .contains("review this please")
     );
+}
+
+#[tokio::test]
+async fn full_inline_comment_collection_is_fetched_once_and_dispatched() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let comments: Vec<_> = (1..=50).map(|id| json!({
+        "id":id, "user":{"login":"shylock"}, "path":"README.md", "position":id,
+        "pull_request_review_id":103,
+        "body":if id == 50 { "@shylock-bot --agent=custom check the last line" } else { "no action" }
+    })).collect();
+    let mock = Router::new().route(
+        "/api/v1/repos/shylock/forge-bot/pulls/16/reviews/103/comments",
+        get(move || async move {
+            if count.fetch_add(1, Ordering::SeqCst) != 0 {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok(Json(comments))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with(dir.path(), |config| {
+        let forge = config.forges.forgejo.as_mut().unwrap();
+        forge.base_url = base;
+        forge.token = Some("test-token".into());
+    });
+    assert_eq!(
+        accepted(&harness.app, "pull_request_comment", REVIEW_PAYLOAD).await,
+        2
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    wait_for_jobs(&harness.sessions).await;
+    let session = harness
+        .sessions
+        .get("user:default:forgejo:shylock/forge-bot:issue:5")
+        .unwrap();
+    assert_eq!(session.runs.len(), 2);
+    for expected in ["review this please", "check the last line"] {
+        assert!(
+            session.runs.iter().any(|run| run.success == Some(true)
+                && run.summary.as_deref().unwrap().contains(expected))
+        );
+    }
+    server.abort();
 }
 
 #[tokio::test]
@@ -1241,6 +1290,158 @@ async fn duplicate_deliveries_are_ignored() {
         .get("user:default:forgejo:shylock/forge-bot:issue:1")
         .expect("session should exist");
     assert_eq!(session.runs.len(), 1, "the duplicate must be dropped");
+}
+
+#[tokio::test]
+async fn webhook_and_poller_accept_one_job_for_the_same_comment() {
+    for poll_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut comment = serde_json::from_str::<Value>(PAYLOAD).unwrap()["comment"].clone();
+        comment["issue_url"] = json!("http://forge.local/shylock/forge-bot/issues/1");
+        comment["created_at"] = json!(chrono::Utc::now().to_rfc3339());
+        let mock = Router::new().route(
+            "/api/v1/repos/shylock/forge-bot/issues/comments",
+            get(move || async move { Json(json!([comment])) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let mut poll_config = None;
+        let harness = harness_with(dir.path(), |config| {
+            config.forges.forgejo.as_mut().unwrap().base_url = base;
+            config.poller.repositories = vec!["shylock/forge-bot".into()];
+            poll_config = Some(Arc::new(config.clone()));
+        });
+        let poller =
+            forge_bot::poller::Poller::new(poll_config.unwrap(), harness.dispatcher.clone())
+                .unwrap();
+        if poll_first {
+            poller.tick().await.unwrap();
+            assert_eq!(accepted(&harness.app, "issue_comment", PAYLOAD).await, 0);
+        } else {
+            assert_eq!(accepted(&harness.app, "issue_comment", PAYLOAD).await, 1);
+            poller.tick().await.unwrap();
+        }
+        wait_for_jobs(&harness.sessions).await;
+        assert_eq!(harness.sessions.list()[0].runs.len(), 1);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn identical_reviews_run_once_per_review_across_ingesters() {
+    for poll_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut payload: Value = serde_json::from_str(REVIEW_PAYLOAD).unwrap();
+        payload["review"].as_object_mut().unwrap().remove("id");
+        let pull = payload["pull_request"].clone();
+        let mut reviews = Vec::new();
+        let mut hooks = Vec::new();
+        let now = chrono::Utc::now();
+        for (id, age) in [(1111, 3), (1112, 2)] {
+            let submitted = (now - chrono::Duration::seconds(age)).to_rfc3339();
+            reviews.push(json!({"id":id, "state":"COMMENT", "body":payload["review"]["content"],
+                "user":payload["sender"], "submitted_at":submitted, "comments_count":0,
+                "html_url":format!("{}#issuecomment-{}", pull["html_url"].as_str().unwrap(), id + 9000)}));
+            payload["pull_request"]["updated_at"] = json!(submitted);
+            hooks.push(payload.to_string());
+        }
+        let empty = || async { Json(json!([])) };
+        let mock = Router::new()
+            .route(
+                "/api/v1/repos/shylock/forge-bot/issues/comments",
+                get(empty),
+            )
+            .route(
+                "/api/v1/repos/shylock/forge-bot/issues",
+                get(move || async move { Json(json!([pull])) }),
+            )
+            .route(
+                "/api/v1/repos/shylock/forge-bot/pulls/16/reviews",
+                get(move |headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers["authorization"], "token private-review-reader");
+                    Json(reviews)
+                }),
+            )
+            .route(
+                "/api/v1/repos/shylock/forge-bot/pulls/16/reviews/{id}/comments",
+                get(empty),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let mut poll_config = None;
+        let harness = harness_with(dir.path(), |config| {
+            config.forges.forgejo.as_mut().unwrap().base_url = base;
+            config.users.get_mut("default").unwrap().token = Some("private-review-reader".into());
+            config.poller.repositories = vec!["shylock/forge-bot".into()];
+            poll_config = Some(Arc::new(config.clone()));
+        });
+        let poller =
+            forge_bot::poller::Poller::new(poll_config.unwrap(), harness.dispatcher.clone())
+                .unwrap();
+        if poll_first {
+            poller.tick().await.unwrap();
+        }
+        for hook in hooks.iter().rev() {
+            assert_eq!(
+                accepted(&harness.app, "pull_request_comment", hook).await,
+                usize::from(!poll_first)
+            );
+        }
+        poller.tick().await.unwrap();
+        for (id, hook) in [1111, 1112].into_iter().zip(&hooks) {
+            assert_eq!(
+                accepted(&harness.app, "pull_request_comment", hook).await,
+                0
+            );
+            let mut identified: Value = serde_json::from_str(hook).unwrap();
+            identified["review"]["id"] = json!(id);
+            assert_eq!(
+                accepted(
+                    &harness.app,
+                    "pull_request_comment",
+                    &identified.to_string()
+                )
+                .await,
+                0
+            );
+        }
+        poller.tick().await.unwrap();
+        wait_for_jobs(&harness.sessions).await;
+        assert_eq!(harness.sessions.list()[0].runs.len(), 2);
+        let mut comment: Value = serde_json::from_str(PAYLOAD).unwrap();
+        comment["comment"]["id"] = json!(1111);
+        assert_eq!(
+            accepted(&harness.app, "issue_comment", &comment.to_string()).await,
+            1
+        );
+        wait_for_jobs(&harness.sessions).await;
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn failed_webhook_persistence_allows_concurrent_redelivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path());
+    let jobs = dir.path().join("jobs");
+    std::fs::remove_dir(&jobs).unwrap();
+    let first = harness
+        .app
+        .clone()
+        .oneshot(signed_request("issue_comment", PAYLOAD))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    std::fs::create_dir(jobs).unwrap();
+    let (first, second) = tokio::join!(
+        accepted(&harness.app, "issue_comment", PAYLOAD),
+        accepted(&harness.app, "issue_comment", PAYLOAD)
+    );
+    assert_eq!(first + second, 1);
+    wait_for_jobs(&harness.sessions).await;
+    assert_eq!(harness.sessions.list()[0].runs.len(), 1);
 }
 
 #[tokio::test]
@@ -2731,6 +2932,7 @@ async fn admin_reported_models_follow_the_reporting_adapter_not_the_queued_adapt
             author: "shylock".into(),
             repository: "shylock/forge-bot".into(),
             comment_id: Some(1),
+            review_id: None,
             number: Some(1),
             is_pull_request: false,
             linked_issue: None,
