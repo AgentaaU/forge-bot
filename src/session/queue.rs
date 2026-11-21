@@ -264,13 +264,14 @@ impl Dispatcher {
         // forever and eventually run out of memory (issue #119). Drop the
         // idle threads past the retention window now, then keep doing so in
         // the background.
-        if inner.config.session.retention_secs > 0
-            && let Err(error) = evict_stale_sessions(&inner)
-        {
-            tracing::warn!(%error, "failed to evict stale thread status at startup");
+        if inner.config.session.retention_secs > 0 {
+            if let Err(error) = evict_stale_sessions(&inner) {
+                tracing::warn!(%error, "failed to evict stale thread status at startup");
+            }
+            tokio::spawn(session_eviction_loop(inner.clone()));
         }
-        if inner.config.session.retention_secs > 0 || inner.config.workspace.retention_secs > 0 {
-            tokio::spawn(eviction_loop(inner.clone()));
+        if inner.config.workspace.retention_secs > 0 {
+            tokio::spawn(workspace_eviction_loop(inner.clone()));
         }
 
         Ok(Arc::new(Self { inner }))
@@ -1022,8 +1023,8 @@ async fn scheduler_loop(
     }
 }
 
-/// How often the dispatcher looks for stale thread status and checkouts.
-const EVICTION_INTERVAL: Duration = Duration::from_secs(300);
+const SESSION_EVICTION_INTERVAL: Duration = Duration::from_secs(300);
+const WORKSPACE_EVICTION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Evict every idle thread older than the configured retention window.
 fn evict_stale_sessions(inner: &Arc<Inner>) -> Result<usize> {
@@ -1055,17 +1056,21 @@ fn evict_stale_workspaces(inner: &Inner) -> Result<()> {
     Ok(())
 }
 
-async fn eviction_loop(inner: Arc<Inner>) {
+async fn workspace_eviction_loop(inner: Arc<Inner>) {
     loop {
-        if inner.config.workspace.retention_secs > 0 {
-            let cleanup = inner.clone();
-            match tokio::task::spawn_blocking(move || evict_stale_workspaces(&cleanup)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "failed to evict stale workspaces"),
-                Err(error) => tracing::warn!(%error, "workspace cleanup task failed"),
-            }
+        let cleanup = inner.clone();
+        match tokio::task::spawn_blocking(move || evict_stale_workspaces(&cleanup)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "failed to evict stale workspaces"),
+            Err(error) => tracing::warn!(%error, "workspace cleanup task failed"),
         }
-        tokio::time::sleep(EVICTION_INTERVAL).await;
+        tokio::time::sleep(WORKSPACE_EVICTION_INTERVAL).await;
+    }
+}
+
+async fn session_eviction_loop(inner: Arc<Inner>) {
+    loop {
+        tokio::time::sleep(SESSION_EVICTION_INTERVAL).await;
         match evict_stale_sessions(&inner) {
             Ok(0) => {}
             Ok(count) => tracing::info!(count, "evicted stale thread status"),

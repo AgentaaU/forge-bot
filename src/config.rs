@@ -565,7 +565,7 @@ impl Default for WorkspaceConfig {
             enabled: true,
             root: PathBuf::from("/tmp/forge-bot-workspaces"),
             reuse: true,
-            retention_secs: 30 * 24 * 60 * 60,
+            retention_secs: 7 * 24 * 60 * 60,
             git_author_name: "forge-bot".to_owned(),
             git_author_email: "forge-bot@localhost".to_owned(),
         }
@@ -1161,11 +1161,8 @@ role = "default"
     }
 
     #[test]
-    fn workspace_retention_defaults_to_thirty_days_and_can_be_disabled() {
-        assert_eq!(
-            Config::default().workspace.retention_secs,
-            30 * 24 * 60 * 60
-        );
+    fn workspace_retention_defaults_to_seven_days_and_can_be_disabled() {
+        assert_eq!(Config::default().workspace.retention_secs, 7 * 24 * 60 * 60);
         let config: Config = toml::from_str("[workspace]\nretention_secs = 0\n").unwrap();
         assert_eq!(config.workspace.retention_secs, 0);
     }

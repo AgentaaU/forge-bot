@@ -118,8 +118,8 @@ enabled = true
 # `host_user`'s home, which that account already owns.
 root = "~/.local/state/forge-bot/workspaces"
 reuse = true
-# Delete idle Git checkouts under root after 30 days. Set to 0 to keep them.
-retention_secs = 2592000
+# Delete idle Git checkouts under root after 7 days. Set to 0 to keep them.
+retention_secs = 604800
 git_author_name = "forge-bot"
 git_author_email = "forge-bot@localhost"
 

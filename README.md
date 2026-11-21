@@ -222,7 +222,7 @@ most important options:
 | `agent_sequence` | Ordered agent names for unqualified mentions and capacity fallback. The first registered name becomes the default; only listed agents are fallback candidates. When omitted, the built-in order starts with `codex`. Explicit `@agent --agent=<name>` still takes priority. |
 | `[forgejo]` | `base_url`, `webhook_secret`, `token`, `bot_username`. |
 | `[policy]` | `allow_all`, `allowed_users`, `allowed_repos`. |
-| `[workspace]` | Whether to clone a checkout, where to keep it, and how long to keep idle checkouts under `root` (`retention_secs`, default 30 days). |
+| `[workspace]` | Whether to clone a checkout, where to keep it, and how long to keep idle checkouts under `root` (`retention_secs`, default seven days). |
 | `[reply]` | `ack` defaults to true; the acknowledgement and any fallback notices share one status comment. `result` defaults to false because agents normally reply themselves; set `result = true` to also post completion summaries. Failures always post a brief notice; provider diagnostics stay in server logs and run history. |
 | `[session]` | Queue/state directory, worker count (the global cap on concurrent agent runs), recovery, and how long an idle thread keeps its status (`retention_secs`, `0` disables eviction). |
 | `[capacity]` | Capacity/quota detection: `fallback`, `cooldown_secs` (default 5 h), extra `markers` (`[quota]` is an alias). |
@@ -234,7 +234,7 @@ Configuration is loaded from `FORGE_BOT_CONFIG` (or `--config`), falling back to
 `forge-bot.toml`, falling back to defaults. Environment variables override file
 values.
 
-At startup and every five minutes, forge-bot removes idle Git checkouts
+At startup and once a day, forge-bot removes idle Git checkouts
 from `[workspace].root` (`~/.local/state/forge-bot/workspaces` in the
 example config). Cleanup includes checkouts left by older deployments and
 keeps checkouts needed by queued or running jobs, checkouts with registered
