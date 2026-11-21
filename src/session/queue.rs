@@ -8,6 +8,7 @@
 //! bounds how many agent processes (pooled or one-shot) may be in flight.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,6 +46,9 @@ struct Inner {
     sessions: Arc<SessionStore>,
     api: Arc<dyn ForgeApi>,
     workspaces: WorkspaceManager,
+    /// Serialize persisting new jobs with workspace cleanup's pending-job
+    /// snapshot and checkout moves. The trash is purged outside this lock.
+    workspace_cleanup: tokio::sync::Mutex<()>,
     policy: Policy,
     /// Resolved user identities. At least one `[users.*]` table is required.
     identities: Arc<Identities>,
@@ -202,6 +206,7 @@ impl Dispatcher {
 
         let inner = Arc::new(Inner {
             workspaces: WorkspaceManager::new(&config.workspace, executor.clone()),
+            workspace_cleanup: tokio::sync::Mutex::new(()),
             config: config.clone(),
             agents,
             sessions,
@@ -259,10 +264,12 @@ impl Dispatcher {
         // forever and eventually run out of memory (issue #119). Drop the
         // idle threads past the retention window now, then keep doing so in
         // the background.
-        if inner.config.session.retention_secs > 0 {
-            if let Err(error) = evict_stale_sessions(&inner) {
-                tracing::warn!(%error, "failed to evict stale thread status at startup");
-            }
+        if inner.config.session.retention_secs > 0
+            && let Err(error) = evict_stale_sessions(&inner)
+        {
+            tracing::warn!(%error, "failed to evict stale thread status at startup");
+        }
+        if inner.config.session.retention_secs > 0 || inner.config.workspace.retention_secs > 0 {
             tokio::spawn(eviction_loop(inner.clone()));
         }
 
@@ -379,6 +386,7 @@ impl Dispatcher {
             .await
             .map_err(|_| BotError::Other(anyhow::anyhow!("job queue is closed")))?;
         let saved = {
+            let _cleanup = self.inner.workspace_cleanup.lock().await;
             let mut accepted = self.inner.accepted.lock().expect("delivery mutex poisoned");
             if delivery.as_ref().is_some_and(|key| accepted.contains(key)) {
                 return Ok(None);
@@ -1014,9 +1022,7 @@ async fn scheduler_loop(
     }
 }
 
-/// How often the dispatcher looks for stale thread status. The scan is cheap
-/// and running it every few minutes keeps memory close to the retention
-/// window instead of waiting for an exact deadline.
+/// How often the dispatcher looks for stale thread status and checkouts.
 const EVICTION_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Evict every idle thread older than the configured retention window.
@@ -1025,10 +1031,40 @@ fn evict_stale_sessions(inner: &Arc<Inner>) -> Result<usize> {
     inner.sessions.evict_stale(retention)
 }
 
-/// Periodically drop idle thread status past the retention window so a
-/// long-running bot does not grow without bound.
+fn evict_stale_workspaces(inner: &Inner) -> Result<()> {
+    let trash = {
+        let _cleanup = inner.workspace_cleanup.blocking_lock();
+        let mut protected = HashSet::new();
+        for job in inner.sessions.pending_jobs()? {
+            // Protect both checkout layouts for persisted work that might
+            // have been queued before the switch to account homes.
+            protected.insert(inner.workspaces.path_for(&job.message, None));
+            protected.insert(
+                inner
+                    .workspaces
+                    .path_for(&job.message, job.user_id.as_deref()),
+            );
+            protected.extend(inner.job_workspace(&job));
+        }
+        let retention = Duration::from_secs(inner.config.workspace.retention_secs);
+        inner.workspaces.retire_stale(retention, &protected)?
+    };
+    if let Some(trash) = trash {
+        trash.purge()?;
+    }
+    Ok(())
+}
+
 async fn eviction_loop(inner: Arc<Inner>) {
     loop {
+        if inner.config.workspace.retention_secs > 0 {
+            let cleanup = inner.clone();
+            match tokio::task::spawn_blocking(move || evict_stale_workspaces(&cleanup)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "failed to evict stale workspaces"),
+                Err(error) => tracing::warn!(%error, "workspace cleanup task failed"),
+            }
+        }
         tokio::time::sleep(EVICTION_INTERVAL).await;
         match evict_stale_sessions(&inner) {
             Ok(0) => {}
@@ -1171,6 +1207,15 @@ impl Inner {
                 "job references unknown user `{id}`; refusing to run it as another account"
             ))
         })
+    }
+
+    fn job_workspace(&self, job: &Job) -> Option<PathBuf> {
+        let user = self.identities.get(job.user_id.as_deref()?)?;
+        Some(self.workspaces.path_for_run(
+            &job.message,
+            Some(&user.host_user),
+            job.user_id.as_deref(),
+        ))
     }
 
     /// Whether `key` already has a run in flight or a mention waiting in the
@@ -2062,6 +2107,11 @@ impl Inner {
         if let Err(error) = self.sessions.finish(key, job.id, agent, outcome) {
             tracing::warn!(%error, "failed to persist session result");
         }
+        if self.config.workspace.retention_secs > 0
+            && let Some(workspace) = self.job_workspace(job)
+        {
+            self.workspaces.record_use(&workspace);
+        }
         if let Err(error) = self.sessions.remove_job(job.id) {
             tracing::warn!(%error, "failed to remove persisted job");
         }
@@ -2374,6 +2424,7 @@ mod tests {
         config.session.dir = dir.to_path_buf();
         config.session.workers = 1;
         config.workspace.enabled = false;
+        config.workspace.root = dir.join("workspaces");
         config.reply.ack = false;
         config.reply.result = false;
         // Every run belongs to a configured user now. Tests spawn fake CLIs
@@ -8257,5 +8308,92 @@ echo "end:$token" >> "$AGENT_LOG"
             sessions.get(key).is_none(),
             "an idle thread past the retention window is evicted at start"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_cleans_idle_checkouts_on_start_and_keeps_pending_work() {
+        use std::fs::{self, File};
+        use std::time::SystemTime;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.session.recover = false;
+        config.session.retention_secs = 0;
+        config.workspace.retention_secs = 60;
+        let config = Arc::new(config);
+
+        let root = &config.workspace.root;
+        // The host account's home uses a different path from both of the
+        // legacy layouts for the logical user ID "default".
+        let account_home = root.join("worker");
+        fs::create_dir_all(&account_home).unwrap();
+        fs::create_dir(dir.path().join("home")).unwrap();
+        std::os::unix::fs::symlink(&account_home, dir.path().join("home/agent")).unwrap();
+        let kept = [
+            root.join("o__r-1"),
+            root.join("default/o__r-1"),
+            account_home.join("o__r-1"),
+        ];
+        let stale = root.join("o__r-2");
+        let old = SystemTime::now() - Duration::from_secs(600);
+        for path in kept.iter().chain(std::iter::once(&stale)) {
+            let git = path.join(".git");
+            fs::create_dir_all(&git).unwrap();
+            fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            File::open(&git).unwrap().set_modified(old).unwrap();
+            File::open(path).unwrap().set_modified(old).unwrap();
+        }
+
+        let sessions = Arc::new(SessionStore::open(dir.path()).unwrap());
+        let pull_request = ForgeMessage {
+            location: Url::parse("http://forge.local/o/r/pulls/3").unwrap(),
+            number: Some(3),
+            is_pull_request: true,
+            linked_issue: Some(crate::forge::IssueRef {
+                repository: None,
+                number: 1,
+            }),
+            ..message("o/r")
+        };
+        sessions
+            .save_job(&Job {
+                id: Uuid::new_v4(),
+                message: pull_request,
+                mention: Mention {
+                    model: None,
+                    effort: None,
+                    agent: None,
+                    message: "Continue".into(),
+                },
+                agent: "codex".into(),
+                user_id: Some("default".into()),
+                created_at: Utc::now(),
+                status_comment: None,
+                waiting: true,
+                recovered_effort: None,
+                configured_model_agent: None,
+                model_agent: None,
+            })
+            .unwrap();
+        let _dispatcher = Dispatcher::new(
+            config.clone(),
+            Arc::new(AgentRegistry::from_config(&config)),
+            sessions.clone(),
+            Arc::new(NoopForgeApi),
+            Policy::new(&config.policy),
+        )
+        .unwrap();
+
+        let trash = root.join(".forge-bot-trash");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stale.exists() || !fs::read_dir(&trash).is_ok_and(|mut dir| dir.next().is_none())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(kept.iter().all(|path| path.is_dir()));
+        assert_eq!(sessions.pending_jobs().unwrap().len(), 1);
     }
 }

@@ -172,6 +172,7 @@ mod tests {
         let mut config = Config::default();
         config.session.dir = dir.to_path_buf();
         config.workspace.enabled = false;
+        config.workspace.root = dir.join("workspaces");
         config.reply.ack = false;
         config.reply.result = false;
         config.forges.forgejo = Some(ForgejoConfig {

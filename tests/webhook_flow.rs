@@ -69,6 +69,7 @@ fn harness_with_api(
     config.admin_token = Some("test-operator-token".into());
     config.policy.allow_all = true;
     config.workspace.enabled = false;
+    config.workspace.root = dir.join("workspaces");
     config.reply.ack = false;
     config.reply.result = false;
     config.session.dir = dir.to_path_buf();

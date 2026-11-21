@@ -5,16 +5,32 @@
 //! workspace is optional; with `workspace.enabled = false` agents run in an
 //! empty directory and are expected to clone/access the forge themselves.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, Metadata};
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
+use rustix::fs::{
+    AtFlags, CWD, Mode, OFlags, RenameFlags, StatxFlags, openat, renameat_with, statx, unlinkat,
+};
 use url::Url;
+use uuid::Uuid;
 
-use crate::config::WorkspaceConfig;
+use crate::config::{WorkspaceConfig, is_valid_user_identifier};
 use crate::error::{BotError, Result};
 use crate::executor::{ExecSpec, Executor, Prepared};
 use crate::forge::ForgeMessage;
 use crate::location::ForgeKind;
+
+const TRASH_DIR: &str = ".forge-bot-trash";
+const UNVERIFIED_PREFIX: &str = "unverified-";
+const VERIFIED_PREFIX: &str = "verified-";
 
 /// Creates and updates per-issue checkouts.
 #[derive(Debug, Clone)]
@@ -81,6 +97,92 @@ impl WorkspaceManager {
         user_id: Option<&str>,
     ) -> PathBuf {
         self.dir_for(message, host_user, user_id)
+    }
+
+    /// Refresh the idle timer before a job stops protecting this checkout.
+    pub(crate) fn record_use(&self, path: &Path) {
+        let touch = || -> io::Result<()> {
+            let mut directory = open_directory(&self.root)?;
+            // Resolve aliases through opened directories, then verify that the
+            // checkout reached from the cleanup root is the same inode.
+            let checkout = File::options()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                .open(path)?;
+            let Some(relative) = checkout_path_within_root(&directory, &checkout)? else {
+                return Ok(());
+            };
+            for component in relative.components() {
+                let Component::Normal(name) = component else {
+                    return Ok(());
+                };
+                directory = open_child_directory(&directory, name)?;
+            }
+            if directory_identity(&directory.metadata()?)
+                == directory_identity(&checkout.metadata()?)
+            {
+                directory.set_modified(SystemTime::now())?;
+            }
+            Ok(())
+        };
+        if let Err(error) = touch()
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(dir = %path.display(), %error, "failed to record workspace activity");
+        }
+    }
+
+    /// Detach expired checkouts, then hand the trash back to the caller to
+    /// purge without holding up job admission.
+    pub(crate) fn retire_stale(
+        &self,
+        retention: Duration,
+        protected: &HashSet<PathBuf>,
+    ) -> io::Result<Option<WorkspaceTrash>> {
+        if retention.is_zero() {
+            return Ok(None);
+        }
+        let root = match open_directory(&self.root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if has_git_marker(&root)? {
+            return Ok(None);
+        }
+        let now = SystemTime::now();
+        let mut protected_ids = HashSet::new();
+        for path in protected {
+            match fs::metadata(path) {
+                Ok(metadata) if metadata.is_dir() => {
+                    protected_ids.insert(directory_identity(&metadata));
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mounts = read_mounts()?;
+        let trash = match WorkspaceTrash::open(&root) {
+            Ok(trash) => Some(trash),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let mut sweep = WorkspaceSweep {
+            now,
+            retention,
+            protected,
+            protected_ids,
+            mounts,
+            root: &root,
+            trash,
+        };
+        sweep.namespace(&root, &self.root, true)?;
+        Ok(sweep.trash)
     }
 
     /// Ensure a checkout exists for `message` and return its path.
@@ -169,6 +271,396 @@ impl WorkspaceManager {
 
         Ok(dir)
     }
+}
+
+struct WorkspaceSweep<'a> {
+    now: SystemTime,
+    retention: Duration,
+    protected: &'a HashSet<PathBuf>,
+    protected_ids: HashSet<(u64, u64)>,
+    mounts: Vec<Mount>,
+    root: &'a File,
+    trash: Option<WorkspaceTrash>,
+}
+
+impl WorkspaceSweep<'_> {
+    fn namespace(&mut self, dir: &File, logical: &Path, root: bool) -> io::Result<()> {
+        visit_directories(dir, logical, |name, path, logical| {
+            let checkout = name.rsplit_once('-').is_some_and(|(repo, suffix)| {
+                repo.contains("__") && sanitize(repo) == repo && is_checkout_suffix(suffix)
+            });
+            let user_namespace = root && is_valid_user_identifier(name);
+            let gitlab_namespace = name == "gitlab";
+            if !checkout && !user_namespace && !gitlab_namespace {
+                return Ok(());
+            }
+            let child = open_child_directory(dir, OsStr::new(name))?;
+            if has_git_marker(&child)? {
+                if checkout {
+                    self.checkout(&child, path, logical)?;
+                }
+                return Ok(());
+            }
+            if gitlab_namespace {
+                self.gitlab_projects(&child, logical)?;
+            }
+            if user_namespace {
+                self.namespace(&child, logical, false)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn gitlab_projects(&mut self, dir: &File, logical: &Path) -> io::Result<()> {
+        visit_directories(dir, logical, |name, _, logical| {
+            if name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                let project = open_child_directory(dir, OsStr::new(name))?;
+                if has_git_marker(&project)? {
+                    return Ok(());
+                }
+                visit_directories(&project, logical, |name, path, logical| {
+                    if name.rsplit_once('-').is_some_and(|(kind, suffix)| {
+                        matches!(kind, "issue" | "mr") && is_checkout_suffix(suffix)
+                    }) {
+                        let checkout = open_child_directory(&project, OsStr::new(name))?;
+                        self.checkout(&checkout, path, logical)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+    }
+
+    fn checkout(&mut self, dir: &File, path: &Path, logical: &Path) -> io::Result<()> {
+        let metadata = dir.metadata()?;
+        if self.protected.contains(logical)
+            || self.protected_ids.contains(&directory_identity(&metadata))
+        {
+            return Ok(());
+        }
+        let git = match open_child_directory(dir, OsStr::new(".git")) {
+            Ok(git) => git,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if !fs::symlink_metadata(directory_path(&git).join("HEAD"))?.is_file() {
+            return Ok(());
+        }
+        // Older checkouts have no explicit activity stamp. Git updates the
+        // metadata directory on fetch, checkout and config changes.
+        let modified = metadata.modified()?.max(git.metadata()?.modified()?);
+        if self
+            .now
+            .duration_since(modified)
+            .is_ok_and(|age| age >= self.retention)
+            && !has_registered_worktrees(&git)?
+            && !has_mount_at_or_below(dir, &self.mounts)?
+        {
+            let trash = match &self.trash {
+                Some(trash) => trash,
+                None => self.trash.insert(WorkspaceTrash::get_or_create(self.root)?),
+            };
+            trash.retire(path, dir)?;
+            tracing::info!(dir = %logical.display(), "retired stale workspace");
+        }
+        Ok(())
+    }
+}
+
+// A linked worktree stores a .git file that points to metadata elsewhere.
+// Both forms mark a checkout boundary, even when the checkout is unrelated.
+fn has_git_marker(dir: &File) -> io::Result<bool> {
+    match fs::symlink_metadata(directory_path(dir).join(".git")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn has_registered_worktrees(git: &File) -> io::Result<bool> {
+    let worktrees = match open_child_directory(git, OsStr::new("worktrees")) {
+        Ok(worktrees) => worktrees,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(fs::read_dir(directory_path(&worktrees))?.next().is_some())
+}
+
+pub(crate) struct WorkspaceTrash(File);
+
+impl WorkspaceTrash {
+    fn open(root: &File) -> io::Result<Self> {
+        let dir = open_child_directory(root, OsStr::new(TRASH_DIR))?;
+        let metadata = dir.metadata()?;
+        // SAFETY: geteuid has no pointer arguments or side effects.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "workspace trash must be private to the gateway account",
+            ));
+        }
+        Ok(Self(dir))
+    }
+
+    fn get_or_create(root: &File) -> io::Result<Self> {
+        if let Err(error) = fs::DirBuilder::new()
+            .mode(0o700)
+            .create(directory_path(root).join(TRASH_DIR))
+            && error.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(error);
+        }
+        Self::open(root)
+    }
+
+    fn stage(&self, source: &Path, id: Uuid) -> io::Result<String> {
+        let name = format!("{UNVERIFIED_PREFIX}{id}");
+        renameat_with(CWD, source, &self.0, name.as_str(), RenameFlags::NOREPLACE)?;
+        Ok(name)
+    }
+
+    fn retire(&self, source: &Path, inspected: &File) -> io::Result<()> {
+        let id = Uuid::new_v4();
+        let staged_name = self.stage(source, id)?;
+        // The source name may have been replaced after inspection. The
+        // private trash name becomes eligible for purge only after we verify
+        // the move against the still-open directory.
+        let verify = || -> io::Result<()> {
+            let staged = open_child_directory(&self.0, OsStr::new(&staged_name))?;
+            if directory_identity(&staged.metadata()?) != directory_identity(&inspected.metadata()?)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "staged checkout differs from inspected directory",
+                ));
+            }
+            renameat_with(
+                &self.0,
+                staged_name.as_str(),
+                &self.0,
+                format!("{VERIFIED_PREFIX}{id}").as_str(),
+                RenameFlags::NOREPLACE,
+            )?;
+            Ok(())
+        };
+        verify().map_err(|error| {
+            let path = Path::new(TRASH_DIR).join(&staged_name);
+            io::Error::other(format!(
+                "preserved {} under the workspace root after verification failed: {error}",
+                path.display()
+            ))
+        })
+    }
+
+    /// Retry interrupted deletions, including leftovers from a previous run.
+    pub(crate) fn purge(self) -> io::Result<()> {
+        let mounts = read_mounts()?;
+        visit_directories(&self.0, Path::new(TRASH_DIR), |name, _, _| {
+            if name
+                .strip_prefix(VERIFIED_PREFIX)
+                .is_some_and(|id| Uuid::parse_str(id).is_ok())
+            {
+                let name = OsStr::new(name);
+                let checkout = open_child_directory(&self.0, name)?;
+                if !has_mount_at_or_below(&checkout, &mounts)? {
+                    remove_directory_contents(&checkout)?;
+                    unlinkat(&self.0, name, AtFlags::REMOVEDIR)?;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+fn remove_directory_contents(dir: &File) -> io::Result<()> {
+    for entry in fs::read_dir(directory_path(dir))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if entry.file_type()?.is_dir() {
+            // Enforce the boundary on every open in case a mount appears
+            // after the mount table was read. This also covers bind mounts.
+            let child = open_child_directory(dir, &name)?;
+            remove_directory_contents(&child)?;
+            unlinkat(dir, &name, AtFlags::REMOVEDIR)?;
+        } else {
+            unlinkat(dir, &name, AtFlags::empty())?;
+        }
+    }
+    Ok(())
+}
+
+fn has_mount_at_or_below(dir: &File, mounts: &[Mount]) -> io::Result<bool> {
+    let path = fs::read_link(directory_path(dir))?;
+    Ok(mounts.iter().any(|mount| mount.target.starts_with(&path)))
+}
+
+struct Mount {
+    id: u64,
+    root: PathBuf,
+    target: PathBuf,
+}
+
+fn read_mounts() -> io::Result<Vec<Mount>> {
+    // mountinfo lists bind mounts separately even when st_dev is unchanged.
+    let data = fs::read("/proc/self/mountinfo")?;
+    data.split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split(|byte| *byte == b' ');
+            let (Some(id), Some(root), Some(target)) =
+                (fields.next(), fields.nth(2), fields.next())
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "incomplete mount entry",
+                ));
+            };
+            let id = std::str::from_utf8(id)
+                .ok()
+                .and_then(|id| id.parse().ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid mount ID"))?;
+            Ok(Mount {
+                id,
+                root: decode_mount_path(root)?,
+                target: decode_mount_path(target)?,
+            })
+        })
+        .collect()
+}
+
+fn decode_mount_path(field: &[u8]) -> io::Result<PathBuf> {
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut rest = field;
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'\\' {
+            let decoded_byte = match tail.get(..3) {
+                Some(b"040") => b' ',
+                Some(b"011") => b'\t',
+                Some(b"012") => b'\n',
+                Some(b"134") => b'\\',
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid mount path escape",
+                    ));
+                }
+            };
+            decoded.push(decoded_byte);
+            rest = &tail[3..];
+        } else {
+            decoded.push(byte);
+            rest = tail;
+        }
+    }
+    Ok(OsString::from_vec(decoded).into())
+}
+
+fn checkout_path_within_root(root: &File, checkout: &File) -> io::Result<Option<PathBuf>> {
+    let root_path = fs::read_link(directory_path(root))?;
+    let checkout_path = fs::read_link(directory_path(checkout))?;
+    if let Ok(relative) = checkout_path.strip_prefix(&root_path) {
+        return Ok(Some(relative.to_owned()));
+    }
+
+    let root_mount_id = mount_id(root)?;
+    let checkout_mount_id = mount_id(checkout)?;
+    if root_mount_id == checkout_mount_id || root.metadata()?.dev() != checkout.metadata()?.dev() {
+        return Ok(None);
+    }
+
+    // For bind aliases, compare paths relative to their filesystem root.
+    let mounts = read_mounts()?;
+    let filesystem_path = |id, path: &Path| {
+        let mount = mounts.iter().find(|mount| mount.id == id)?;
+        Some(mount.root.join(path.strip_prefix(&mount.target).ok()?))
+    };
+    let (Some(root), Some(checkout)) = (
+        filesystem_path(root_mount_id, &root_path),
+        filesystem_path(checkout_mount_id, &checkout_path),
+    ) else {
+        return Ok(None);
+    };
+    Ok(checkout.strip_prefix(root).ok().map(Path::to_owned))
+}
+
+fn directory_identity(metadata: &Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
+fn is_checkout_suffix(suffix: &str) -> bool {
+    suffix == "latest" || (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn open_child_directory(parent: &File, name: &OsStr) -> io::Result<File> {
+    let child = File::from(openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?);
+    // Compare the opened mount, since a bind mount has the same device and
+    // inode as its source. Keep the descriptor pinned for all later lookups.
+    if mount_id(parent)? != mount_id(&child)? {
+        return Err(io::Error::from_raw_os_error(libc::EXDEV));
+    }
+    Ok(child)
+}
+
+fn mount_id(dir: &File) -> io::Result<u64> {
+    if let Ok(info) = statx(dir, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
+        && info.stx_mask & StatxFlags::MNT_ID.bits() != 0
+    {
+        return Ok(info.stx_mnt_id);
+    }
+    // Linux before 5.8 does not return mount IDs via statx.
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", dir.as_raw_fd()))?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .and_then(|id| id.trim().parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing mount ID"))
+}
+
+fn open_directory(path: &Path) -> io::Result<File> {
+    File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+// Keep parent directories open during the walk. A rename or symlink swap
+// cannot redirect a subsequent lookup through a different parent.
+fn directory_path(dir: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+}
+
+fn visit_directories(
+    dir: &File,
+    logical: &Path,
+    mut visit: impl FnMut(&str, &Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(directory_path(dir))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if entry.file_type()?.is_dir()
+            && let Some(name) = name.to_str()
+        {
+            let logical = logical.join(name);
+            if let Err(error) = visit(name, &entry.path(), &logical)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(dir = %logical.display(), %error, "failed to check stale workspace");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Name of the checkout directory for one message.
@@ -382,6 +874,403 @@ mod tests {
             title: None,
             reply_target: Default::default(),
         }
+    }
+
+    fn checkout(path: &Path, modified: SystemTime) {
+        let git = path.join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        set_checkout_mtime(path, modified);
+    }
+
+    fn set_checkout_mtime(path: &Path, modified: SystemTime) {
+        File::open(path.join(".git"))
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        File::open(path).unwrap().set_modified(modified).unwrap();
+    }
+
+    #[test]
+    fn retirement_preserves_a_checkout_replaced_after_inspection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("Org__Repo-1");
+        let original = root.join("original");
+        let old = SystemTime::now() - Duration::from_secs(600);
+        checkout(&source, old);
+        let inspected = open_directory(&source).unwrap();
+
+        fs::rename(&source, &original).unwrap();
+        checkout(&source, SystemTime::now());
+        fs::write(source.join("local changes"), "fresh checkout").unwrap();
+
+        let trash = WorkspaceTrash::get_or_create(&open_directory(root).unwrap()).unwrap();
+        let error = trash.retire(&source, &inspected).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from inspected directory")
+        );
+        let staged = fs::read_dir(root.join(TRASH_DIR))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(
+            staged
+                .file_name()
+                .to_str()
+                .unwrap()
+                .starts_with(UNVERIFIED_PREFIX)
+        );
+
+        trash.purge().unwrap();
+        assert!(original.join(".git/HEAD").is_file());
+        assert_eq!(
+            fs::read_to_string(staged.path().join("local changes")).unwrap(),
+            "fresh checkout"
+        );
+    }
+
+    #[test]
+    fn restart_purges_only_verified_trash() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let trash_path = root.join(TRASH_DIR);
+        let interrupted = root.join("Org__Repo-1");
+        let stale = root.join("Org__Repo-2");
+        let old = SystemTime::now() - Duration::from_secs(600);
+        checkout(&interrupted, old);
+        checkout(&stale, old);
+
+        let trash = WorkspaceTrash::get_or_create(&open_directory(root).unwrap()).unwrap();
+        let staged_name = trash.stage(&interrupted, Uuid::new_v4()).unwrap();
+        // Older UUID-only entries have no verification record either.
+        let legacy = trash_path.join(Uuid::new_v4().to_string());
+        checkout(&legacy, old);
+        drop(trash);
+
+        let manager = workspace_manager(&WorkspaceConfig {
+            root: root.to_owned(),
+            ..Default::default()
+        });
+        manager
+            .retire_stale(Duration::from_secs(60), &HashSet::new())
+            .unwrap()
+            .unwrap()
+            .purge()
+            .unwrap();
+
+        assert!(!stale.exists());
+        assert!(trash_path.join(staged_name).join(".git/HEAD").is_file());
+        assert!(legacy.join(".git/HEAD").is_file());
+        assert_eq!(fs::read_dir(trash_path).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn retires_only_idle_checkouts_in_managed_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let manager = workspace_manager(&WorkspaceConfig {
+            root: root.clone(),
+            ..Default::default()
+        });
+        let recent = SystemTime::now();
+        let old = recent - Duration::from_secs(600);
+        let retention = Duration::from_secs(60);
+        let gitlab = format!("{}/mr-7", "a".repeat(64));
+        let stale = [
+            root.join("Org__My-Repo-3"),
+            root.join("old__user-1/Org__My-Repo-latest"),
+            root.join("gitlab").join(&gitlab),
+            root.join("reviewer/gitlab").join(&gitlab),
+        ];
+        let outside = dir.path().join("outside");
+        let kept = [
+            outside.join("Org__My-Repo-8"),
+            root.join("reference"),
+            root.join("Org__My-Repo-backup"),
+            root.join("Org__My-Repo-5"),
+        ];
+        for path in stale.iter().chain(&kept) {
+            checkout(path, old);
+        }
+        let nested = root.join("reference/Org__My-Repo-9");
+        checkout(&nested, old);
+        let nested_worktree = root.join("external-worktree/Org__My-Repo-10");
+        checkout(&nested_worktree, old);
+        fs::write(root.join("external-worktree/.git"), "gitdir: /elsewhere\n").unwrap();
+        let fresh = root.join("Org__My-Repo-6");
+        checkout(&fresh, old);
+        File::open(fresh.join(".git"))
+            .unwrap()
+            .set_modified(recent)
+            .unwrap();
+        let other = root.join("Org__Other-1");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("notes"), "keep these notes").unwrap();
+        let symlink = root.join("Org__My-Repo-8");
+        std::os::unix::fs::symlink(&kept[0], &symlink).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked-user")).unwrap();
+        std::os::unix::fs::symlink(&outside, stale[0].join("external")).unwrap();
+        File::open(&stale[0]).unwrap().set_modified(old).unwrap();
+
+        let protected = HashSet::from([kept[3].clone()]);
+        let trash = manager
+            .retire_stale(retention, &protected)
+            .unwrap()
+            .unwrap();
+        assert!(stale.iter().all(|path| !path.exists()));
+        let trash_dir = root.join(".forge-bot-trash");
+        assert_eq!(fs::read_dir(&trash_dir).unwrap().count(), stale.len());
+        // Simulate restarting after detaching checkouts and before purging.
+        drop(trash);
+        manager
+            .retire_stale(retention, &protected)
+            .unwrap()
+            .unwrap()
+            .purge()
+            .unwrap();
+        assert_eq!(fs::read_dir(&trash_dir).unwrap().count(), 0);
+        assert!(kept.iter().all(|path| path.is_dir()));
+        assert!(nested.join(".git/HEAD").is_file());
+        assert!(nested_worktree.join(".git/HEAD").is_file());
+        assert!(symlink.is_symlink());
+        assert!(fresh.is_dir());
+        assert_eq!(
+            fs::read_to_string(other.join("notes")).unwrap(),
+            "keep these notes"
+        );
+    }
+
+    #[test]
+    fn disabled_cleanup_and_recent_use_preserve_checkouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let manager = workspace_manager(&WorkspaceConfig {
+            root: root.clone(),
+            ..Default::default()
+        });
+        let protected = HashSet::new();
+        let retention = Duration::from_secs(60);
+        assert!(
+            manager
+                .retire_stale(retention, &protected)
+                .unwrap()
+                .is_none()
+        );
+        let path = root.join("reviewer/Org__My-Repo-3");
+        checkout(&path, SystemTime::now() - Duration::from_secs(600));
+
+        assert!(
+            manager
+                .retire_stale(Duration::ZERO, &protected)
+                .unwrap()
+                .is_none()
+        );
+        assert!(path.is_dir());
+
+        let aliased_home = dir.path().join("home");
+        std::os::unix::fs::symlink(path.parent().unwrap(), &aliased_home).unwrap();
+        manager.record_use(&aliased_home.join(path.file_name().unwrap()));
+        assert!(
+            manager
+                .retire_stale(retention, &protected)
+                .unwrap()
+                .is_none()
+        );
+        assert!(path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn keeps_shared_git_metadata_while_a_linked_worktree_is_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let manager = workspace_manager(&WorkspaceConfig {
+            root: root.clone(),
+            ..Default::default()
+        });
+        let main = root.join("Org__Repo-1");
+        let linked = dir.path().join("linked");
+        fs::create_dir_all(&main).unwrap();
+        let executor = Executor::direct();
+        run_git(&executor, None, &main, &["init"]).await.unwrap();
+        run_git(
+            &executor,
+            None,
+            &main,
+            &[
+                "-c",
+                "user.name=forge-bot",
+                "-c",
+                "user.email=forge-bot@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "local work",
+            ],
+        )
+        .await
+        .unwrap();
+        run_git(
+            &executor,
+            None,
+            &main,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        let old = SystemTime::now() - Duration::from_secs(600);
+        set_checkout_mtime(&main, old);
+        let retention = Duration::from_secs(60);
+        let protected = HashSet::new();
+
+        assert!(
+            manager
+                .retire_stale(retention, &protected)
+                .unwrap()
+                .is_none()
+        );
+        run_git(&executor, None, &linked, &["status"])
+            .await
+            .unwrap();
+        let summary = run_git(&executor, None, &linked, &["log", "-1", "--format=%s"])
+            .await
+            .unwrap();
+        assert_eq!(summary.trim(), "local work");
+
+        run_git(
+            &executor,
+            None,
+            &main,
+            &["worktree", "remove", linked.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        set_checkout_mtime(&main, old);
+        manager
+            .retire_stale(retention, &protected)
+            .unwrap()
+            .unwrap()
+            .purge()
+            .unwrap();
+        assert!(!main.exists());
+    }
+
+    #[test]
+    #[ignore = "run inside a private user and mount namespace with unshare --map-root-user --mount"]
+    fn cleanup_respects_same_filesystem_bind_mounts() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let manager = workspace_manager(&WorkspaceConfig {
+            root: root.clone(),
+            ..Default::default()
+        });
+        let stale = root.join("Org__Repo-1");
+        let mounted = root.join("Org__Repo-2");
+        let checkout_with_alias = root.join("Org__Repo-3");
+        let cache = dir.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("artifact"), "build output").unwrap();
+        let cache_mount = mounted.join("build cache\t\n\\variant");
+        fs::create_dir_all(&cache_mount).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(600);
+        checkout(&stale, old);
+        checkout(&mounted, old);
+        checkout(&checkout_with_alias, old);
+
+        let bind = |source: &Path, target: &Path| {
+            let result = Command::new("mount")
+                .arg("--bind")
+                .arg(source)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                fs::metadata(target).unwrap().dev(),
+                fs::metadata(source).unwrap().dev()
+            );
+        };
+        bind(&cache, &cache_mount);
+
+        let checkout_alias = dir.path().join("checkout alias");
+        fs::create_dir(&checkout_alias).unwrap();
+        bind(&checkout_with_alias, &checkout_alias);
+        manager.record_use(&checkout_alias);
+        assert!(
+            fs::metadata(&checkout_with_alias)
+                .unwrap()
+                .modified()
+                .unwrap()
+                > old
+        );
+
+        let retention = Duration::from_secs(60);
+        let protected = HashSet::new();
+        let trash = manager
+            .retire_stale(retention, &protected)
+            .unwrap()
+            .unwrap();
+        assert!(mounted.is_dir());
+        assert!(checkout_with_alias.is_dir());
+        assert!(!stale.exists());
+
+        let staged = fs::read_dir(root.join(TRASH_DIR))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let recovered_mount = staged.join("recovered cache");
+        fs::create_dir(&recovered_mount).unwrap();
+        bind(&cache, &recovered_mount);
+        drop(trash);
+        manager
+            .retire_stale(retention, &protected)
+            .unwrap()
+            .unwrap()
+            .purge()
+            .unwrap();
+        assert!(staged.join(".git/HEAD").is_file());
+        assert!(cache_mount.join("artifact").is_file());
+        assert!(recovered_mount.join("artifact").is_file());
+
+        // Model a mount that was absent when the mount table was read.
+        let error = remove_directory_contents(&open_directory(&staged).unwrap()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+        assert_eq!(
+            fs::read_to_string(cache.join("artifact")).unwrap(),
+            "build output"
+        );
+
+        for mount in [&recovered_mount, &cache_mount, &checkout_alias] {
+            assert!(
+                Command::new("umount")
+                    .arg(mount)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        manager
+            .retire_stale(retention, &protected)
+            .unwrap()
+            .unwrap()
+            .purge()
+            .unwrap();
+        assert!(!mounted.exists());
+        assert!(!staged.exists());
+        assert!(cache.join("artifact").is_file());
     }
 
     #[test]
